@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertMessages } from "../src/api/openai-completions.ts";
 import { getModel, stream, streamSimple } from "../src/compat.ts";
-import type { AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
+import type { Api, AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -101,6 +101,10 @@ async function captureSimpleParams(
 	).result();
 
 	return (payload ?? mockState.lastParams) as CapturedParams;
+}
+
+function expectOpenAICompletionsModel(model: Model<Api>): asserts model is Model<"openai-completions"> {
+	expect(model.api).toBe("openai-completions");
 }
 
 describe("openai-completions tool_choice", () => {
@@ -1119,6 +1123,7 @@ describe("openai-completions tool_choice", () => {
 
 		for (const provider of providers) {
 			const model = getModel(provider, "mimo-v2.5-pro")!;
+			expectOpenAICompletionsModel(model);
 			expect(model.compat?.requiresReasoningContentOnAssistantMessages).toBe(true);
 			expect(model.compat?.thinkingFormat).toBe("deepseek");
 			expect(model.compat?.maxTokensField).toBeUndefined();
@@ -1407,6 +1412,7 @@ describe("openai-completions tool_choice", () => {
 
 		for (const model of cases) {
 			let payload: unknown;
+			expectOpenAICompletionsModel(model);
 			expect(model.compat?.maxTokensField).toBe("max_tokens");
 
 			await streamSimple(
@@ -1433,6 +1439,7 @@ describe("openai-completions tool_choice", () => {
 		const cases = [getModel("zai", "glm-5-turbo")!, getModel("zai", "glm-5.2")!] as const;
 
 		for (const model of cases) {
+			expectOpenAICompletionsModel(model);
 			expect(model.compat?.maxTokensField).toBe("max_tokens");
 			let payload: unknown;
 

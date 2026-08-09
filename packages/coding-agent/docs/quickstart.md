@@ -7,7 +7,7 @@ This page gets you from install to a useful first Diffex session.
 Diffex is distributed as an npm package:
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+npm install -g --ignore-scripts @earendil-works/diffex-coding-agent
 ```
 
 `--ignore-scripts` disables dependency lifecycle scripts during install. Diffex does not require install scripts for normal npm installs.
@@ -18,16 +18,16 @@ Use the package manager that installed Diffex:
 
 ```bash
 # npm
-npm uninstall -g @earendil-works/pi-coding-agent
+npm uninstall -g @earendil-works/diffex-coding-agent
 
 # pnpm
-pnpm remove -g @earendil-works/pi-coding-agent
+pnpm remove -g @earendil-works/diffex-coding-agent
 
 # Yarn
-yarn global remove @earendil-works/pi-coding-agent
+yarn global remove @earendil-works/diffex-coding-agent
 
 # Bun
-bun uninstall -g @earendil-works/pi-coding-agent
+bun uninstall -g @earendil-works/diffex-coding-agent
 ```
 
 Uninstalling Diffex leaves settings, credentials, sessions, and installed Diffex packages in `~/.diffex/agent/`.
@@ -36,7 +36,7 @@ Then start Diffex in the project directory you want it to work on:
 
 ```bash
 cd /path/to/project
-pi
+diffex
 ```
 
 ## Authenticate
@@ -59,7 +59,7 @@ Set an API key before launching Diffex:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-pi
+diffex
 ```
 
 You can also run `/login` and select an API-key provider to store the key in `~/.diffex/agent/auth.json`.
@@ -111,8 +111,8 @@ Restart Diffex, or run `/reload`, after changing context files.
 Type `@` in the editor to fuzzy-search files, or pass files on the command line:
 
 ```bash
-pi @README.md "Summarize this"
-pi @src/app.ts @src/app.test.ts "Review these together"
+diffex @README.md "Summarize this"
+diffex @src/app.ts @src/app.test.ts "Review these together"
 ```
 
 Images or text can be pasted with Ctrl+V (Alt+V on Windows); images can also be dragged into supported terminals.
@@ -136,10 +136,10 @@ Use `/model` or Ctrl+L to choose a model. Use Shift+Tab to cycle thinking level.
 Sessions are saved automatically:
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse previous sessions
-pi --name "my task"    # Set session display name at startup
-pi --session <path|id> # Open a specific session
+diffex -c                  # Continue most recent session
+diffex -r                  # Browse previous sessions
+diffex --name "my task"    # Set session display name at startup
+diffex --session <path|id> # Open a specific session
 ```
 
 Inside Diffex, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.
@@ -149,9 +149,9 @@ Inside Diffex, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage s
 For one-shot prompts:
 
 ```bash
-pi -p "Summarize this codebase"
-cat README.md | pi -p "Summarize this text"
-pi -p @screenshot.png "What's in this image?"
+diffex -p "Summarize this codebase"
+cat README.md | diffex -p "Summarize this text"
+diffex -p @screenshot.png "What's in this image?"
 ```
 
 Use `--mode json` for JSON event output or `--mode rpc` for process integration.

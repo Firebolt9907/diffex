@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Usage } from "@earendil-works/pi-ai";
+import type { Usage } from "@earendil-works/diffex-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NodeExecutionEnv } from "../../../src/harness/env/nodejs.ts";
 import type {
@@ -19,7 +19,7 @@ import type { AgentMessage } from "../../../src/types.ts";
 const tempDirs: string[] = [];
 
 function createTempDir(): string {
-	const directory = mkdtempSync(join(tmpdir(), "pi-agent-jsonl-storage-"));
+	const directory = mkdtempSync(join(tmpdir(), "diffex-agent-jsonl-storage-"));
 	tempDirs.push(directory);
 	return directory;
 }

@@ -1,5 +1,5 @@
-import type { Api, AssistantMessage, Model, ToolCall, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
-import { encodeServerMessage, PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
+import type { Api, AssistantMessage, Model, ToolCall, ToolResultMessage, UserMessage } from "@earendil-works/diffex-ai";
+import { encodeServerMessage, PROTOCOL_VERSION } from "@earendil-works/diffex-protocol";
 import { describe, expect, test } from "vitest";
 import {
 	sanitizeProtocolDetails,
@@ -77,7 +77,7 @@ function assertValidServerPayload(item: ProtocolTranscriptItem): void {
 	).not.toThrow();
 }
 
-describe("pi-ai protocol bridge", () => {
+describe("diffex-ai protocol bridge", () => {
 	test("maps model metadata and produces protocol-valid output", () => {
 		const result = toProtocolModelMetadata(model, true);
 

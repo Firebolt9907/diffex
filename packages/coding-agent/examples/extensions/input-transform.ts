@@ -2,17 +2,17 @@
  * Input Transform Example - demonstrates the `input` event for intercepting user input.
  *
  * Start Diffex with this extension:
- *   pi -e ./examples/extensions/input-transform.ts
+ *   diffex -e ./examples/extensions/input-transform.ts
  *
  * Then type these inside Diffex:
  *   ?quick What is TypeScript?  → "Respond briefly: What is TypeScript?"
  *   ping                        → "pong" (instant, no LLM)
  *   time                        → current time (instant, no LLM)
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/diffex-coding-agent";
 
-export default function (pi: ExtensionAPI) {
-	pi.on("input", async (event, ctx) => {
+export default function (diffex: ExtensionAPI) {
+	diffex.on("input", async (event, ctx) => {
 		// Source-based logic: skip processing for extension-injected messages
 		if (event.source === "extension") {
 			return { action: "continue" };

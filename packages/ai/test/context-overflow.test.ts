@@ -19,6 +19,7 @@ import type { AssistantMessage, Context, Model, Usage } from "../src/types.ts";
 import { isContextOverflow } from "../src/utils/overflow.ts";
 import { hasAzureOpenAICredentials } from "./azure-utils.ts";
 import { hasBedrockCredentials } from "./bedrock-utils.ts";
+import { getGoogleTextModel } from "./google-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -203,8 +204,8 @@ describe("Context overflow error handling", () => {
 	// =============================================================================
 
 	describe.skipIf(!process.env.GEMINI_API_KEY)("Google", () => {
-		it("gemini-2.0-flash - should detect overflow via isContextOverflow", async () => {
-			const model = getModel("google", "gemini-2.0-flash");
+		it("Google Gemini text model - should detect overflow via isContextOverflow", async () => {
+			const model = getGoogleTextModel();
 			const result = await testContextOverflow(model, process.env.GEMINI_API_KEY!);
 			logResult(result);
 

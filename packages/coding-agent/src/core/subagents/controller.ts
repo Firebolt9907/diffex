@@ -1,0 +1,405 @@
+import type { AgentSession } from "../agent-session.ts";
+import type {
+	SubagentControllerSnapshot,
+	SubagentLifecycleEvent,
+	SubagentLifecycleListener,
+	SubagentPermit,
+	SubagentRecord,
+	SubagentSnapshot,
+	SubagentStatus,
+	SubagentWaitOptions,
+	SubagentWaitResult,
+} from "./types.ts";
+
+const SUBAGENT_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+
+interface PermitRequest {
+	readonly resolve: (permit: SubagentPermit) => void;
+	readonly reject: (reason: unknown) => void;
+	readonly signal?: AbortSignal;
+	readonly onAbort?: () => void;
+}
+
+interface RevisionWaiter {
+	readonly afterRevision: number;
+	readonly resolve: (result: SubagentWaitResult) => void;
+	readonly reject: (reason: unknown) => void;
+	readonly signal?: AbortSignal;
+	timer?: ReturnType<typeof setTimeout>;
+	onAbort?: () => void;
+	settled: boolean;
+}
+
+interface TransitionFields {
+	readonly result?: unknown;
+	readonly error?: unknown;
+}
+
+export class SubagentController {
+	readonly #maxConcurrent: number;
+	readonly #records = new Map<string, SubagentRecord>();
+	readonly #listeners = new Set<SubagentLifecycleListener>();
+	readonly #waiters = new Set<RevisionWaiter>();
+	readonly #permitQueue: PermitRequest[] = [];
+	#activePermits = 0;
+	#revision = 0;
+	#closed = false;
+	#shutdownPromise: Promise<void> | undefined;
+
+	constructor(options: { maxConcurrent: number }) {
+		if (!Number.isInteger(options.maxConcurrent) || options.maxConcurrent <= 0) {
+			throw new RangeError("maxConcurrent must be a positive integer");
+		}
+		this.#maxConcurrent = options.maxConcurrent;
+	}
+
+	reserve(name: string, task: string): SubagentRecord {
+		this.#assertOpen();
+		if (!SUBAGENT_NAME_PATTERN.test(name)) {
+			throw new Error(`Invalid subagent name: ${name}`);
+		}
+		if (this.#records.has(name)) {
+			throw new Error(`Subagent already reserved: ${name}`);
+		}
+
+		const timestamp = Date.now();
+		const record: SubagentRecord = {
+			name,
+			task,
+			status: "queued",
+			createdAt: timestamp,
+			updatedAt: timestamp,
+		};
+		this.#records.set(name, record);
+		this.#publish((revision) => ({
+			type: "subagent_reserved",
+			revision,
+			name,
+			status: "queued",
+			timestamp,
+		}));
+		return record;
+	}
+
+	attachSession(name: string, session: AgentSession): void {
+		const record = this.#getRecordForUpdate(name);
+		if (!record) return;
+		if (record.session) {
+			throw new Error(`Subagent session already attached: ${name}`);
+		}
+		record.session = session;
+	}
+
+	trackRun(name: string, run: Promise<unknown>): void {
+		const record = this.#getRecordForUpdate(name);
+		if (!record) return;
+		record.run = run;
+		void run.catch(() => {});
+	}
+
+	markRunning(name: string): void {
+		this.#transition(name, "running");
+	}
+
+	markIdle(name: string, result?: unknown): void {
+		this.#transition(name, "idle", { result });
+	}
+
+	markFailed(name: string, error: unknown): void {
+		this.#transition(name, "failed", { error });
+	}
+
+	markInterrupted(name: string): void {
+		this.#transition(name, "interrupted");
+	}
+
+	snapshot(): SubagentControllerSnapshot {
+		return this.#createSnapshot();
+	}
+
+	subscribe(listener: SubagentLifecycleListener): () => void {
+		this.#assertOpen();
+		this.#listeners.add(listener);
+		return () => {
+			this.#listeners.delete(listener);
+		};
+	}
+
+	acquirePermit(signal?: AbortSignal): Promise<SubagentPermit> {
+		if (this.#closed) {
+			return Promise.reject(this.#closedError());
+		}
+		if (signal?.aborted) {
+			return Promise.reject(signal.reason);
+		}
+
+		return new Promise<SubagentPermit>((resolve, reject) => {
+			const request: PermitRequest = {
+				resolve,
+				reject,
+				signal,
+				onAbort: signal
+					? () => {
+							const index = this.#permitQueue.indexOf(request);
+							if (index === -1) return;
+							this.#permitQueue.splice(index, 1);
+							reject(signal.reason);
+						}
+					: undefined,
+			};
+
+			if (this.#activePermits < this.#maxConcurrent) {
+				this.#grantPermit(request);
+				return;
+			}
+
+			this.#permitQueue.push(request);
+			if (signal && request.onAbort) {
+				signal.addEventListener("abort", request.onAbort, { once: true });
+			}
+		});
+	}
+
+	waitForChange(afterRevision: number, options: SubagentWaitOptions): Promise<SubagentWaitResult> {
+		if (!Number.isInteger(afterRevision) || afterRevision < 0) {
+			return Promise.reject(new RangeError("afterRevision must be a non-negative integer"));
+		}
+		if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 0) {
+			return Promise.reject(new RangeError("timeoutMs must be a non-negative finite number"));
+		}
+		if (options.signal?.aborted) {
+			return Promise.reject(options.signal.reason);
+		}
+
+		return new Promise<SubagentWaitResult>((resolve, reject) => {
+			const waiter: RevisionWaiter = {
+				afterRevision,
+				resolve,
+				reject,
+				signal: options.signal,
+				settled: false,
+			};
+			this.#waiters.add(waiter);
+
+			waiter.onAbort = options.signal
+				? () => this.#settleWaiter(waiter, "reject", options.signal?.reason)
+				: undefined;
+			if (options.signal && waiter.onAbort) {
+				options.signal.addEventListener("abort", waiter.onAbort, { once: true });
+			}
+			waiter.timer = setTimeout(() => {
+				this.#settleWaiter(waiter, "resolve", { reason: "timeout" });
+			}, options.timeoutMs);
+
+			if (this.#closed) {
+				this.#settleWaiter(waiter, "resolve", { reason: "disposed" });
+			} else if (this.#revision > afterRevision) {
+				this.#settleWaiter(waiter, "resolve", { reason: "changed", snapshot: this.#createSnapshot() });
+			}
+		});
+	}
+
+	shutdown(): Promise<void> {
+		if (this.#shutdownPromise) return this.#shutdownPromise;
+
+		this.#closed = true;
+		const closedError = this.#closedError();
+		for (const request of this.#permitQueue.splice(0)) {
+			if (request.signal && request.onAbort) {
+				request.signal.removeEventListener("abort", request.onAbort);
+			}
+			request.reject(closedError);
+		}
+
+		const records = [...this.#records.values()];
+		this.#records.clear();
+		this.#publish(
+			(revision) => ({
+				type: "subagent_controller_disposed",
+				revision,
+				timestamp: Date.now(),
+			}),
+			true,
+		);
+		this.#listeners.clear();
+
+		this.#shutdownPromise = this.#finishShutdown(records);
+		return this.#shutdownPromise;
+	}
+
+	#transition(name: string, status: SubagentStatus, fields: TransitionFields = {}): void {
+		const record = this.#getRecordForUpdate(name);
+		if (!record) return;
+		const previousStatus = record.status;
+		if (!this.#isValidTransition(previousStatus, status)) {
+			throw new Error(`Invalid subagent status transition: ${previousStatus} -> ${status}`);
+		}
+
+		const timestamp = Date.now();
+		record.status = status;
+		record.updatedAt = timestamp;
+		if (status === "running") {
+			record.startedAt = timestamp;
+			record.completedAt = undefined;
+			record.result = undefined;
+			record.error = undefined;
+		} else {
+			record.completedAt = timestamp;
+			record.result = status === "idle" ? fields.result : undefined;
+			record.error = status === "failed" ? fields.error : undefined;
+		}
+
+		this.#publish((revision) => ({
+			type: "subagent_status_changed",
+			revision,
+			name,
+			previousStatus,
+			status,
+			timestamp,
+		}));
+	}
+
+	#isValidTransition(previousStatus: SubagentStatus, status: SubagentStatus): boolean {
+		if (previousStatus === "queued") {
+			return status === "running" || status === "failed" || status === "interrupted";
+		}
+		if (previousStatus === "running") {
+			return status === "idle" || status === "failed" || status === "interrupted";
+		}
+		return false;
+	}
+
+	#getRecordForUpdate(name: string): SubagentRecord | undefined {
+		if (this.#closed) return undefined;
+		const record = this.#records.get(name);
+		if (!record) {
+			throw new Error(`Unknown subagent: ${name}`);
+		}
+		return record;
+	}
+
+	#createSnapshot(): SubagentControllerSnapshot {
+		const agents = [...this.#records.values()]
+			.sort((left, right) => left.name.localeCompare(right.name))
+			.map((record): SubagentSnapshot => {
+				const snapshot: SubagentSnapshot = {
+					name: record.name,
+					status: record.status,
+					createdAt: record.createdAt,
+					updatedAt: record.updatedAt,
+					...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
+					...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
+				};
+				return Object.freeze(snapshot);
+			});
+		return Object.freeze({ revision: this.#revision, agents: Object.freeze(agents) });
+	}
+
+	#publish(createEvent: (revision: number) => SubagentLifecycleEvent, disposed = false): void {
+		this.#revision += 1;
+		const event = Object.freeze(createEvent(this.#revision));
+		if (disposed) {
+			for (const waiter of [...this.#waiters]) {
+				this.#settleWaiter(waiter, "resolve", { reason: "disposed" });
+			}
+		} else {
+			const snapshot = this.#createSnapshot();
+			for (const waiter of [...this.#waiters]) {
+				if (this.#revision > waiter.afterRevision) {
+					this.#settleWaiter(waiter, "resolve", { reason: "changed", snapshot });
+				}
+			}
+		}
+		for (const listener of [...this.#listeners]) {
+			try {
+				listener(event);
+			} catch {
+				// Lifecycle observers must not interrupt controller state publication.
+			}
+		}
+	}
+
+	#settleWaiter(waiter: RevisionWaiter, kind: "resolve" | "reject", value: SubagentWaitResult | unknown): void {
+		if (waiter.settled) return;
+		waiter.settled = true;
+		this.#waiters.delete(waiter);
+		if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+		if (waiter.signal && waiter.onAbort) {
+			waiter.signal.removeEventListener("abort", waiter.onAbort);
+		}
+		if (kind === "resolve") {
+			waiter.resolve(value as SubagentWaitResult);
+		} else {
+			waiter.reject(value);
+		}
+	}
+
+	#grantPermit(request: PermitRequest): void {
+		if (request.signal && request.onAbort) {
+			request.signal.removeEventListener("abort", request.onAbort);
+		}
+		if (this.#closed) {
+			request.reject(this.#closedError());
+			return;
+		}
+		if (request.signal?.aborted) {
+			request.reject(request.signal.reason);
+			return;
+		}
+
+		this.#activePermits += 1;
+		let released = false;
+		request.resolve(
+			Object.freeze({
+				release: () => {
+					if (released) return;
+					released = true;
+					this.#activePermits -= 1;
+					this.#drainPermitQueue();
+				},
+			}),
+		);
+	}
+
+	#drainPermitQueue(): void {
+		while (!this.#closed && this.#activePermits < this.#maxConcurrent) {
+			const request = this.#permitQueue.shift();
+			if (!request) return;
+			this.#grantPermit(request);
+		}
+	}
+
+	async #finishShutdown(records: SubagentRecord[]): Promise<void> {
+		const failures: unknown[] = [];
+		const activeSessions = records.flatMap((record) =>
+			record.status === "running" && record.session ? [record.session] : [],
+		);
+		const abortResults = await Promise.allSettled(activeSessions.map((session) => session.abort()));
+		for (const result of abortResults) {
+			if (result.status === "rejected") failures.push(result.reason);
+		}
+
+		await Promise.allSettled(records.flatMap((record) => (record.run ? [record.run] : [])));
+
+		for (const record of records) {
+			if (!record.session) continue;
+			try {
+				record.session.dispose();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+
+		if (failures.length > 0) {
+			throw new AggregateError(failures, "Failed to shut down subagent controller");
+		}
+	}
+
+	#assertOpen(): void {
+		if (this.#closed) throw this.#closedError();
+	}
+
+	#closedError(): Error {
+		return new Error("Subagent controller is shut down");
+	}
+}

@@ -153,9 +153,12 @@ export class SubagentController {
 				return;
 			}
 
-			this.#permitQueue.push(request);
 			if (signal && request.onAbort) {
 				signal.addEventListener("abort", request.onAbort, { once: true });
+			}
+			this.#permitQueue.push(request);
+			if (signal?.aborted && request.onAbort) {
+				request.onAbort();
 			}
 		});
 	}
@@ -179,8 +182,6 @@ export class SubagentController {
 				signal: options.signal,
 				settled: false,
 			};
-			this.#waiters.add(waiter);
-
 			waiter.onAbort = options.signal
 				? () => this.#settleWaiter(waiter, "reject", options.signal?.reason)
 				: undefined;
@@ -190,6 +191,7 @@ export class SubagentController {
 			waiter.timer = setTimeout(() => {
 				this.#settleWaiter(waiter, "resolve", { reason: "timeout" });
 			}, options.timeoutMs);
+			this.#waiters.add(waiter);
 
 			if (this.#closed) {
 				this.#settleWaiter(waiter, "resolve", { reason: "disposed" });
@@ -374,7 +376,11 @@ export class SubagentController {
 		const activeSessions = records.flatMap((record) =>
 			record.status === "running" && record.session ? [record.session] : [],
 		);
-		const abortResults = await Promise.allSettled(activeSessions.map((session) => session.abort()));
+		const abortResults = await Promise.allSettled(
+			activeSessions.map(async (session) => {
+				await session.abort();
+			}),
+		);
 		for (const result of abortResults) {
 			if (result.status === "rejected") failures.push(result.reason);
 		}

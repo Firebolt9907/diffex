@@ -16,6 +16,7 @@ import type {
 	SubagentSnapshot,
 	SubagentSpawnOrigin,
 	SubagentStatus,
+	SubagentSummary,
 	SubagentWaitOptions,
 	SubagentWaitResult,
 } from "./types.ts";
@@ -255,6 +256,19 @@ export class SubagentController {
 
 	snapshot(): SubagentControllerSnapshot {
 		return this.#createSnapshot();
+	}
+
+	getSummaries(): readonly SubagentSummary[] {
+		const summaries = [...this.#records.values()]
+			.sort((left, right) => left.name.localeCompare(right.name))
+			.map((record) =>
+				Object.freeze({
+					name: record.name,
+					status: record.status,
+					task: record.task,
+				}),
+			);
+		return Object.freeze(summaries);
 	}
 
 	async queryAgents(options: SubagentQueryOptions): Promise<SubagentQueryResult> {

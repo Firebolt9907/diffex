@@ -218,6 +218,9 @@ export class SubagentController {
 				timeoutMs: remainingMs,
 				signal: options.signal,
 			});
+			if (options.signal?.aborted) {
+				throw options.signal.reason;
+			}
 			if (wait.reason === "disposed") {
 				throw this.#closedError();
 			}

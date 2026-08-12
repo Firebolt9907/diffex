@@ -104,6 +104,7 @@ import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader }
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
+import type { SubagentController } from "./subagents/controller.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
@@ -225,8 +226,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
-	/** Release resources owned by the session when it is disposed. */
-	onDispose?: () => void;
+	/** Lifecycle-owned child-agent controller. */
+	subagentController?: SubagentController;
 }
 
 export interface ExtensionBindings {
@@ -362,9 +363,6 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
-	private readonly _onDispose: (() => void) | undefined;
-	private _disposed = false;
-
 	private _modelRuntime: ModelRuntime;
 
 	// Tool registry for extension getTools/setTools
@@ -377,6 +375,8 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private readonly _subagentController: SubagentController | undefined;
+	private _disposePromise: Promise<void> | undefined;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -393,7 +393,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
-		this._onDispose = config.onDispose;
+		this._subagentController = config.subagentController;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -841,31 +841,83 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
-		if (this._disposed) return;
-		this._disposed = true;
+	dispose(): Promise<void> {
+		if (this._disposePromise) return this._disposePromise;
+
+		let resolveDispose!: () => void;
+		let rejectDispose!: (reason: unknown) => void;
+		const disposePromise = new Promise<void>((resolve, reject) => {
+			resolveDispose = resolve;
+			rejectDispose = reject;
+		});
+		this._disposePromise = disposePromise;
+		let childCleanup: Promise<void> | undefined;
 		try {
-			this._onDispose?.();
-		} catch {
-			// Dispose must continue even if an owned resource throws.
+			childCleanup = this._subagentController?.shutdown();
+		} catch (error) {
+			childCleanup = Promise.reject(error);
+		}
+		void this._finishDispose(childCleanup).then(resolveDispose, rejectDispose);
+		return disposePromise;
+	}
+
+	private async _finishDispose(childCleanup: Promise<void> | undefined): Promise<void> {
+		const failures: unknown[] = [];
+		for (const abort of [
+			() => this.abortRetry(),
+			() => this.abortCompaction(),
+			() => this.abortBranchSummary(),
+			() => this.abortBash(),
+		]) {
+			try {
+				abort();
+			} catch (error) {
+				failures.push(error);
+			}
 		}
 
+		let rootIdle: Promise<void> | undefined;
 		try {
-			this.abortRetry();
-			this.abortCompaction();
-			this.abortBranchSummary();
-			this.abortBash();
 			this.agent.abort();
-		} catch {
-			// Dispose must succeed even if an abort hook throws.
+			rootIdle = this.waitForIdle();
+		} catch (error) {
+			failures.push(error);
 		}
 
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured diffex or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+		const cleanupResults = await Promise.allSettled(
+			[childCleanup, rootIdle].filter((promise): promise is Promise<void> => promise !== undefined),
 		);
-		this._disconnectFromAgent();
+		for (const result of cleanupResults) {
+			if (result.status !== "rejected") continue;
+			if (result.reason instanceof AggregateError) {
+				failures.push(...result.reason.errors);
+			} else {
+				failures.push(result.reason);
+			}
+		}
+
+		try {
+			this._extensionRunner.invalidate(
+				"This extension ctx is stale after session replacement or reload. Do not use a captured diffex or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+			);
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			this._disconnectFromAgent();
+		} catch (error) {
+			failures.push(error);
+		}
 		this._eventListeners = [];
-		cleanupSessionResources(this.sessionId);
+		try {
+			cleanupSessionResources(this.sessionId);
+		} catch (error) {
+			failures.push(error);
+		}
+
+		if (failures.length > 0) {
+			throw new AggregateError(failures, "Failed to dispose agent session");
+		}
 	}
 
 	// =========================================================================
@@ -2621,6 +2673,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		await this._subagentController?.reset();
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });

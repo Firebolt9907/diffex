@@ -71,14 +71,14 @@ describe("SubagentController", () => {
 		controller.markIdle("idle", "result");
 
 		controller.reserve("queued-failure", "task");
-		controller.markFailed("queued-failure", new Error("failed"));
+		controller.markFailed("queued-failure", "failed");
 
 		controller.reserve("queued-interrupt", "task");
 		controller.markInterrupted("queued-interrupt");
 
 		controller.reserve("running-failure", "task");
 		controller.markRunning("running-failure");
-		controller.markFailed("running-failure", new Error("failed"));
+		controller.markFailed("running-failure", "failed");
 
 		controller.reserve("running-interrupt", "task");
 		controller.markRunning("running-interrupt");
@@ -132,11 +132,11 @@ describe("SubagentController", () => {
 		const child = await harness();
 		const dispose = vi.spyOn(child.session, "dispose").mockImplementation(() => {});
 		controller.attachSession("worker", child.session);
-		controller.trackRun("worker", Promise.resolve("private run result"));
+		controller.trackRun("worker", Promise.resolve());
 		controller.markRunning("worker");
 		controller.markIdle("worker", "private child output");
 		controller.reserve("failure", "private failure task");
-		controller.markFailed("failure", new Error("private error details"));
+		controller.markFailed("failure", "private error details");
 		const snapshot = controller.snapshot();
 		await controller.shutdown();
 		unsubscribe();
@@ -165,7 +165,7 @@ describe("SubagentController", () => {
 			expect(serializedEvents).not.toContain(secret);
 			expect(serializedSnapshot).not.toContain(secret);
 		}
-		for (const key of ["task", "session", "run", "result", "error"]) {
+		for (const key of ["task", "session", "run", "result", "finalText", "error"]) {
 			expect(serializedEvents).not.toContain(`"${key}"`);
 			expect(serializedSnapshot).not.toContain(`"${key}"`);
 		}
@@ -368,7 +368,7 @@ describe("SubagentController", () => {
 		controller.markRunning("first");
 		controller.reserve("second", "task");
 		controller.attachSession("second", second.session);
-		controller.markFailed("second", new Error("run failed"));
+		controller.markFailed("second", "run failed");
 
 		const error = await controller.shutdown().catch((reason: unknown) => reason);
 		expect(error).toBeInstanceOf(AggregateError);

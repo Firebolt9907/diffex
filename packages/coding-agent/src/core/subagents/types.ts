@@ -75,6 +75,11 @@ export type SubagentLifecycleEvent =
 			readonly timestamp: number;
 	  }
 	| {
+			readonly type: "subagent_controller_reset";
+			readonly revision: number;
+			readonly timestamp: number;
+	  }
+	| {
 			readonly type: "subagent_controller_disposed";
 			readonly revision: number;
 			readonly timestamp: number;
@@ -85,6 +90,7 @@ export type SubagentLifecycleListener = (event: SubagentLifecycleEvent) => void;
 export type SubagentWaitResult =
 	| { readonly reason: "changed"; readonly snapshot: SubagentControllerSnapshot }
 	| { readonly reason: "timeout" }
+	| { readonly reason: "reset" }
 	| { readonly reason: "disposed" };
 
 export interface SubagentWaitOptions {

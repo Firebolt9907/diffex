@@ -95,17 +95,21 @@ describe("asynchronous subagent startup", () => {
 		});
 
 		const accepted = executeSpawnTool(tool, "worker", "blocked task");
-		expect(tool.executionMode).toBe("parallel");
-		expect(record).toMatchObject({ name: "worker", task: "blocked task", status: "queued" });
-		expect(controller.snapshot()).toMatchObject({ revision: 1, agents: [{ name: "worker", status: "queued" }] });
-		await expect(accepted).resolves.toMatchObject({ details: { name: "worker", status: "queued" } });
-		await waitForStatus(controller, "worker", "running");
-		expect(record?.run).toBeInstanceOf(Promise);
+		try {
+			expect(tool.executionMode).toBe("parallel");
+			expect(record).toMatchObject({ name: "worker", task: "blocked task", status: "queued" });
+			expect(controller.snapshot()).toMatchObject({ revision: 1, agents: [{ name: "worker", status: "queued" }] });
+			await expect(accepted).resolves.toMatchObject({ details: { name: "worker", status: "queued" } });
+			await waitForStatus(controller, "worker", "running");
+			expect(record?.run).toBeInstanceOf(Promise);
 
-		await expect(executeSpawnTool(tool, "worker", "duplicate")).rejects.toThrow("Subagent already reserved: worker");
-		expect(controller.snapshot().agents).toHaveLength(1);
-
-		response.resolve(fauxAssistantMessage("finished"));
+			await expect(executeSpawnTool(tool, "worker", "duplicate")).rejects.toThrow(
+				"Subagent already reserved: worker",
+			);
+			expect(controller.snapshot().agents).toHaveLength(1);
+		} finally {
+			response.resolve(fauxAssistantMessage("finished"));
+		}
 		await record?.run;
 		expect(record).toMatchObject({ status: "idle", finalText: "finished" });
 	});
@@ -265,8 +269,11 @@ describe("asynchronous subagent startup", () => {
 		const dispose = vi.spyOn(child!, "dispose");
 
 		const shutdown = controller.shutdown();
-		expect(abort).toHaveBeenCalledOnce();
-		response.resolve(fauxAssistantMessage("late response"));
+		try {
+			expect(abort).toHaveBeenCalledOnce();
+		} finally {
+			response.resolve(fauxAssistantMessage("late response"));
+		}
 		await shutdown;
 		await record.run;
 

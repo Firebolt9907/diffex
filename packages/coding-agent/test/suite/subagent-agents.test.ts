@@ -72,12 +72,12 @@ describe("subagent queries", () => {
 			fauxAssistantMessage("interrupted result", { stopReason: "aborted" }),
 		]);
 
-		const idle = subject.spawn("idle", "private idle task", createSession);
-		await idle.run;
-		const failed = subject.spawn("failed", "private failed task", createSession);
-		await failed.run;
-		const interrupted = subject.spawn("interrupted", "private interrupted task", createSession);
-		await interrupted.run;
+		subject.spawn("idle", "private idle task", createSession);
+		await subject.queryAgents({ timeoutMs: 1_000, targets: ["idle"], until: "all" });
+		subject.spawn("failed", "private failed task", createSession);
+		await subject.queryAgents({ timeoutMs: 1_000, targets: ["failed"], until: "all" });
+		subject.spawn("interrupted", "private interrupted task", createSession);
+		await subject.queryAgents({ timeoutMs: 1_000, targets: ["interrupted"], until: "all" });
 
 		const result = await subject.queryAgents({ timeoutMs: 100, until: "all" });
 		expect(result).toEqual({

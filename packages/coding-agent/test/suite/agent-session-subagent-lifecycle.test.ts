@@ -143,6 +143,56 @@ describe("AgentSession subagent lifecycle", () => {
 		).rejects.toThrow("Subagent controller is shut down");
 	});
 
+	it("clears root queues before aborting the active turn", async () => {
+		const { root, harness } = await createRoot();
+		harness.setResponses([fauxAssistantMessage("first response"), fauxAssistantMessage("queued response")]);
+		await root.followUp("queued during disposal");
+		let disposal: Promise<void> | undefined;
+		let disposing = false;
+		root.subscribe((event) => {
+			if (event.type !== "turn_end" || disposing) return;
+			disposing = true;
+			disposal = root.dispose();
+		});
+
+		await root.prompt("initial request");
+		await disposal;
+
+		expect(root.getFollowUpMessages()).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("clears child queues before controller shutdown aborts the turn", async () => {
+		const { root, harness } = await createRoot();
+		const childProviderStarted = deferred<void>();
+		const childResponse = deferred<ReturnType<typeof fauxAssistantMessage>>();
+		harness.setResponses([
+			async () => {
+				childProviderStarted.resolve();
+				return await childResponse.promise;
+			},
+			fauxAssistantMessage("queued response"),
+		]);
+		const spawn = root.getToolDefinition("spawn_agent")!;
+		const action = root.getToolDefinition("agent_action")!;
+		await spawn.execute("spawn-worker", { name: "worker", task: "wait" }, undefined, undefined, extensionContext);
+		await childProviderStarted.promise;
+		await expect(
+			action.execute(
+				"queue-follow-up",
+				{ target: "worker", action: "message", message: "queued during shutdown" },
+				undefined,
+				undefined,
+				extensionContext,
+			),
+		).resolves.toMatchObject({ details: { delivery: "follow_up" } });
+
+		childResponse.resolve(fauxAssistantMessage("first response"));
+		await root.dispose();
+
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
 	it("resets children before reload and reuses retained tools and names", async () => {
 		const { root, harness } = await createRoot();
 		const childProviderStarted = deferred<void>();

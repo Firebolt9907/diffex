@@ -863,6 +863,11 @@ export class AgentSession {
 
 	private async _finishDispose(childCleanup: Promise<void> | undefined): Promise<void> {
 		const failures: unknown[] = [];
+		try {
+			this.clearQueue();
+		} catch (error) {
+			failures.push(error);
+		}
 		for (const abort of [
 			() => this.abortRetry(),
 			() => this.abortCompaction(),

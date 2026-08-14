@@ -845,6 +845,11 @@ export class SubagentController {
 				const session = record.session;
 				if (!session) return [];
 				try {
+					session.clearQueue();
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
 					return [session.abort()];
 				} catch (error) {
 					return [Promise.reject(error)];

@@ -261,7 +261,7 @@ describe("subagent sessions", () => {
 		}
 	});
 
-	async function setupRoot() {
+	async function setupRoot(options: { persist?: boolean } = {}) {
 		const harness = await createHarness({
 			models: [
 				{ id: "faux-1", name: "One", reasoning: true },
@@ -300,7 +300,9 @@ describe("subagent sessions", () => {
 				},
 			},
 		});
-		const sessionManager = SessionManager.inMemory(fixture.projectDir);
+		const sessionManager = options.persist
+			? SessionManager.create(fixture.projectDir, join(harness.tempDir, "sessions"))
+			: SessionManager.inMemory(fixture.projectDir);
 		const { session: root } = await createAgentSessionFromServices({
 			services,
 			sessionManager,
@@ -375,6 +377,14 @@ describe("subagent sessions", () => {
 				second.agent.state.tools.find((tool) => tool.name === toolName),
 			);
 		}
+	});
+
+	it("records the persisted root session path as child lineage", async () => {
+		const { fixture, root } = await setupRoot({ persist: true });
+		const child = await createChild(root, fixture.agentDir);
+
+		expect(root.sessionFile).toBeDefined();
+		expect(child.sessionManager.getHeader()?.parentSession).toBe(root.sessionFile);
 	});
 
 	it("inherits only active unshadowed built-in tools", async () => {

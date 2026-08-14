@@ -1,0 +1,394 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SubagentController } from "../src/core/subagents/controller.ts";
+import type { SubagentLifecycleEvent } from "../src/core/subagents/types.ts";
+import { createHarness, type Harness } from "./suite/harness.ts";
+
+interface Deferred<T> {
+	readonly promise: Promise<T>;
+	readonly resolve: (value: T) => void;
+	readonly reject: (reason: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
+async function isPending(promise: Promise<unknown>): Promise<boolean> {
+	const pending = Symbol("pending");
+	return (await Promise.race([promise.then(() => false), Promise.resolve(pending)])) === pending;
+}
+
+describe("SubagentController", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		for (const harness of harnesses.splice(0)) harness.cleanup();
+	});
+
+	async function harness(): Promise<Harness> {
+		const created = await createHarness();
+		harnesses.push(created);
+		return created;
+	}
+
+	it("requires a positive integer concurrency limit", () => {
+		for (const maxConcurrent of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(() => new SubagentController({ maxConcurrent })).toThrow("maxConcurrent must be a positive integer");
+		}
+		expect(() => new SubagentController({ maxConcurrent: 1 })).not.toThrow();
+	});
+
+	it("validates names and reserves each name synchronously", () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		for (const name of ["", "A", "1agent", "agent.name", "agent/name", `a${"b".repeat(64)}`]) {
+			expect(() => controller.reserve(name, "task")).toThrow(`Invalid subagent name: ${name}`);
+		}
+
+		controller.reserve("agent_1", "first task");
+		expect(controller.snapshot().agents[0]).toMatchObject({ name: "agent_1", status: "queued" });
+		expect(() => controller.reserve("agent_1", "second task")).toThrow("Subagent already reserved: agent_1");
+	});
+
+	it("does not expose mutable reservation records", () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const reservation = controller.reserve("worker", "task");
+
+		expect(reservation).toBeUndefined();
+		expect(controller.snapshot().agents[0]).toMatchObject({ name: "worker", status: "queued" });
+	});
+
+	it("allows only the declared status transitions", () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		controller.reserve("idle", "task");
+		controller.markRunning("idle");
+		controller.markIdle("idle", "result");
+
+		controller.reserve("queued-failure", "task");
+		controller.markFailed("queued-failure", new Error("failed"));
+
+		controller.reserve("queued-interrupt", "task");
+		controller.markInterrupted("queued-interrupt");
+
+		controller.reserve("running-failure", "task");
+		controller.markRunning("running-failure");
+		controller.markFailed("running-failure", new Error("failed"));
+
+		controller.reserve("running-interrupt", "task");
+		controller.markRunning("running-interrupt");
+		controller.markInterrupted("running-interrupt");
+
+		controller.reserve("queued", "task");
+		expect(() => controller.markIdle("queued", "result")).toThrow(
+			"Invalid subagent status transition: queued -> idle",
+		);
+		expect(() => controller.markRunning("idle")).toThrow("Invalid subagent status transition: idle -> running");
+		expect(() => controller.markRunning("missing")).toThrow("Unknown subagent: missing");
+		expect(controller.snapshot().agents.map(({ name, status }) => ({ name, status }))).toEqual([
+			{ name: "idle", status: "idle" },
+			{ name: "queued", status: "queued" },
+			{ name: "queued-failure", status: "failed" },
+			{ name: "queued-interrupt", status: "interrupted" },
+			{ name: "running-failure", status: "failed" },
+			{ name: "running-interrupt", status: "interrupted" },
+		]);
+	});
+
+	it("publishes monotonic revisions and immutable name-sorted snapshots", () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		expect(controller.snapshot()).toEqual({ revision: 0, agents: [] });
+
+		controller.reserve("zeta", "z task");
+		controller.reserve("alpha", "a task");
+		controller.markRunning("alpha");
+		const snapshot = controller.snapshot();
+
+		expect(snapshot.revision).toBe(3);
+		expect(snapshot.agents.map((agent) => agent.name)).toEqual(["alpha", "zeta"]);
+		expect(snapshot.agents[0]?.status).toBe("running");
+		expect(Object.isFrozen(snapshot)).toBe(true);
+		expect(Object.isFrozen(snapshot.agents)).toBe(true);
+		expect(snapshot.agents.every(Object.isFrozen)).toBe(true);
+		expect(Reflect.set(snapshot, "revision", 100)).toBe(false);
+		expect(Reflect.set(snapshot.agents[0]!, "status", "failed")).toBe(false);
+	});
+
+	it("publishes safe typed lifecycle events through the revision path", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const events: SubagentLifecycleEvent[] = [];
+		const unsubscribe = controller.subscribe((event) => events.push(event));
+		controller.subscribe(() => {
+			throw new Error("observer failed");
+		});
+
+		const task = "private task text";
+		controller.reserve("worker", task);
+		const child = await harness();
+		const dispose = vi.spyOn(child.session, "dispose").mockImplementation(() => {});
+		controller.attachSession("worker", child.session);
+		controller.trackRun("worker", Promise.resolve("private run result"));
+		controller.markRunning("worker");
+		controller.markIdle("worker", "private child output");
+		controller.reserve("failure", "private failure task");
+		controller.markFailed("failure", new Error("private error details"));
+		const snapshot = controller.snapshot();
+		await controller.shutdown();
+		unsubscribe();
+
+		expect(events.map((event) => event.revision)).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(events.map((event) => event.type)).toEqual([
+			"subagent_reserved",
+			"subagent_status_changed",
+			"subagent_status_changed",
+			"subagent_reserved",
+			"subagent_status_changed",
+			"subagent_controller_disposed",
+		]);
+		expect(events.every(Object.isFrozen)).toBe(true);
+		expect(dispose).toHaveBeenCalledOnce();
+
+		const serializedEvents = JSON.stringify(events);
+		const serializedSnapshot = JSON.stringify(snapshot);
+		for (const secret of [
+			task,
+			"private run result",
+			"private child output",
+			"private failure task",
+			"private error details",
+		]) {
+			expect(serializedEvents).not.toContain(secret);
+			expect(serializedSnapshot).not.toContain(secret);
+		}
+		for (const key of ["task", "session", "run", "result", "error"]) {
+			expect(serializedEvents).not.toContain(`"${key}"`);
+			expect(serializedSnapshot).not.toContain(`"${key}"`);
+		}
+	});
+
+	it("admits permits in FIFO order without exceeding the limit", async () => {
+		const controller = new SubagentController({ maxConcurrent: 2 });
+		const first = await controller.acquirePermit();
+		const second = await controller.acquirePermit();
+		const admitted: string[] = [];
+		let active = 2;
+		let peakActive = active;
+		const thirdPromise = controller.acquirePermit().then((permit) => {
+			admitted.push("third");
+			active += 1;
+			peakActive = Math.max(peakActive, active);
+			return permit;
+		});
+		const fourthPromise = controller.acquirePermit().then((permit) => {
+			admitted.push("fourth");
+			active += 1;
+			peakActive = Math.max(peakActive, active);
+			return permit;
+		});
+
+		expect(await isPending(thirdPromise)).toBe(true);
+		expect(await isPending(fourthPromise)).toBe(true);
+		active -= 1;
+		second.release();
+		const third = await thirdPromise;
+		expect(admitted).toEqual(["third"]);
+		expect(await isPending(fourthPromise)).toBe(true);
+
+		active -= 1;
+		first.release();
+		const fourth = await fourthPromise;
+		expect(admitted).toEqual(["third", "fourth"]);
+		expect(peakActive).toBe(2);
+		third.release();
+		fourth.release();
+	});
+
+	it("makes permit release idempotent", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const first = await controller.acquirePermit();
+		const secondPromise = controller.acquirePermit();
+		first.release();
+		first.release();
+		const second = await secondPromise;
+		const thirdPromise = controller.acquirePermit();
+		expect(await isPending(thirdPromise)).toBe(true);
+		second.release();
+		const third = await thirdPromise;
+		third.release();
+	});
+
+	it("releases a permit after admitted work rejects", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		async function runWithPermit(work: () => Promise<void>): Promise<void> {
+			const permit = await controller.acquirePermit();
+			try {
+				await work();
+			} finally {
+				permit.release();
+			}
+		}
+
+		await expect(runWithPermit(() => Promise.reject(new Error("work failed")))).rejects.toThrow("work failed");
+		await expect(runWithPermit(() => Promise.resolve())).resolves.toBeUndefined();
+	});
+
+	it("removes canceled permit requests without disturbing FIFO order", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const active = await controller.acquirePermit();
+		const abortController = new AbortController();
+		const reason = new Error("caller canceled");
+		const canceled = controller.acquirePermit(abortController.signal);
+		const next = controller.acquirePermit();
+
+		abortController.abort(reason);
+		await expect(canceled).rejects.toBe(reason);
+		expect(await isPending(next)).toBe(true);
+		active.release();
+		const admitted = await next;
+		admitted.release();
+	});
+
+	it("returns immediate and later revision changes", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		controller.reserve("existing", "task");
+		await expect(controller.waitForChange(0, { timeoutMs: 100 })).resolves.toMatchObject({
+			reason: "changed",
+			snapshot: { revision: 1 },
+		});
+
+		const waiting = controller.waitForChange(1, { timeoutMs: 100 });
+		controller.reserve("later", "task");
+		await expect(waiting).resolves.toMatchObject({ reason: "changed", snapshot: { revision: 2 } });
+	});
+
+	it("does not miss a change completed before the revision recheck", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const abortController = new AbortController();
+		const addEventListener = abortController.signal.addEventListener.bind(abortController.signal);
+		vi.spyOn(abortController.signal, "addEventListener").mockImplementationOnce((...args) => {
+			controller.reserve("racing", "task");
+			return addEventListener(...args);
+		});
+
+		await expect(
+			controller.waitForChange(0, { timeoutMs: 100, signal: abortController.signal }),
+		).resolves.toMatchObject({ reason: "changed", snapshot: { revision: 1 } });
+	});
+
+	it("settles waits on timeout, caller cancellation, and disposal", async () => {
+		const timeoutController = new SubagentController({ maxConcurrent: 1 });
+		const timeoutSignal = new AbortController();
+		const timeoutRemove = vi.spyOn(timeoutSignal.signal, "removeEventListener");
+		await expect(timeoutController.waitForChange(0, { timeoutMs: 1, signal: timeoutSignal.signal })).resolves.toEqual(
+			{ reason: "timeout" },
+		);
+		expect(timeoutRemove).toHaveBeenCalled();
+
+		const abortController = new AbortController();
+		const abortRemove = vi.spyOn(abortController.signal, "removeEventListener");
+		const reason = new Error("wait canceled");
+		const aborted = timeoutController.waitForChange(0, { timeoutMs: 100, signal: abortController.signal });
+		abortController.abort(reason);
+		await expect(aborted).rejects.toBe(reason);
+		expect(abortRemove).toHaveBeenCalled();
+
+		const disposedController = new SubagentController({ maxConcurrent: 1 });
+		const disposed = disposedController.waitForChange(0, { timeoutMs: 100 });
+		await disposedController.shutdown();
+		await expect(disposed).resolves.toEqual({ reason: "disposed" });
+		await expect(disposedController.waitForChange(0, { timeoutMs: 100 })).resolves.toEqual({
+			reason: "disposed",
+		});
+	});
+
+	it("aborts active sessions, waits for runs, and disposes captured sessions", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const child = await harness();
+		const abort = vi.spyOn(child.session, "abort").mockResolvedValue();
+		const dispose = vi.spyOn(child.session, "dispose").mockImplementation(() => {});
+		const run = deferred<void>();
+		controller.reserve("worker", "task");
+		controller.attachSession("worker", child.session);
+		controller.trackRun("worker", run.promise);
+		controller.markRunning("worker");
+
+		const shutdown = controller.shutdown();
+		expect(abort).toHaveBeenCalledOnce();
+		expect(await isPending(shutdown)).toBe(true);
+		expect(dispose).not.toHaveBeenCalled();
+		run.resolve();
+		await shutdown;
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it("is idempotent and closes admission before awaiting cleanup", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const active = await controller.acquirePermit();
+		const queued = controller.acquirePermit();
+		const run = deferred<void>();
+		controller.reserve("worker", "task");
+		controller.trackRun("worker", run.promise);
+
+		const firstShutdown = controller.shutdown();
+		const secondShutdown = controller.shutdown();
+		expect(firstShutdown).toBe(secondShutdown);
+		expect(() => controller.reserve("later", "task")).toThrow("Subagent controller is shut down");
+		await expect(controller.acquirePermit()).rejects.toThrow("Subagent controller is shut down");
+		await expect(queued).rejects.toThrow("Subagent controller is shut down");
+		active.release();
+		run.resolve();
+		await firstShutdown;
+		await expect(controller.shutdown()).resolves.toBeUndefined();
+	});
+
+	it("finishes cleanup before aggregating abort and disposal failures", async () => {
+		const controller = new SubagentController({ maxConcurrent: 2 });
+		const first = await harness();
+		const second = await harness();
+		const abortFailure = new Error("abort failed");
+		const firstDisposeFailure = new Error("first dispose failed");
+		const secondDisposeFailure = new Error("second dispose failed");
+		vi.spyOn(first.session, "abort").mockImplementation(() => {
+			throw abortFailure;
+		});
+		vi.spyOn(first.session, "dispose").mockImplementation(() => {
+			throw firstDisposeFailure;
+		});
+		vi.spyOn(second.session, "dispose").mockImplementation(() => {
+			throw secondDisposeFailure;
+		});
+
+		controller.reserve("first", "task");
+		controller.attachSession("first", first.session);
+		controller.markRunning("first");
+		controller.reserve("second", "task");
+		controller.attachSession("second", second.session);
+		controller.markFailed("second", new Error("run failed"));
+
+		const error = await controller.shutdown().catch((reason: unknown) => reason);
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as AggregateError).errors).toEqual([abortFailure, firstDisposeFailure, secondDisposeFailure]);
+		expect(first.session.dispose).toHaveBeenCalledOnce();
+		expect(second.session.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("ignores late completion updates after shutdown", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const run = deferred<string>();
+		controller.reserve("worker", "task");
+		controller.markRunning("worker");
+		const tracked = run.promise.then((result) => controller.markIdle("worker", result));
+		controller.trackRun("worker", tracked);
+		const revisionBeforeShutdown = controller.snapshot().revision;
+
+		const shutdown = controller.shutdown();
+		run.resolve("late result");
+		await shutdown;
+		expect(controller.snapshot()).toEqual({ revision: revisionBeforeShutdown + 1, agents: [] });
+	});
+});

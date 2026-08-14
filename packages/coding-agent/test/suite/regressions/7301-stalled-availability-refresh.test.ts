@@ -60,10 +60,10 @@ describe("issue #7301 stalled availability refresh", () => {
 	let harness: Harness | undefined;
 	let stalledList: StalledCredentialList | undefined;
 
-	afterEach(() => {
+	afterEach(async () => {
 		stalledList?.release();
 		stalledList = undefined;
-		harness?.cleanup();
+		await harness?.cleanup();
 		harness = undefined;
 	});
 

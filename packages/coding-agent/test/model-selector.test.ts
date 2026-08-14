@@ -16,8 +16,8 @@ describe("model selector", () => {
 		initTheme("dark");
 	});
 
-	afterEach(() => {
-		harness?.cleanup();
+	afterEach(async () => {
+		await harness?.cleanup();
 		harness = undefined;
 	});
 

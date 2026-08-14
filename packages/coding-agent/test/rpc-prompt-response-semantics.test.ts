@@ -162,7 +162,7 @@ async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: 
 			} catch {
 				// ignore test cleanup failures
 			}
-			session.dispose();
+			await session.dispose();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
 			}
@@ -185,7 +185,7 @@ async function startRpcMode(options: { withAuth: boolean; responseDelayMs: numbe
 }
 
 describe("RPC prompt response semantics", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
 	});

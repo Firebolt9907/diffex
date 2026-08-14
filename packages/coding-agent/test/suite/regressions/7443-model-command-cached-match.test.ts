@@ -11,8 +11,8 @@ const findExactModelMatch = Reflect.get(InteractiveMode.prototype, "findExactMod
 describe("issue #7443 /model cached match", () => {
 	let harness: Harness | undefined;
 
-	afterEach(() => {
-		harness?.cleanup();
+	afterEach(async () => {
+		await harness?.cleanup();
 		harness = undefined;
 		vi.restoreAllMocks();
 	});

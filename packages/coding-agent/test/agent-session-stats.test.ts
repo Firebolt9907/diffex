@@ -112,7 +112,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage?.contextWindow).toBe(model.contextWindow);
 			expect(stats.contextUsage?.percent).toBe((200 / model.contextWindow) * 100);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -135,7 +135,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage?.tokens).toBeNull();
 			expect(stats.contextUsage?.percent).toBeNull();
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -159,7 +159,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage?.tokens).toBe(25_000);
 			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -181,7 +181,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.tokens).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, total: 100 });
 			expect(stats.cost).toBe(1);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -204,7 +204,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.tokens).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, total: 100 });
 			expect(stats.cost).toBe(1);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -228,7 +228,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.tokens).toEqual({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, total: 100 });
 			expect(stats.cost).toBe(1);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -277,7 +277,7 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage?.tokens).not.toBeNull();
 			expect(stats.contextUsage?.tokens ?? 0).toBeGreaterThan(25_000);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 });

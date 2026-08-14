@@ -104,6 +104,7 @@ import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader }
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
+import type { SubagentController } from "./subagents/controller.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
@@ -225,8 +226,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
-	/** Release resources owned by the session when it is disposed. */
-	onDispose?: () => void;
+	/** Lifecycle-owned child-agent controller. */
+	subagentController?: SubagentController;
 }
 
 export interface ExtensionBindings {
@@ -340,6 +341,7 @@ export class AgentSession {
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	private readonly _ownedOperations = new Set<Promise<unknown>>();
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -362,9 +364,6 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
-	private readonly _onDispose: (() => void) | undefined;
-	private _disposed = false;
-
 	private _modelRuntime: ModelRuntime;
 
 	// Tool registry for extension getTools/setTools
@@ -377,6 +376,8 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private readonly _subagentController: SubagentController | undefined;
+	private _disposePromise: Promise<void> | undefined;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -393,7 +394,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
-		this._onDispose = config.onDispose;
+		this._subagentController = config.subagentController;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -841,31 +842,121 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
-		if (this._disposed) return;
-		this._disposed = true;
+	dispose(): Promise<void> {
+		if (this._disposePromise) return this._disposePromise;
+
+		let resolveDispose!: () => void;
+		let rejectDispose!: (reason: unknown) => void;
+		const disposePromise = new Promise<void>((resolve, reject) => {
+			resolveDispose = resolve;
+			rejectDispose = reject;
+		});
+		this._disposePromise = disposePromise;
+		let childCleanup: Promise<void> | undefined;
 		try {
-			this._onDispose?.();
-		} catch {
-			// Dispose must continue even if an owned resource throws.
+			childCleanup = this._subagentController?.shutdown();
+		} catch (error) {
+			childCleanup = Promise.reject(error);
+		}
+		void this._finishDispose(childCleanup).then(resolveDispose, rejectDispose);
+		return disposePromise;
+	}
+
+	private _runOwnedOperation<T>(run: () => Promise<T>): Promise<T> {
+		if (this._disposePromise) {
+			return Promise.reject(new Error("Agent session is disposed"));
 		}
 
+		let resolveOperation!: (value: T | PromiseLike<T>) => void;
+		let rejectOperation!: (reason: unknown) => void;
+		const operation = new Promise<T>((resolve, reject) => {
+			resolveOperation = resolve;
+			rejectOperation = reject;
+		});
+		this._ownedOperations.add(operation);
 		try {
-			this.abortRetry();
-			this.abortCompaction();
-			this.abortBranchSummary();
-			this.abortBash();
-			this.agent.abort();
-		} catch {
-			// Dispose must succeed even if an abort hook throws.
+			void run().then(resolveOperation, rejectOperation);
+		} catch (error) {
+			rejectOperation(error);
 		}
-
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured diffex or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+		void operation.then(
+			() => this._ownedOperations.delete(operation),
+			() => this._ownedOperations.delete(operation),
 		);
-		this._disconnectFromAgent();
+		return operation;
+	}
+
+	private async _waitForOwnedOperations(): Promise<void> {
+		while (this._ownedOperations.size > 0) {
+			await Promise.allSettled([...this._ownedOperations]);
+		}
+	}
+
+	private async _finishDispose(childCleanup: Promise<void> | undefined): Promise<void> {
+		const failures: unknown[] = [];
+		try {
+			this.clearQueue();
+		} catch (error) {
+			failures.push(error);
+		}
+		for (const abort of [
+			() => this.abortRetry(),
+			() => this.abortCompaction(),
+			() => this.abortBranchSummary(),
+			() => this.abortBash(),
+		]) {
+			try {
+				abort();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+
+		let rootIdle: Promise<void> | undefined;
+		try {
+			this.agent.abort();
+			rootIdle = this.waitForIdle();
+		} catch (error) {
+			failures.push(error);
+		}
+		const ownedOperationsIdle = this._waitForOwnedOperations();
+
+		const cleanupResults = await Promise.allSettled(
+			[childCleanup, rootIdle, ownedOperationsIdle].filter(
+				(promise): promise is Promise<void> => promise !== undefined,
+			),
+		);
+		for (const result of cleanupResults) {
+			if (result.status !== "rejected") continue;
+			if (result.reason instanceof AggregateError) {
+				failures.push(...result.reason.errors);
+			} else {
+				failures.push(result.reason);
+			}
+		}
+
+		try {
+			this._extensionRunner.invalidate(
+				"This extension ctx is stale after session replacement or reload. Do not use a captured diffex or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+			);
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			this._disconnectFromAgent();
+		} catch (error) {
+			failures.push(error);
+		}
 		this._eventListeners = [];
-		cleanupSessionResources(this.sessionId);
+		try {
+			cleanupSessionResources(this.sessionId);
+		} catch (error) {
+			failures.push(error);
+		}
+
+		if (failures.length > 0) {
+			throw new AggregateError(failures, "Failed to dispose agent session");
+		}
 	}
 
 	// =========================================================================
@@ -1800,8 +1891,15 @@ export class AgentSession {
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	compact(customInstructions?: string): Promise<CompactionResult> {
+		return this._runOwnedOperation(() => this._compact(customInstructions));
+	}
+
+	private async _compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		if (this._disposePromise) {
+			throw new Error("Compaction cancelled");
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 
@@ -2068,7 +2166,12 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		if (this._disposePromise) return Promise.resolve(false);
+		return this._runOwnedOperation(() => this._runAutoCompactionOperation(reason, willRetry));
+	}
+
+	private async _runAutoCompactionOperation(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2078,6 +2181,7 @@ export class AgentSession {
 			}
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			if (this._disposePromise) return false;
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2621,6 +2725,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		await this._subagentController?.reset();
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -2785,7 +2890,15 @@ export class AgentSession {
 	 * @param options.id Optional identifier included in bash execution update events
 	 * @param options.operations Custom BashOperations for remote execution
 	 */
-	async executeBash(
+	executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+	): Promise<BashResult> {
+		return this._runOwnedOperation(() => this._executeBash(command, onChunk, options));
+	}
+
+	private async _executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
@@ -2915,9 +3028,16 @@ export class AgentSession {
 	 * @param options.label Label to attach to the branch summary entry
 	 * @returns Result with editorText (if user message) and cancelled status
 	 */
-	async navigateTree(
+	navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		return this._runOwnedOperation(() => this._navigateTree(targetId, options));
+	}
+
+	private async _navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");

@@ -5,9 +5,9 @@ import { createHarness, getMessageText, getUserTexts, type Harness } from "../ha
 describe("issue #7150: RPC prompt during manual compaction", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

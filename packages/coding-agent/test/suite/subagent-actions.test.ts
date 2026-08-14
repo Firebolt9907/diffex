@@ -53,7 +53,7 @@ describe("subagent actions", () => {
 		vi.restoreAllMocks();
 		for (const fixture of fixtures.splice(0)) await fixture.cleanup();
 		for (const controller of extraControllers.splice(0)) await controller.shutdown();
-		for (const harness of extraHarnesses.splice(0)) harness.cleanup();
+		for (const harness of extraHarnesses.splice(0)) await harness.cleanup();
 	});
 
 	async function setup(maxConcurrent = 1): Promise<SubagentTestHarness> {

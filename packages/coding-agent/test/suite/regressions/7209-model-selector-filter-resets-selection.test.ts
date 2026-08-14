@@ -30,9 +30,9 @@ describe("model selector filter resets selection to top", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

@@ -6,9 +6,9 @@ import { assistantMsg, userMsg } from "./utilities.ts";
 describe("Branch summary extensions", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

@@ -31,9 +31,9 @@ function createControlledBashOperations(invocations: ControlledBashInvocation[])
 describe("AgentSession bash and persistence characterization", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

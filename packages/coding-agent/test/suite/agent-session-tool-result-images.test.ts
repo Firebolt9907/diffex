@@ -66,9 +66,9 @@ function getToolResultImages(harness: Harness): ImageContent[] {
 describe("AgentSession tool result images", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

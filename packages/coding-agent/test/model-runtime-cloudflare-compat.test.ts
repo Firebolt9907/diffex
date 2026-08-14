@@ -56,10 +56,18 @@ async function createCloudflareRuntime(): Promise<{ modelRuntime: ModelRuntime; 
 	return { modelRuntime, modelRegistry: new ModelRegistry(modelRuntime) };
 }
 
+function getCloudflareCompatModelId(modelRuntime: ModelRuntime): string {
+	const model = modelRuntime
+		.getModels("cloudflare-ai-gateway")
+		.find((candidate) => candidate.api === "openai-completions" && candidate.baseUrl.endsWith("/compat"));
+	if (!model) throw new Error("Cloudflare AI Gateway has no OpenAI-compatible model");
+	return model.id;
+}
+
 describe("ModelRegistry Cloudflare compat streaming", () => {
 	it("materializes the Cloudflare endpoint through ModelRuntime streaming", async () => {
 		const { modelRuntime } = await createCloudflareRuntime();
-		const model = modelRuntime.getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5");
+		const model = modelRuntime.getModel("cloudflare-ai-gateway", getCloudflareCompatModelId(modelRuntime));
 		expect(model).toBeDefined();
 
 		resetApiProviders();
@@ -74,8 +82,8 @@ describe("ModelRegistry Cloudflare compat streaming", () => {
 	});
 
 	it("materializes the Cloudflare endpoint after extension-style auth resolution", async () => {
-		const { modelRegistry } = await createCloudflareRuntime();
-		const model = modelRegistry.find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5");
+		const { modelRuntime, modelRegistry } = await createCloudflareRuntime();
+		const model = modelRegistry.find("cloudflare-ai-gateway", getCloudflareCompatModelId(modelRuntime));
 		expect(model).toBeDefined();
 
 		resetApiProviders();

@@ -422,8 +422,17 @@ export class AgentSessionRuntime {
 	}
 
 	dispose(): Promise<void> {
-		this.disposePromise ??= this.teardownCurrent("quit");
-		return this.disposePromise;
+		if (this.disposePromise) return this.disposePromise;
+
+		let resolveDispose!: () => void;
+		let rejectDispose!: (reason: unknown) => void;
+		const disposePromise = new Promise<void>((resolve, reject) => {
+			resolveDispose = resolve;
+			rejectDispose = reject;
+		});
+		this.disposePromise = disposePromise;
+		void this.teardownCurrent("quit").then(resolveDispose, rejectDispose);
+		return disposePromise;
 	}
 }
 

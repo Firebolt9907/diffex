@@ -371,6 +371,30 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(disposedChildren).toHaveLength(1);
 	});
 
+	it("shares the disposal promise during synchronous re-entry", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const originalAbort = runtime.session.abort.bind(runtime.session);
+		let nestedDisposal: Promise<void> | undefined;
+		let reentered = false;
+		let invalidations = 0;
+		runtime.setBeforeSessionInvalidate(() => {
+			invalidations += 1;
+		});
+		vi.spyOn(runtime.session, "abort").mockImplementation(() => {
+			if (!reentered) {
+				reentered = true;
+				nestedDisposal = runtime.dispose();
+			}
+			return originalAbort();
+		});
+
+		const disposal = runtime.dispose();
+
+		expect(nestedDisposal).toBe(disposal);
+		await disposal;
+		expect(invalidations).toBe(1);
+	});
+
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {

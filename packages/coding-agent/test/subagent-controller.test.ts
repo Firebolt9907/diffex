@@ -100,6 +100,38 @@ describe("SubagentController", () => {
 		]);
 	});
 
+	it("queues terminal children for restart and clears stale lifecycle state", async () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const permit = await controller.acquirePermit();
+		const states = ["idle", "failed", "interrupted"] as const;
+
+		for (const status of states) {
+			const child = await harness();
+			controller.reserve(status, "task");
+			controller.attachSession(status, child.session);
+			controller.markRunning(status);
+			if (status === "idle") controller.markIdle(status, "old result");
+			if (status === "failed") controller.markFailed(status, "old error", "old result");
+			if (status === "interrupted") controller.markInterrupted(status, "old result");
+			const terminalSnapshot = controller.snapshot().agents.find((agent) => agent.name === status);
+			expect(terminalSnapshot?.startedAt).toBeDefined();
+			expect(terminalSnapshot?.completedAt).toBeDefined();
+
+			await expect(controller.message(status, "restart", true)).resolves.toMatchObject({
+				status: "queued",
+				delivery: "prompt",
+			});
+			const restartedSnapshot = controller.snapshot().agents.find((agent) => agent.name === status);
+			expect(restartedSnapshot).toMatchObject({ status: "queued" });
+			expect(restartedSnapshot).not.toHaveProperty("startedAt");
+			expect(restartedSnapshot).not.toHaveProperty("completedAt");
+			await expect(controller.interrupt(status)).resolves.toMatchObject({ status: "interrupted" });
+		}
+
+		permit.release();
+		await controller.shutdown();
+	});
+
 	it("publishes monotonic revisions and immutable name-sorted snapshots", () => {
 		const controller = new SubagentController({ maxConcurrent: 1 });
 		expect(controller.snapshot()).toEqual({ revision: 0, agents: [] });

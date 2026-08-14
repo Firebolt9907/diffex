@@ -5,6 +5,21 @@ export const SUBAGENT_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 export type SubagentStatus = "queued" | "running" | "idle" | "failed" | "interrupted";
 
 export type CreateSubagentSession = (signal: AbortSignal) => Promise<AgentSession>;
+
+export type SubagentMessageDelivery = "steer" | "follow_up" | "prompt";
+
+export type SubagentActionResult =
+	| {
+			readonly target: string;
+			readonly action: "message";
+			readonly status: SubagentStatus;
+			readonly delivery: SubagentMessageDelivery;
+	  }
+	| {
+			readonly target: string;
+			readonly action: "interrupt";
+			readonly status: SubagentStatus;
+	  };
 export interface SubagentSnapshot {
 	readonly name: string;
 	readonly status: SubagentStatus;

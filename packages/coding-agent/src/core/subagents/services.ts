@@ -7,9 +7,14 @@ import {
 	createAgentSessionServices,
 } from "../agent-session-services.ts";
 import type { ModelRuntime } from "../model-runtime.ts";
-import { SessionManager } from "../session-manager.ts";
+import type { SessionManager } from "../session-manager.ts";
 import type { SettingsManager } from "../settings-manager.ts";
 import { allToolNames, type ToolName } from "../tools/index.ts";
+import {
+	RootLocalEphemeralSubagentSessionManagerFactory,
+	type SubagentSessionManagerFactory,
+} from "./session-manager-factory.ts";
+import type { SubagentSpawnOrigin } from "./types.ts";
 
 export interface CreateSubagentServicesOptions {
 	cwd: string;
@@ -26,7 +31,15 @@ export interface SubagentSessionConfig {
 	readonly model: Model<any>;
 	readonly thinkingLevel: ThinkingLevel;
 	readonly tools: readonly ToolName[];
-	readonly parentSessionPath?: string;
+	readonly parentSession: string;
+	readonly sourceSessionManager: SessionManager;
+}
+
+export interface CreateSubagentSessionOptions {
+	readonly signal?: AbortSignal;
+	readonly childName?: string;
+	readonly origin?: SubagentSpawnOrigin;
+	readonly sessionManagerFactory?: SubagentSessionManagerFactory;
 }
 
 const SUBAGENT_SYSTEM_PROMPT = [
@@ -77,13 +90,14 @@ export function captureSubagentSessionConfig(parent: AgentSession, agentDir: str
 		model,
 		thinkingLevel: parent.thinkingLevel,
 		tools,
-		parentSessionPath: parent.sessionFile,
+		parentSession: parent.sessionId,
+		sourceSessionManager: parent.sessionManager,
 	});
 }
 
 export async function createSubagentSession(
 	config: SubagentSessionConfig,
-	options: { signal?: AbortSignal } = {},
+	options: CreateSubagentSessionOptions = {},
 ): Promise<AgentSession> {
 	options.signal?.throwIfAborted();
 	const services = await createSubagentServices({
@@ -94,7 +108,16 @@ export async function createSubagentSession(
 	});
 	options.signal?.throwIfAborted();
 
-	const sessionManager = SessionManager.inMemory(config.cwd, { parentSession: config.parentSessionPath });
+	const sessionManagerFactory = options.sessionManagerFactory ?? new RootLocalEphemeralSubagentSessionManagerFactory();
+	const sessionManager = sessionManagerFactory.create(
+		Object.freeze({
+			childName: options.childName ?? "subagent",
+			sourceSessionManager: config.sourceSessionManager,
+			cwd: config.cwd,
+			parentSessionId: config.parentSession,
+			origin: options.origin ?? Object.freeze({ type: "programmatic", contextEntryId: null }),
+		}),
+	);
 	const { session } = await createAgentSessionFromServices({
 		services,
 		sessionManager,

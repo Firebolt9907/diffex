@@ -36,13 +36,16 @@ describe("asynchronous subagent startup", () => {
 		const { harness, controller, createSession } = await setup();
 		const response = deferred<AssistantMessage>();
 		harness.setResponses([() => response.promise]);
-		const tool = createSpawnAgentTool((name, task) => {
+		let capturedToolCallId: string | undefined;
+		const tool = createSpawnAgentTool((name, task, toolCallId) => {
+			capturedToolCallId = toolCallId;
 			controller.spawn(name, task, createSession);
 		});
 
 		const accepted = executeSpawnTool(tool, "worker", "blocked task");
 		try {
 			expect(tool.executionMode).toBe("parallel");
+			expect(capturedToolCallId).toBe("spawn-call");
 			expect(controller.snapshot()).toMatchObject({ revision: 1, agents: [{ name: "worker", status: "queued" }] });
 			await expect(accepted).resolves.toMatchObject({ details: { name: "worker", status: "queued" } });
 			await waitForStatus(controller, "worker", "running");

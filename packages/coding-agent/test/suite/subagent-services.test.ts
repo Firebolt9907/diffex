@@ -360,7 +360,7 @@ describe("subagent sessions", () => {
 			expect(child.sessionManager.getCwd()).toBe(fixture.projectDir);
 			expect(child.sessionFile).toBeUndefined();
 			expect(child.messages).toEqual([]);
-			expect(child.sessionManager.getHeader()?.parentSession).toBeUndefined();
+			expect(child.sessionManager.getHeader()?.parentSession).toBe(root.sessionId);
 		}
 
 		expect(first.agent).not.toBe(second.agent);
@@ -379,12 +379,12 @@ describe("subagent sessions", () => {
 		}
 	});
 
-	it("records the persisted root session path as child lineage", async () => {
+	it("records the persisted root session ID as child lineage", async () => {
 		const { fixture, root } = await setupRoot({ persist: true });
 		const child = await createChild(root, fixture.agentDir);
 
 		expect(root.sessionFile).toBeDefined();
-		expect(child.sessionManager.getHeader()?.parentSession).toBe(root.sessionFile);
+		expect(child.sessionManager.getHeader()?.parentSession).toBe(root.sessionId);
 	});
 
 	it("inherits only active unshadowed built-in tools", async () => {

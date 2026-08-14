@@ -57,12 +57,6 @@ function getAssistantText(message: AssistantMessage | undefined): string | undef
 	return text.trim().length > 0 ? text : undefined;
 }
 
-function getTurnAssistantMessages(session: AgentSession, turnStart: number): AssistantMessage[] {
-	return session.messages
-		.slice(turnStart)
-		.filter((message): message is AssistantMessage => message.role === "assistant");
-}
-
 interface SubagentRecord {
 	name: string;
 	task: string;
@@ -553,7 +547,8 @@ export class SubagentController {
 	async #runPrompt(record: SubagentRecord, prompt: string, runController: AbortController): Promise<void> {
 		let permit: SubagentPermit | undefined;
 		let session = record.session;
-		let turnStart: number | undefined;
+		const assistantMessages: AssistantMessage[] = [];
+		let unsubscribe: (() => void) | undefined;
 		try {
 			permit = await this.acquirePermit(runController.signal);
 			if (!session) {
@@ -574,11 +569,14 @@ export class SubagentController {
 
 			runController.signal.throwIfAborted();
 			this.markRunning(record.name);
-			turnStart = session.messages.length;
+			unsubscribe = session.subscribe((event) => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					assistantMessages.push(event.message);
+				}
+			});
 			await session.prompt(prompt);
 			if (this.#closed) return;
 
-			const assistantMessages = getTurnAssistantMessages(session, turnStart);
 			const terminalMessage = assistantMessages.at(-1);
 			const finalText = getAssistantText(terminalMessage);
 			if (record.interruptionRequested) {
@@ -594,8 +592,6 @@ export class SubagentController {
 			}
 		} catch (error) {
 			if (!this.#closed) {
-				const assistantMessages =
-					session && turnStart !== undefined ? getTurnAssistantMessages(session, turnStart) : [];
 				const finalText = getAssistantText(assistantMessages.at(-1));
 				if (record.interruptionRequested) {
 					this.markInterrupted(record.name, finalText);
@@ -604,6 +600,7 @@ export class SubagentController {
 				}
 			}
 		} finally {
+			unsubscribe?.();
 			permit?.release();
 			if (record.runController === runController) {
 				record.runController = undefined;

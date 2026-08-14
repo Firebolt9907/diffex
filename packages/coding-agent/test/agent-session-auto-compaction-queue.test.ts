@@ -52,8 +52,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 	});
 
-	afterEach(() => {
-		session.dispose();
+	afterEach(async () => {
+		await session.dispose();
 		vi.restoreAllMocks();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });

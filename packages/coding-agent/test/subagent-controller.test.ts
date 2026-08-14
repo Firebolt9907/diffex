@@ -27,9 +27,9 @@ async function isPending(promise: Promise<unknown>): Promise<boolean> {
 describe("SubagentController", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		for (const harness of harnesses.splice(0)) harness.cleanup();
+		for (const harness of harnesses.splice(0)) await harness.cleanup();
 	});
 
 	async function harness(): Promise<Harness> {

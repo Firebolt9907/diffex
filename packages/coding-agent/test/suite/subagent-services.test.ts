@@ -99,9 +99,9 @@ function createTestTool(name: string): ToolDefinition {
 describe("createSubagentServices", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 
@@ -251,13 +251,13 @@ describe("subagent sessions", () => {
 	const harnesses: Harness[] = [];
 	const sessions: AgentSession[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		while (sessions.length > 0) {
-			sessions.pop()?.dispose();
+			await sessions.pop()?.dispose();
 		}
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			await harnesses.pop()?.cleanup();
 		}
 	});
 

@@ -72,7 +72,7 @@ export async function createSubagentTestHarness(
 		createSession: (signal) => createSubagentSession(config, { signal }),
 		async cleanup() {
 			await controller.shutdown();
-			harness.cleanup();
+			await harness.cleanup();
 		},
 	};
 }

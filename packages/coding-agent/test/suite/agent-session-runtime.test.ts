@@ -850,7 +850,7 @@ describe("AgentSessionRuntime characterization", () => {
 			allowModelNetwork: false,
 		});
 		const refresh = vi.spyOn(modelRuntime, "refresh");
-		cleanups.push(() => rmSync(tempDir, { recursive: true, force: true }));
+		cleanups.push(async () => rmSync(tempDir, { recursive: true, force: true }));
 
 		await createAgentSessionServices({
 			cwd: tempDir,
@@ -885,7 +885,7 @@ describe("AgentSessionRuntime characterization", () => {
 			.spyOn(modelRuntime, "refresh")
 			.mockResolvedValueOnce(refreshResult)
 			.mockImplementationOnce(() => barrier);
-		cleanups.push(() => {
+		cleanups.push(async () => {
 			faux.unregister();
 			rmSync(tempDir, { recursive: true, force: true });
 		});

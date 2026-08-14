@@ -21,9 +21,9 @@ const dynamicModel: Model<"openai-completions"> = {
 describe("issues #7027 and #7113 credential refresh hang", () => {
 	let harness: Harness | undefined;
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.useRealTimers();
-		harness?.cleanup();
+		await harness?.cleanup();
 		harness = undefined;
 		vi.restoreAllMocks();
 	});

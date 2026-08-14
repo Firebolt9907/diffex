@@ -23,7 +23,7 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 		mkdirSync(agentDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -95,7 +95,7 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 		expect(session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
 		expect(session.systemPrompt).not.toContain("- read:");
 		expect(session.systemPrompt).not.toContain("- bash:");
-		session.dispose();
+		await session.dispose();
 	});
 
 	it("still disables all tools when noTools is all", async () => {
@@ -104,7 +104,7 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 		expect(session.getAllTools()).toEqual([]);
 		expect(session.getActiveToolNames()).toEqual([]);
 		expect(session.systemPrompt).toContain("Available tools:\n(none)");
-		session.dispose();
+		await session.dispose();
 	});
 
 	it("propagates noTools through service-based session creation", async () => {
@@ -126,6 +126,6 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 		expect(session.getActiveToolNames()).toEqual(["spawn_agent", "agent_action", "agents"]);
 		expect(session.systemPrompt).toContain("Available tools:\n(none)");
 		expect(session.systemPrompt).not.toContain("- read:");
-		session.dispose();
+		await session.dispose();
 	});
 });

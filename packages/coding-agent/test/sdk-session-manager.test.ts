@@ -19,7 +19,7 @@ describe("createAgentSession session manager defaults", () => {
 		mkdirSync(agentDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -43,7 +43,7 @@ describe("createAgentSession session manager defaults", () => {
 		expect(sessionDir).toBe(expectedSessionDir);
 		expect(sessionFile?.startsWith(`${expectedSessionDir}/`)).toBe(true);
 
-		session.dispose();
+		await session.dispose();
 	});
 
 	it("keeps an explicit sessionManager override", async () => {
@@ -61,7 +61,7 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager).toBe(sessionManager);
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
-		session.dispose();
+		await session.dispose();
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {
@@ -90,7 +90,7 @@ describe("createAgentSession session manager defaults", () => {
 
 		expect(realpathSync(output.trim())).toBe(realpathSync(sessionCwd));
 
-		session.dispose();
+		await session.dispose();
 	});
 
 	it("exposes current session state to the built-in bash tool", async () => {
@@ -126,6 +126,6 @@ describe("createAgentSession session manager defaults", () => {
 			session.thinkingLevel,
 		]);
 
-		session.dispose();
+		await session.dispose();
 	});
 });

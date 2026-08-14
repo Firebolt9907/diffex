@@ -14,11 +14,11 @@ import { ModelRuntime } from "../../../src/core/model-runtime.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
 
 describe("issue #2753 reload stale resource settings", () => {
-	const cleanups: Array<() => void> = [];
+	const cleanups: Array<() => Promise<void>> = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (cleanups.length > 0) {
-			cleanups.pop()?.();
+			await cleanups.pop()?.();
 		}
 	});
 
@@ -85,8 +85,8 @@ describe("issue #2753 reload stale resource settings", () => {
 			sessionManager: SessionManager.create(tempDir),
 		});
 
-		cleanups.push(() => {
-			runtime.session.dispose();
+		cleanups.push(async () => {
+			await runtime.session.dispose();
 			faux.unregister();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

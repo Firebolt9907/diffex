@@ -33,7 +33,7 @@ describe("createAgentSession provider attribution headers", () => {
 		delete process.env.DIFFEX_TELEMETRY;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		if (originalTelemetryEnv === undefined) {
 			delete process.env.DIFFEX_TELEMETRY;
 		} else {
@@ -138,7 +138,7 @@ describe("createAgentSession provider attribution headers", () => {
 			await stream.result();
 			return capturedOptions?.headers;
 		} finally {
-			session.dispose();
+			await session.dispose();
 			modelRegistry.unregisterProvider(model.provider);
 		}
 	}

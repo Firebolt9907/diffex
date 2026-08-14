@@ -38,7 +38,7 @@ describe("AgentSession subagent lifecycle", () => {
 		for (const faux of fauxProviders.splice(0)) faux.unregister();
 		for (const harness of harnesses.splice(0)) {
 			await harness.session.dispose();
-			harness.cleanup();
+			await harness.cleanup();
 		}
 	});
 

@@ -67,8 +67,8 @@ describe("issue #7153 scoped models refresh", () => {
 
 	beforeAll(() => initTheme("dark"));
 	beforeEach(() => setKeybindings(new KeybindingsManager()));
-	afterEach(() => {
-		harness?.cleanup();
+	afterEach(async () => {
+		await harness?.cleanup();
 		harness = undefined;
 		vi.restoreAllMocks();
 	});

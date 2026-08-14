@@ -64,8 +64,8 @@ describe("root subagent tool registration", () => {
 
 	afterEach(async () => {
 		while (runtimeCleanups.length > 0) await runtimeCleanups.pop()?.();
-		while (sessions.length > 0) sessions.pop()?.dispose();
-		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+		while (sessions.length > 0) await sessions.pop()?.dispose();
+		while (harnesses.length > 0) await harnesses.pop()?.cleanup();
 	});
 
 	async function setupHarness(): Promise<Harness> {

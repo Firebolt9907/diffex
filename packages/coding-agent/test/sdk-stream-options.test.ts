@@ -29,7 +29,7 @@ describe("createAgentSession stream options", () => {
 		mkdirSync(agentDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -118,7 +118,7 @@ describe("createAgentSession stream options", () => {
 			await stream.result();
 			return capturedOptions;
 		} finally {
-			session.dispose();
+			await session.dispose();
 			modelRegistry.unregisterProvider(model.provider);
 		}
 	}

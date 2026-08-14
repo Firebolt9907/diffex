@@ -55,8 +55,8 @@ describe("issue #6949 unavailable scoped models", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	afterEach(() => {
-		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	afterEach(async () => {
+		while (harnesses.length > 0) await harnesses.pop()?.cleanup();
 	});
 
 	it("shows and removes an enabled model without a catalog entry", async () => {

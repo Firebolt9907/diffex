@@ -341,6 +341,7 @@ export class AgentSession {
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	private readonly _ownedOperations = new Set<Promise<unknown>>();
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -861,6 +862,36 @@ export class AgentSession {
 		return disposePromise;
 	}
 
+	private _runOwnedOperation<T>(run: () => Promise<T>): Promise<T> {
+		if (this._disposePromise) {
+			return Promise.reject(new Error("Agent session is disposed"));
+		}
+
+		let resolveOperation!: (value: T | PromiseLike<T>) => void;
+		let rejectOperation!: (reason: unknown) => void;
+		const operation = new Promise<T>((resolve, reject) => {
+			resolveOperation = resolve;
+			rejectOperation = reject;
+		});
+		this._ownedOperations.add(operation);
+		try {
+			void run().then(resolveOperation, rejectOperation);
+		} catch (error) {
+			rejectOperation(error);
+		}
+		void operation.then(
+			() => this._ownedOperations.delete(operation),
+			() => this._ownedOperations.delete(operation),
+		);
+		return operation;
+	}
+
+	private async _waitForOwnedOperations(): Promise<void> {
+		while (this._ownedOperations.size > 0) {
+			await Promise.allSettled([...this._ownedOperations]);
+		}
+	}
+
 	private async _finishDispose(childCleanup: Promise<void> | undefined): Promise<void> {
 		const failures: unknown[] = [];
 		try {
@@ -888,9 +919,12 @@ export class AgentSession {
 		} catch (error) {
 			failures.push(error);
 		}
+		const ownedOperationsIdle = this._waitForOwnedOperations();
 
 		const cleanupResults = await Promise.allSettled(
-			[childCleanup, rootIdle].filter((promise): promise is Promise<void> => promise !== undefined),
+			[childCleanup, rootIdle, ownedOperationsIdle].filter(
+				(promise): promise is Promise<void> => promise !== undefined,
+			),
 		);
 		for (const result of cleanupResults) {
 			if (result.status !== "rejected") continue;
@@ -1857,8 +1891,15 @@ export class AgentSession {
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	compact(customInstructions?: string): Promise<CompactionResult> {
+		return this._runOwnedOperation(() => this._compact(customInstructions));
+	}
+
+	private async _compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		if (this._disposePromise) {
+			throw new Error("Compaction cancelled");
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 
@@ -2125,7 +2166,12 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		if (this._disposePromise) return Promise.resolve(false);
+		return this._runOwnedOperation(() => this._runAutoCompactionOperation(reason, willRetry));
+	}
+
+	private async _runAutoCompactionOperation(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2135,6 +2181,7 @@ export class AgentSession {
 			}
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			if (this._disposePromise) return false;
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2843,7 +2890,15 @@ export class AgentSession {
 	 * @param options.id Optional identifier included in bash execution update events
 	 * @param options.operations Custom BashOperations for remote execution
 	 */
-	async executeBash(
+	executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+	): Promise<BashResult> {
+		return this._runOwnedOperation(() => this._executeBash(command, onChunk, options));
+	}
+
+	private async _executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
@@ -2973,9 +3028,16 @@ export class AgentSession {
 	 * @param options.label Label to attach to the branch summary entry
 	 * @returns Result with editorText (if user message) and cancelled status
 	 */
-	async navigateTree(
+	navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		return this._runOwnedOperation(() => this._navigateTree(targetId, options));
+	}
+
+	private async _navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");

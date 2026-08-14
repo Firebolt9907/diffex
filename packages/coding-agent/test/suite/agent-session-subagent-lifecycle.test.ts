@@ -7,11 +7,25 @@ import { AgentSession } from "../../src/core/agent-session.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../../src/index.ts";
-import { createTestResourceLoader } from "../utilities.ts";
+import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.ts";
 import { createHarness, type Harness } from "./harness.ts";
 import { deferred } from "./subagent-harness.ts";
 
 const extensionContext = {} as ExtensionContext;
+
+async function expectPending(promise: Promise<unknown>): Promise<void> {
+	let settled = false;
+	void promise.then(
+		() => {
+			settled = true;
+		},
+		() => {
+			settled = true;
+		},
+	);
+	await Promise.resolve();
+	expect(settled).toBe(false);
+}
 
 describe("AgentSession subagent lifecycle", () => {
 	const roots: AgentSession[] = [];
@@ -191,6 +205,123 @@ describe("AgentSession subagent lifecycle", () => {
 		await root.dispose();
 
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("awaits standalone bash cancellation before disposal completes", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const executionStarted = deferred<void>();
+		const abortObserved = deferred<void>();
+		const executionGate = deferred<void>();
+		const execution = harness.session.executeBash("blocking command", undefined, {
+			operations: {
+				exec: async (_command, _cwd, options) => {
+					executionStarted.resolve();
+					await new Promise<void>((resolve) => {
+						options.signal?.addEventListener(
+							"abort",
+							() => {
+								abortObserved.resolve();
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+					await executionGate.promise;
+					return { exitCode: null };
+				},
+			},
+		});
+		await executionStarted.promise;
+
+		const disposal = harness.session.dispose();
+		await abortObserved.promise;
+		await expectPending(disposal);
+		executionGate.resolve();
+		await execution;
+		await disposal;
+	});
+
+	it("awaits manual compaction cancellation before disposal completes", async () => {
+		const compactionStarted = deferred<void>();
+		const abortObserved = deferred<void>();
+		const compactionGate = deferred<void>();
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						compactionStarted.resolve();
+						await new Promise<void>((resolve) => {
+							event.signal.addEventListener(
+								"abort",
+								() => {
+									abortObserved.resolve();
+									resolve();
+								},
+								{ once: true },
+							);
+						});
+						await compactionGate.promise;
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const compaction = harness.session.compact();
+		await compactionStarted.promise;
+
+		const disposal = harness.session.dispose();
+		await abortObserved.promise;
+		await expectPending(disposal);
+		compactionGate.resolve();
+		await expect(compaction).rejects.toThrow("Compaction cancelled");
+		await disposal;
+	});
+
+	it("awaits branch summary cancellation before disposal completes", async () => {
+		const summaryStarted = deferred<void>();
+		const abortObserved = deferred<void>();
+		const summaryGate = deferred<void>();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", async (event) => {
+						summaryStarted.resolve();
+						await new Promise<void>((resolve) => {
+							event.signal.addEventListener(
+								"abort",
+								() => {
+									abortObserved.resolve();
+									resolve();
+								},
+								{ once: true },
+							);
+						});
+						await summaryGate.promise;
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const targetId = harness.sessionManager.appendMessage(userMsg("first branch"));
+		harness.sessionManager.appendMessage(assistantMsg("first response"));
+		harness.sessionManager.appendMessage(userMsg("abandoned work"));
+		harness.sessionManager.appendMessage(assistantMsg("abandoned response"));
+		const summary = harness.session.navigateTree(targetId, { summarize: true });
+		await summaryStarted.promise;
+
+		const disposal = harness.session.dispose();
+		await abortObserved.promise;
+		await expectPending(disposal);
+		summaryGate.resolve();
+		await expect(summary).resolves.toEqual({ cancelled: true });
+		await disposal;
 	});
 
 	it("resets children before reload and reuses retained tools and names", async () => {

@@ -4,7 +4,6 @@ import type {
 	SubagentLifecycleEvent,
 	SubagentLifecycleListener,
 	SubagentPermit,
-	SubagentRecord,
 	SubagentSnapshot,
 	SubagentStatus,
 	SubagentWaitOptions,
@@ -35,6 +34,20 @@ interface TransitionFields {
 	readonly error?: unknown;
 }
 
+interface SubagentRecord {
+	name: string;
+	task: string;
+	status: SubagentStatus;
+	createdAt: number;
+	updatedAt: number;
+	startedAt?: number;
+	completedAt?: number;
+	result?: unknown;
+	error?: unknown;
+	session?: AgentSession;
+	run?: Promise<unknown>;
+}
+
 export class SubagentController {
 	readonly #maxConcurrent: number;
 	readonly #records = new Map<string, SubagentRecord>();
@@ -53,7 +66,7 @@ export class SubagentController {
 		this.#maxConcurrent = options.maxConcurrent;
 	}
 
-	reserve(name: string, task: string): SubagentRecord {
+	reserve(name: string, task: string): void {
 		this.#assertOpen();
 		if (!SUBAGENT_NAME_PATTERN.test(name)) {
 			throw new Error(`Invalid subagent name: ${name}`);
@@ -78,7 +91,6 @@ export class SubagentController {
 			status: "queued",
 			timestamp,
 		}));
-		return record;
 	}
 
 	attachSession(name: string, session: AgentSession): void {

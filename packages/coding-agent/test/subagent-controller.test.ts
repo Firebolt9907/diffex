@@ -51,43 +51,53 @@ describe("SubagentController", () => {
 			expect(() => controller.reserve(name, "task")).toThrow(`Invalid subagent name: ${name}`);
 		}
 
-		const record = controller.reserve("agent_1", "first task");
-		expect(record).toMatchObject({ name: "agent_1", task: "first task", status: "queued" });
+		controller.reserve("agent_1", "first task");
+		expect(controller.snapshot().agents[0]).toMatchObject({ name: "agent_1", status: "queued" });
 		expect(() => controller.reserve("agent_1", "second task")).toThrow("Subagent already reserved: agent_1");
+	});
+
+	it("does not expose mutable reservation records", () => {
+		const controller = new SubagentController({ maxConcurrent: 1 });
+		const reservation = controller.reserve("worker", "task");
+
+		expect(reservation).toBeUndefined();
+		expect(controller.snapshot().agents[0]).toMatchObject({ name: "worker", status: "queued" });
 	});
 
 	it("allows only the declared status transitions", () => {
 		const controller = new SubagentController({ maxConcurrent: 1 });
-		const idle = controller.reserve("idle", "task");
+		controller.reserve("idle", "task");
 		controller.markRunning("idle");
 		controller.markIdle("idle", "result");
-		expect(idle).toMatchObject({ status: "idle", result: "result" });
 
-		const queuedFailure = controller.reserve("queued-failure", "task");
+		controller.reserve("queued-failure", "task");
 		controller.markFailed("queued-failure", new Error("failed"));
-		expect(queuedFailure.status).toBe("failed");
 
-		const queuedInterrupt = controller.reserve("queued-interrupt", "task");
+		controller.reserve("queued-interrupt", "task");
 		controller.markInterrupted("queued-interrupt");
-		expect(queuedInterrupt.status).toBe("interrupted");
 
-		const runningFailure = controller.reserve("running-failure", "task");
+		controller.reserve("running-failure", "task");
 		controller.markRunning("running-failure");
 		controller.markFailed("running-failure", new Error("failed"));
-		expect(runningFailure.status).toBe("failed");
 
-		const runningInterrupt = controller.reserve("running-interrupt", "task");
+		controller.reserve("running-interrupt", "task");
 		controller.markRunning("running-interrupt");
 		controller.markInterrupted("running-interrupt");
-		expect(runningInterrupt.status).toBe("interrupted");
 
-		const queued = controller.reserve("queued", "task");
+		controller.reserve("queued", "task");
 		expect(() => controller.markIdle("queued", "result")).toThrow(
 			"Invalid subagent status transition: queued -> idle",
 		);
-		expect(queued.status).toBe("queued");
 		expect(() => controller.markRunning("idle")).toThrow("Invalid subagent status transition: idle -> running");
 		expect(() => controller.markRunning("missing")).toThrow("Unknown subagent: missing");
+		expect(controller.snapshot().agents.map(({ name, status }) => ({ name, status }))).toEqual([
+			{ name: "idle", status: "idle" },
+			{ name: "queued", status: "queued" },
+			{ name: "queued-failure", status: "failed" },
+			{ name: "queued-interrupt", status: "interrupted" },
+			{ name: "running-failure", status: "failed" },
+			{ name: "running-interrupt", status: "interrupted" },
+		]);
 	});
 
 	it("publishes monotonic revisions and immutable name-sorted snapshots", () => {
@@ -117,7 +127,8 @@ describe("SubagentController", () => {
 			throw new Error("observer failed");
 		});
 
-		const record = controller.reserve("worker", "private task text");
+		const task = "private task text";
+		controller.reserve("worker", task);
 		const child = await harness();
 		const dispose = vi.spyOn(child.session, "dispose").mockImplementation(() => {});
 		controller.attachSession("worker", child.session);
@@ -145,7 +156,7 @@ describe("SubagentController", () => {
 		const serializedEvents = JSON.stringify(events);
 		const serializedSnapshot = JSON.stringify(snapshot);
 		for (const secret of [
-			record.task,
+			task,
 			"private run result",
 			"private child output",
 			"private failure task",
@@ -369,7 +380,7 @@ describe("SubagentController", () => {
 	it("ignores late completion updates after shutdown", async () => {
 		const controller = new SubagentController({ maxConcurrent: 1 });
 		const run = deferred<string>();
-		const record = controller.reserve("worker", "task");
+		controller.reserve("worker", "task");
 		controller.markRunning("worker");
 		const tracked = run.promise.then((result) => controller.markIdle("worker", result));
 		controller.trackRun("worker", tracked);
@@ -378,7 +389,6 @@ describe("SubagentController", () => {
 		const shutdown = controller.shutdown();
 		run.resolve("late result");
 		await shutdown;
-		expect(record).toMatchObject({ status: "running", result: undefined, completedAt: undefined });
 		expect(controller.snapshot()).toEqual({ revision: revisionBeforeShutdown + 1, agents: [] });
 	});
 });

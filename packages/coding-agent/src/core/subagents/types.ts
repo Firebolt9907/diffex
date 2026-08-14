@@ -1,20 +1,4 @@
-import type { AgentSession } from "../agent-session.ts";
-
 export type SubagentStatus = "queued" | "running" | "idle" | "failed" | "interrupted";
-
-export interface SubagentRecord {
-	name: string;
-	task: string;
-	status: SubagentStatus;
-	createdAt: number;
-	updatedAt: number;
-	startedAt?: number;
-	completedAt?: number;
-	result?: unknown;
-	error?: unknown;
-	session?: AgentSession;
-	run?: Promise<unknown>;
-}
 
 export interface SubagentSnapshot {
 	readonly name: string;

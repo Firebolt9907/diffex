@@ -182,6 +182,67 @@ describe("subagent actions", () => {
 		expect(record).toMatchObject({ status: "idle", finalText: "older follow-up result" });
 	});
 
+	it("keeps the wake result when prompt preflight compacts child history", async () => {
+		const fixture = await createSubagentTestHarness(1, {
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				retry: { enabled: false },
+			},
+		});
+		fixtures.push(fixture);
+		const { harness, controller, createSession } = fixture;
+		harness.setResponses([fauxAssistantMessage("initial response")]);
+		const record = controller.spawn("worker", "initial task", createSession);
+		await record.run;
+
+		const session = record.session!;
+		const model = session.model!;
+		const now = Date.now();
+		for (let index = 0; index < 20; index += 1) {
+			session.sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: `historical user ${index}` }],
+				timestamp: now + index * 2,
+			});
+			session.sessionManager.appendMessage({
+				...fauxAssistantMessage(`historical assistant ${index}`),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 1_000_000,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1_000_001,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: now + index * 2 + 1,
+			});
+		}
+		session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+		const messagesBeforeCompaction = session.messages.length;
+		const compactions: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_end" && !event.aborted && event.result) {
+				compactions.push(event.reason);
+			}
+		});
+		harness.setResponses([
+			fauxAssistantMessage("compacted history"),
+			fauxAssistantMessage("compacted turn prefix"),
+			fauxAssistantMessage("wake succeeded"),
+		]);
+
+		await controller.message("worker", "wake after compaction", true);
+		await record.run;
+
+		expect(compactions).toEqual(["overflow"]);
+		expect(session.messages.length).toBeLessThan(messagesBeforeCompaction);
+		expect(session.getLastAssistantText()).toBe("wake succeeded");
+		expect(record).toMatchObject({ status: "idle", finalText: "wake succeeded", error: undefined });
+	});
+
 	it("clears queued messages when interrupting an idle child", async () => {
 		const { harness, controller, createSession } = await setup();
 		harness.setResponses([fauxAssistantMessage("idle")]);

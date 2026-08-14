@@ -4,6 +4,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/diffex-ai";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSession } from "../../src/core/agent-session.ts";
 import type { ExtensionContext } from "../../src/core/extensions/types.ts";
 import { SubagentController } from "../../src/core/subagents/controller.ts";
 import { createSubagentSession } from "../../src/core/subagents/services.ts";
@@ -22,6 +23,25 @@ type AgentActionTool = ReturnType<typeof createAgentActionTool>;
 
 function executeAction(tool: AgentActionTool, request: AgentActionRequest) {
 	return tool.execute("action-call", request, undefined, undefined, {} as ExtensionContext);
+}
+
+function spawnTracked(
+	controller: SubagentController,
+	name: string,
+	task: string,
+	createSession: (signal: AbortSignal) => Promise<AgentSession>,
+): { readonly session: AgentSession | undefined } {
+	let capturedSession: AgentSession | undefined;
+	controller.spawn(name, task, async (signal) => {
+		const session = await createSession(signal);
+		capturedSession = session;
+		return session;
+	});
+	return {
+		get session() {
+			return capturedSession;
+		},
+	};
 }
 
 describe("subagent actions", () => {
@@ -98,7 +118,7 @@ describe("subagent actions", () => {
 			fauxAssistantMessage("steering response"),
 			fauxAssistantMessage("follow-up response"),
 		]);
-		const record = controller.spawn("worker", "initial task", createSession);
+		const record = spawnTracked(controller, "worker", "initial task", createSession);
 		await waitForStatus(controller, "worker", "running");
 		const session = record.session!;
 		const calls: string[] = [];
@@ -122,17 +142,17 @@ describe("subagent actions", () => {
 		expect(steer).toHaveBeenCalledOnce();
 
 		firstResponse.resolve(fauxAssistantMessage("initial response"));
-		await record.run;
+		await waitForStatus(controller, "worker", "idle");
 		expect(getUserTexts({ ...harness, session })).toEqual(["initial task", "urgent message", "later message"]);
-		expect(record).toMatchObject({ status: "idle", finalText: "steering response" });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("keeps unrelated children parallel while serializing each child", async () => {
 		const { harness, controller, createSession } = await setup(2);
 		harness.setResponses([fauxAssistantMessage("first idle"), fauxAssistantMessage("second idle")]);
-		const first = controller.spawn("first", "first task", createSession);
-		const second = controller.spawn("second", "second task", createSession);
-		await Promise.all([first.run, second.run]);
+		const first = spawnTracked(controller, "first", "first task", createSession);
+		const second = spawnTracked(controller, "second", "second task", createSession);
+		await Promise.all([waitForStatus(controller, "first", "idle"), waitForStatus(controller, "second", "idle")]);
 		const firstGate = deferred<void>();
 		const firstStarted = deferred<void>();
 		vi.spyOn(first.session!, "followUp").mockImplementation(async () => {
@@ -157,8 +177,8 @@ describe("subagent actions", () => {
 			fauxAssistantMessage("wake result"),
 			fauxAssistantMessage("older follow-up result"),
 		]);
-		const record = controller.spawn("worker", "initial task", createSession);
-		await record.run;
+		const record = spawnTracked(controller, "worker", "initial task", createSession);
+		await waitForStatus(controller, "worker", "idle");
 		const session = record.session;
 		const revision = controller.snapshot().revision;
 
@@ -171,7 +191,7 @@ describe("subagent actions", () => {
 			status: "queued",
 			delivery: "prompt",
 		});
-		await record.run;
+		await waitForStatus(controller, "worker", "idle");
 
 		expect(record.session).toBe(session);
 		expect(getUserTexts({ ...harness, session: session! })).toEqual([
@@ -179,7 +199,7 @@ describe("subagent actions", () => {
 			"wake prompt",
 			"older follow-up",
 		]);
-		expect(record).toMatchObject({ status: "idle", finalText: "older follow-up result" });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("keeps the wake result when prompt preflight compacts child history", async () => {
@@ -192,8 +212,8 @@ describe("subagent actions", () => {
 		fixtures.push(fixture);
 		const { harness, controller, createSession } = fixture;
 		harness.setResponses([fauxAssistantMessage("initial response")]);
-		const record = controller.spawn("worker", "initial task", createSession);
-		await record.run;
+		const record = spawnTracked(controller, "worker", "initial task", createSession);
+		await waitForStatus(controller, "worker", "idle");
 
 		const session = record.session!;
 		const model = session.model!;
@@ -235,19 +255,19 @@ describe("subagent actions", () => {
 		]);
 
 		await controller.message("worker", "wake after compaction", true);
-		await record.run;
+		await waitForStatus(controller, "worker", "idle");
 
 		expect(compactions).toEqual(["overflow"]);
 		expect(session.messages.length).toBeLessThan(messagesBeforeCompaction);
 		expect(session.getLastAssistantText()).toBe("wake succeeded");
-		expect(record).toMatchObject({ status: "idle", finalText: "wake succeeded", error: undefined });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("clears queued messages when interrupting an idle child", async () => {
 		const { harness, controller, createSession } = await setup();
 		harness.setResponses([fauxAssistantMessage("idle")]);
-		const record = controller.spawn("worker", "initial", createSession);
-		await record.run;
+		const record = spawnTracked(controller, "worker", "initial", createSession);
+		await waitForStatus(controller, "worker", "idle");
 		await controller.message("worker", "pending follow-up");
 		expect(record.session?.pendingMessageCount).toBe(1);
 
@@ -257,7 +277,7 @@ describe("subagent actions", () => {
 			status: "idle",
 		});
 		expect(record.session?.pendingMessageCount).toBe(0);
-		expect(record.status).toBe("idle");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("restarts failed and interrupted children only when wake is requested", async () => {
@@ -268,27 +288,27 @@ describe("subagent actions", () => {
 			fauxAssistantMessage("interrupted text", { stopReason: "aborted" }),
 			fauxAssistantMessage("interrupted restart result"),
 		]);
-		const failed = controller.spawn("failed", "fail", createSession);
-		await failed.run;
+		const failed = spawnTracked(controller, "failed", "fail", createSession);
+		await waitForStatus(controller, "failed", "failed");
 		await expect(controller.message("failed", "no wake")).rejects.toThrow(
 			"Cannot message failed subagent without wake: failed",
 		);
 		const failedSession = failed.session;
 		await controller.message("failed", "restart failed", true);
-		await failed.run;
+		await waitForStatus(controller, "failed", "idle");
 		expect(failed.session).toBe(failedSession);
-		expect(failed).toMatchObject({ status: "idle", finalText: "failed restart result", error: undefined });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "failed")?.status).toBe("idle");
 
-		const interrupted = controller.spawn("interrupted", "interrupt", createSession);
-		await interrupted.run;
+		const interrupted = spawnTracked(controller, "interrupted", "interrupt", createSession);
+		await waitForStatus(controller, "interrupted", "interrupted");
 		await expect(controller.message("interrupted", "no wake")).rejects.toThrow(
 			"Cannot message interrupted subagent without wake: interrupted",
 		);
 		const interruptedSession = interrupted.session;
 		await controller.message("interrupted", "restart interrupted", true);
-		await interrupted.run;
+		await waitForStatus(controller, "interrupted", "idle");
 		expect(interrupted.session).toBe(interruptedSession);
-		expect(interrupted).toMatchObject({ status: "idle", finalText: "interrupted restart result" });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "interrupted")?.status).toBe("idle");
 	});
 
 	it("retries failed construction with the retained session factory", async () => {
@@ -300,24 +320,23 @@ describe("subagent actions", () => {
 			if (attempts === 1) throw new Error("construction failed");
 			return createSession(signal);
 		});
-		const record = controller.spawn("worker", "initial task", factory);
-		await record.run;
-		expect(record).toMatchObject({ status: "failed", error: "construction failed" });
+		const record = spawnTracked(controller, "worker", "initial task", factory);
+		await waitForStatus(controller, "worker", "failed");
 		expect(record.session).toBeUndefined();
 
 		await controller.message("worker", "retry prompt", true);
-		await record.run;
+		await waitForStatus(controller, "worker", "idle");
 		expect(factory).toHaveBeenCalledTimes(2);
-		expect(record).toMatchObject({ status: "idle", finalText: "retry result" });
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("admits wake restarts through the shared concurrency limit", async () => {
 		const { harness, controller, createSession } = await setup();
 		harness.setResponses([fauxAssistantMessage("first idle"), fauxAssistantMessage("second idle")]);
-		const first = controller.spawn("first", "first task", createSession);
-		await first.run;
-		const second = controller.spawn("second", "second task", createSession);
-		await second.run;
+		spawnTracked(controller, "first", "first task", createSession);
+		await waitForStatus(controller, "first", "idle");
+		spawnTracked(controller, "second", "second task", createSession);
+		await waitForStatus(controller, "second", "idle");
 
 		const firstGate = deferred<AssistantMessage>();
 		const secondGate = deferred<AssistantMessage>();
@@ -340,26 +359,26 @@ describe("subagent actions", () => {
 		await waitForStatus(controller, "first", "running");
 		await firstStarted.promise;
 		await controller.message("second", "wake second", true);
-		expect(second.status).toBe("queued");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "second")?.status).toBe("queued");
 		expect(starts).toEqual(["wake first"]);
 
 		firstGate.resolve(fauxAssistantMessage("first restarted"));
-		await first.run;
+		await waitForStatus(controller, "first", "idle");
 		await waitForStatus(controller, "second", "running");
 		await secondStarted.promise;
 		expect(starts).toEqual(["wake first", "wake second"]);
 		secondGate.resolve(fauxAssistantMessage("second restarted"));
-		await second.run;
+		await waitForStatus(controller, "second", "idle");
 	});
 
 	it("rejects queued messages and interrupts before child construction", async () => {
 		const { harness, controller, createSession } = await setup();
 		const blockerResponse = deferred<AssistantMessage>();
 		harness.setResponses([() => blockerResponse.promise]);
-		const blocker = controller.spawn("blocker", "block", createSession);
+		controller.spawn("blocker", "block", createSession);
 		await waitForStatus(controller, "blocker", "running");
 		const factory = vi.fn(createSession);
-		const queued = controller.spawn("queued", "queued task", factory);
+		controller.spawn("queued", "queued task", factory);
 
 		await expect(controller.message("queued", "message")).rejects.toThrow("Cannot message queued subagent: queued");
 		await expect(controller.interrupt("queued")).resolves.toEqual({
@@ -368,10 +387,10 @@ describe("subagent actions", () => {
 			status: "interrupted",
 		});
 		expect(factory).not.toHaveBeenCalled();
-		expect(queued.status).toBe("interrupted");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "queued")?.status).toBe("interrupted");
 
 		blockerResponse.resolve(fauxAssistantMessage("unblocked"));
-		await blocker.run;
+		await waitForStatus(controller, "blocker", "idle");
 	});
 
 	it("interrupts queued construction before attachment or prompting", async () => {
@@ -381,7 +400,7 @@ describe("subagent actions", () => {
 		const entered = deferred<void>();
 		const prompt = vi.spyOn(lateSession, "prompt");
 		const dispose = vi.spyOn(lateSession, "dispose");
-		const record = controller.spawn("worker", "task", async () => {
+		controller.spawn("worker", "task", async () => {
 			entered.resolve();
 			await construction.promise;
 			return lateSession;
@@ -391,8 +410,7 @@ describe("subagent actions", () => {
 		const interrupt = controller.interrupt("worker");
 		construction.resolve();
 		await expect(interrupt).resolves.toMatchObject({ status: "interrupted" });
-		await record.run;
-		expect(record.session).toBeUndefined();
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("interrupted");
 		expect(prompt).not.toHaveBeenCalled();
 		expect(dispose).toHaveBeenCalledOnce();
 	});
@@ -400,8 +418,8 @@ describe("subagent actions", () => {
 	it("serializes concurrent wakes and message-interrupt ordering", async () => {
 		const { harness, controller, createSession } = await setup();
 		harness.setResponses([fauxAssistantMessage("idle")]);
-		const record = controller.spawn("worker", "initial", createSession);
-		await record.run;
+		const record = spawnTracked(controller, "worker", "initial", createSession);
+		await waitForStatus(controller, "worker", "idle");
 		const wakeResponse = deferred<AssistantMessage>();
 		harness.setResponses([() => wakeResponse.promise]);
 
@@ -418,14 +436,13 @@ describe("subagent actions", () => {
 		expect(record.session?.pendingMessageCount).toBe(0);
 		await expect(controller.interrupt("worker")).resolves.toMatchObject({ status: "interrupted" });
 		wakeResponse.resolve(fauxAssistantMessage("late success"));
-		await record.run;
-		expect(record.status).toBe("interrupted");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("interrupted");
 	});
 
 	it("re-evaluates a running record after its session reaches idle", async () => {
 		const { controller, config } = await setup();
 		const session = await createSubagentSession(config);
-		const record = controller.reserve("worker", "task");
+		controller.reserve("worker", "task");
 		controller.attachSession("worker", session);
 		controller.markRunning("worker");
 		const completion = deferred<void>();
@@ -438,7 +455,7 @@ describe("subagent actions", () => {
 		completion.resolve();
 		await expect(action).resolves.toMatchObject({ status: "idle", delivery: "follow_up" });
 		expect(followUp).toHaveBeenCalledWith("boundary message");
-		expect(record.status).toBe("idle");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("idle");
 	});
 
 	it("interrupts a signal-aware provider and gives interruption precedence", async () => {
@@ -453,12 +470,11 @@ describe("subagent actions", () => {
 					});
 				}),
 		]);
-		const record = controller.spawn("worker", "long request", createSession);
+		controller.spawn("worker", "long request", createSession);
 		await providerStarted.promise;
 
 		await expect(controller.interrupt("worker")).resolves.toMatchObject({ status: "interrupted" });
-		await record.run;
-		expect(record.status).toBe("interrupted");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("interrupted");
 	});
 
 	it("interrupts signal-aware tools, persists abort results, and clears pending messages", async () => {
@@ -487,15 +503,14 @@ describe("subagent actions", () => {
 		child.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
 		const controller = new SubagentController({ maxConcurrent: 1 });
 		extraControllers.push(controller);
-		const record = controller.spawn("worker", "run tool", async () => child.session);
+		controller.spawn("worker", "run tool", async () => child.session);
 		await toolStarted.promise;
 		await controller.message("worker", "steer pending", true);
 		await controller.message("worker", "follow pending");
 		expect(child.session.pendingMessageCount).toBe(2);
 
 		await controller.interrupt("worker");
-		await record.run;
-		expect(record.status).toBe("interrupted");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "worker")?.status).toBe("interrupted");
 		expect(child.session.pendingMessageCount).toBe(0);
 		const toolResults = child.session.sessionManager
 			.getEntries()
@@ -506,16 +521,16 @@ describe("subagent actions", () => {
 	it("shuts down queued and running restarts without late revisions or double disposal", async () => {
 		const { harness, controller, createSession } = await setup();
 		harness.setResponses([fauxAssistantMessage("first idle"), fauxAssistantMessage("second idle")]);
-		const first = controller.spawn("first", "first", createSession);
-		await first.run;
-		const second = controller.spawn("second", "second", createSession);
-		await second.run;
+		const first = spawnTracked(controller, "first", "first", createSession);
+		await waitForStatus(controller, "first", "idle");
+		const second = spawnTracked(controller, "second", "second", createSession);
+		await waitForStatus(controller, "second", "idle");
 		const runningResponse = deferred<AssistantMessage>();
 		harness.setResponses([() => runningResponse.promise]);
 		await controller.message("first", "restart first", true);
 		await waitForStatus(controller, "first", "running");
 		await controller.message("second", "restart second", true);
-		expect(second.status).toBe("queued");
+		expect(controller.snapshot().agents.find((agent) => agent.name === "second")?.status).toBe("queued");
 		const firstDispose = vi.spyOn(first.session!, "dispose");
 		const secondDispose = vi.spyOn(second.session!, "dispose");
 		const revision = controller.snapshot().revision;

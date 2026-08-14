@@ -20,6 +20,7 @@ export type SubagentActionResult =
 			readonly action: "interrupt";
 			readonly status: SubagentStatus;
 	  };
+
 export interface SubagentSnapshot {
 	readonly name: string;
 	readonly status: SubagentStatus;
@@ -32,6 +33,27 @@ export interface SubagentSnapshot {
 export interface SubagentControllerSnapshot {
 	readonly revision: number;
 	readonly agents: readonly SubagentSnapshot[];
+}
+
+export type SubagentQueryUntil = "any" | "all";
+
+export interface SubagentQueryOptions {
+	readonly timeoutMs: number;
+	readonly targets?: readonly string[];
+	readonly until?: SubagentQueryUntil;
+	readonly signal?: AbortSignal;
+}
+
+export interface SubagentResultView {
+	readonly name: string;
+	readonly status: SubagentStatus;
+	readonly result?: string;
+	readonly error?: string;
+}
+
+export interface SubagentQueryResult {
+	readonly timedOut: boolean;
+	readonly agents: readonly SubagentResultView[];
 }
 
 export type SubagentLifecycleEvent =

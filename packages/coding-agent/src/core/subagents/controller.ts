@@ -7,6 +7,9 @@ import type {
 	SubagentLifecycleEvent,
 	SubagentLifecycleListener,
 	SubagentPermit,
+	SubagentQueryOptions,
+	SubagentQueryResult,
+	SubagentResultView,
 	SubagentSnapshot,
 	SubagentStatus,
 	SubagentWaitOptions,
@@ -74,6 +77,12 @@ interface SubagentRecord {
 	interruptionRequested?: boolean;
 	actionTail?: Promise<void>;
 }
+
+function isTerminalStatus(status: SubagentStatus): boolean {
+	return status === "idle" || status === "failed" || status === "interrupted";
+}
+
+const MAX_TIMER_MS = 2_147_483_647;
 
 export class SubagentController {
 	readonly #maxConcurrent: number;
@@ -172,6 +181,61 @@ export class SubagentController {
 
 	snapshot(): SubagentControllerSnapshot {
 		return this.#createSnapshot();
+	}
+
+	async queryAgents(options: SubagentQueryOptions): Promise<SubagentQueryResult> {
+		if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 0) {
+			throw new RangeError("timeoutMs must be a non-negative integer");
+		}
+		if (options.until !== undefined && options.until !== "any" && options.until !== "all") {
+			throw new Error(`Invalid subagent query condition: ${String(options.until)}`);
+		}
+		if (options.signal?.aborted) {
+			throw options.signal.reason;
+		}
+		this.#assertOpen();
+
+		let snapshot = this.snapshot();
+		const targets = this.#selectQueryTargets(snapshot, options.targets);
+		let result = this.#createQueryResult(false, snapshot, targets);
+		if (
+			options.timeoutMs === 0 ||
+			targets.size === 0 ||
+			(options.until !== undefined && this.#queryConditionMet(result.agents, options.until))
+		) {
+			return result;
+		}
+
+		const deadline = performance.now() + options.timeoutMs;
+		while (true) {
+			const remainingMs = Math.min(deadline - performance.now(), MAX_TIMER_MS);
+			if (remainingMs <= 0) {
+				this.#assertOpen();
+				return this.#createQueryResult(true, this.snapshot(), targets);
+			}
+
+			const wait = await this.waitForChange(snapshot.revision, {
+				timeoutMs: remainingMs,
+				signal: options.signal,
+			});
+			if (options.signal?.aborted) {
+				throw options.signal.reason;
+			}
+			if (wait.reason === "disposed") {
+				throw this.#closedError();
+			}
+			this.#assertOpen();
+			snapshot = this.snapshot();
+			result = this.#createQueryResult(false, snapshot, targets);
+
+			if (wait.reason === "timeout") {
+				if (performance.now() < deadline) continue;
+				return this.#createQueryResult(true, snapshot, targets);
+			}
+			if (options.until === undefined || this.#queryConditionMet(result.agents, options.until)) {
+				return result;
+			}
+		}
 	}
 
 	subscribe(listener: SubagentLifecycleListener): () => void {
@@ -372,6 +436,57 @@ export class SubagentController {
 				return Object.freeze(snapshot);
 			});
 		return Object.freeze({ revision: this.#revision, agents: Object.freeze(agents) });
+	}
+
+	#selectQueryTargets(snapshot: SubagentControllerSnapshot, requested: readonly string[] | undefined): Set<string> {
+		if (requested === undefined) {
+			return new Set(snapshot.agents.map((agent) => agent.name));
+		}
+		if (!Array.isArray(requested) || requested.length === 0) {
+			throw new Error("Subagent query targets must be a non-empty array");
+		}
+
+		const targets = new Set<string>();
+		for (const target of requested) {
+			if (typeof target !== "string" || !SUBAGENT_NAME_PATTERN.test(target)) {
+				throw new Error(`Invalid subagent name: ${String(target)}`);
+			}
+			if (targets.has(target)) {
+				throw new Error(`Duplicate subagent target: ${target}`);
+			}
+			if (!this.#records.has(target)) {
+				throw new Error(`Unknown subagent: ${target}`);
+			}
+			targets.add(target);
+		}
+		return targets;
+	}
+
+	#createQueryResult(
+		timedOut: boolean,
+		snapshot: SubagentControllerSnapshot,
+		targets: ReadonlySet<string>,
+	): SubagentQueryResult {
+		const agents = snapshot.agents.flatMap((agent): SubagentResultView[] => {
+			if (!targets.has(agent.name)) return [];
+			const record = this.#records.get(agent.name);
+			if (!record) return [];
+			return [
+				Object.freeze({
+					name: agent.name,
+					status: agent.status,
+					...(record.finalText === undefined ? {} : { result: record.finalText }),
+					...(record.error === undefined ? {} : { error: record.error }),
+				}),
+			];
+		});
+		return Object.freeze({ timedOut, agents: Object.freeze(agents) });
+	}
+
+	#queryConditionMet(agents: readonly SubagentResultView[], until: "any" | "all"): boolean {
+		return until === "any"
+			? agents.some((agent) => isTerminalStatus(agent.status))
+			: agents.every((agent) => isTerminalStatus(agent.status));
 	}
 
 	#publish(createEvent: (revision: number) => SubagentLifecycleEvent, disposed = false): void {

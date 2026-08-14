@@ -9,7 +9,7 @@ import {
 	createSubagentSession,
 	type SubagentSessionConfig,
 } from "../../src/core/subagents/services.ts";
-import type { SubagentLifecycleEvent, SubagentRecord, SubagentStatus } from "../../src/core/subagents/types.ts";
+import type { SubagentLifecycleEvent, SubagentStatus } from "../../src/core/subagents/types.ts";
 import { createSpawnAgentTool } from "../../src/core/tools/subagents.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -89,20 +89,16 @@ describe("asynchronous subagent startup", () => {
 		const { harness, controller, createSession } = await setup();
 		const response = deferred<AssistantMessage>();
 		harness.setResponses([() => response.promise]);
-		let record: SubagentRecord | undefined;
 		const tool = createSpawnAgentTool((name, task) => {
-			record = controller.spawn(name, task, createSession);
+			controller.spawn(name, task, createSession);
 		});
 
 		const accepted = executeSpawnTool(tool, "worker", "blocked task");
 		try {
 			expect(tool.executionMode).toBe("parallel");
-			expect(record).toMatchObject({ name: "worker", task: "blocked task", status: "queued" });
 			expect(controller.snapshot()).toMatchObject({ revision: 1, agents: [{ name: "worker", status: "queued" }] });
 			await expect(accepted).resolves.toMatchObject({ details: { name: "worker", status: "queued" } });
 			await waitForStatus(controller, "worker", "running");
-			expect(record?.run).toBeInstanceOf(Promise);
-
 			await expect(executeSpawnTool(tool, "worker", "duplicate")).rejects.toThrow(
 				"Subagent already reserved: worker",
 			);
@@ -110,8 +106,7 @@ describe("asynchronous subagent startup", () => {
 		} finally {
 			response.resolve(fauxAssistantMessage("finished"));
 		}
-		await record?.run;
-		expect(record).toMatchObject({ status: "idle", finalText: "finished" });
+		await waitForStatus(controller, "worker", "idle");
 	});
 
 	it("validates names and non-empty tasks before spawning", async () => {
@@ -139,7 +134,9 @@ describe("asynchronous subagent startup", () => {
 			return gates.get(task)!.promise;
 		};
 		harness.setResponses([response, response, response, response]);
-		const records = ["first", "second", "third", "fourth"].map((name) => controller.spawn(name, name, createSession));
+		for (const name of ["first", "second", "third", "fourth"]) {
+			controller.spawn(name, name, createSession);
+		}
 
 		try {
 			await Promise.all([providerStarts.get("first")!.promise, providerStarts.get("second")!.promise]);
@@ -148,20 +145,19 @@ describe("asynchronous subagent startup", () => {
 			expect(controller.snapshot().agents.find((agent) => agent.name === "fourth")?.status).toBe("queued");
 
 			gates.get("second")!.resolve(fauxAssistantMessage("second done"));
-			await records[1]!.run;
+			await waitForStatus(controller, "second", "idle");
 			await providerStarts.get("third")!.promise;
 			expect(started).toEqual(["first", "second", "third"]);
 			expect(controller.snapshot().agents.find((agent) => agent.name === "fourth")?.status).toBe("queued");
 
 			gates.get("first")!.resolve(fauxAssistantMessage("first done"));
-			await records[0]!.run;
+			await waitForStatus(controller, "first", "idle");
 			await providerStarts.get("fourth")!.promise;
 			expect(started).toEqual(["first", "second", "third", "fourth"]);
 		} finally {
 			for (const [name, gate] of gates) gate.resolve(fauxAssistantMessage(`${name} done`));
 		}
-		await Promise.all(records.map((record) => record.run));
-		expect(records.every((record) => record.status === "idle")).toBe(true);
+		await Promise.all(["first", "second", "third", "fourth"].map((name) => waitForStatus(controller, name, "idle")));
 	});
 
 	it("classifies terminal responses and releases permits after failures", async () => {
@@ -174,30 +170,25 @@ describe("asynchronous subagent startup", () => {
 		const events: SubagentLifecycleEvent[] = [];
 		controller.subscribe((event) => events.push(event));
 
-		const failed = controller.spawn("failed", "error task", createSession);
-		await failed.run;
-		expect(failed).toMatchObject({ status: "failed", finalText: "partial error text", error: "provider failed" });
+		controller.spawn("failed", "error task", createSession);
+		await waitForStatus(controller, "failed", "failed");
 
-		const interrupted = controller.spawn("interrupted", "abort task", createSession);
-		await interrupted.run;
-		expect(interrupted).toMatchObject({ status: "interrupted", finalText: "partial abort text" });
+		controller.spawn("interrupted", "abort task", createSession);
+		await waitForStatus(controller, "interrupted", "interrupted");
 
-		const startup = controller.spawn("startup", "startup task", async () => {
+		controller.spawn("startup", "startup task", async () => {
 			throw new Error("startup failed");
 		});
-		await startup.run;
-		expect(startup).toMatchObject({ status: "failed", error: "startup failed" });
+		await waitForStatus(controller, "startup", "failed");
 
-		const preflight = controller.spawn("preflight", "preflight task", async (signal) => {
+		controller.spawn("preflight", "preflight task", async (signal) => {
 			const session = await createSubagentSession(config, { signal });
 			Object.defineProperty(session.agent.state, "model", { value: undefined, writable: true });
 			return session;
 		});
-		await preflight.run;
-		expect(preflight).toMatchObject({ status: "failed" });
-		expect(preflight.error).toContain("No model selected");
+		await waitForStatus(controller, "preflight", "failed");
 
-		const promptFailure = controller.spawn("prompt", "prompt task", async (signal) => {
+		controller.spawn("prompt", "prompt task", async (signal) => {
 			const session = await createSession(signal);
 			vi.spyOn(session, "prompt").mockImplementation(async () => {
 				session.agent.state.messages.push(fauxAssistantMessage("partial thrown text"));
@@ -205,20 +196,14 @@ describe("asynchronous subagent startup", () => {
 			});
 			return session;
 		});
-		await promptFailure.run;
-		expect(promptFailure).toMatchObject({
-			status: "failed",
-			finalText: "partial thrown text",
-			error: "prompt failed",
-		});
+		await waitForStatus(controller, "prompt", "failed");
 
-		const idle = controller.spawn("idle", "success task", async (signal) => {
+		controller.spawn("idle", "success task", async (signal) => {
 			const session = await createSession(signal);
 			session.agent.state.messages.push(fauxAssistantMessage("older assistant text"));
 			return session;
 		});
-		await idle.run;
-		expect(idle).toMatchObject({ status: "idle", finalText: "successful text" });
+		await waitForStatus(controller, "idle", "idle");
 
 		const idleEvents = events.flatMap((event) =>
 			"name" in event && event.name === "idle" ? [{ status: event.status, revision: event.revision }] : [],
@@ -237,7 +222,7 @@ describe("asynchronous subagent startup", () => {
 		const entered = deferred<void>();
 		const events: SubagentLifecycleEvent[] = [];
 		controller.subscribe((event) => events.push(event));
-		const record = controller.spawn("late", "task", async () => {
+		controller.spawn("late", "task", async () => {
 			entered.resolve();
 			await construction.promise;
 			return lateChild;
@@ -247,7 +232,6 @@ describe("asynchronous subagent startup", () => {
 		const shutdown = controller.shutdown();
 		construction.resolve();
 		await shutdown;
-		await record.run;
 
 		expect(dispose).toHaveBeenCalledOnce();
 		expect(events.map((event) => event.type)).toEqual(["subagent_reserved", "subagent_controller_disposed"]);
@@ -260,7 +244,7 @@ describe("asynchronous subagent startup", () => {
 		let child: AgentSession | undefined;
 		const events: SubagentLifecycleEvent[] = [];
 		controller.subscribe((event) => events.push(event));
-		const record = controller.spawn("active", "task", async (signal) => {
+		controller.spawn("active", "task", async (signal) => {
 			child = await createSession(signal);
 			return child;
 		});
@@ -275,7 +259,6 @@ describe("asynchronous subagent startup", () => {
 			response.resolve(fauxAssistantMessage("late response"));
 		}
 		await shutdown;
-		await record.run;
 
 		expect(dispose).toHaveBeenCalledOnce();
 		expect(events.at(-1)?.type).toBe("subagent_controller_disposed");

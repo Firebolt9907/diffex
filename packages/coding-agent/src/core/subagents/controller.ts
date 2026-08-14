@@ -1,6 +1,9 @@
 import type { AssistantMessage } from "@earendil-works/diffex-ai";
 import type { AgentSession } from "../agent-session.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
+import { createAgentActionTool, createAgentsTool, createSpawnAgentTool } from "../tools/subagents.ts";
 import type {
+	CaptureSubagentSession,
 	CreateSubagentSession,
 	SubagentActionResult,
 	SubagentControllerSnapshot,
@@ -86,6 +89,7 @@ const MAX_TIMER_MS = 2_147_483_647;
 
 export class SubagentController {
 	readonly #maxConcurrent: number;
+	readonly #captureSession: CaptureSubagentSession | undefined;
 	readonly #records = new Map<string, SubagentRecord>();
 	readonly #listeners = new Set<SubagentLifecycleListener>();
 	readonly #waiters = new Set<RevisionWaiter>();
@@ -93,13 +97,43 @@ export class SubagentController {
 	#activePermits = 0;
 	#revision = 0;
 	#closed = false;
+	#parent: AgentSession | undefined;
 	#shutdownPromise: Promise<void> | undefined;
 
-	constructor(options: { maxConcurrent: number }) {
+	constructor(options: { maxConcurrent: number; captureSession?: CaptureSubagentSession }) {
 		if (!Number.isInteger(options.maxConcurrent) || options.maxConcurrent <= 0) {
 			throw new RangeError("maxConcurrent must be a positive integer");
 		}
 		this.#maxConcurrent = options.maxConcurrent;
+		this.#captureSession = options.captureSession;
+	}
+
+	createToolDefinitions(): ToolDefinition[] {
+		const definitions = [
+			createSpawnAgentTool((name, task) => {
+				const parent = this.#getBoundParent();
+				const createSession = this.#captureSession?.(parent);
+				if (!createSession) {
+					throw new Error("Subagent session capture is unavailable");
+				}
+				this.spawn(name, task, createSession);
+			}),
+			createAgentActionTool((request) =>
+				request.action === "message"
+					? this.message(request.target, request.message, request.wake)
+					: this.interrupt(request.target),
+			),
+			createAgentsTool((options) => this.queryAgents(options)),
+		];
+		return definitions.map((definition) => definition as unknown as ToolDefinition);
+	}
+
+	bindParent(session: AgentSession): void {
+		this.#assertOpen();
+		if (this.#parent) {
+			throw new Error("Subagent controller parent is already bound");
+		}
+		this.#parent = session;
 	}
 
 	reserve(name: string, task: string): void {
@@ -339,6 +373,7 @@ export class SubagentController {
 			record.runController?.abort(closedError);
 		}
 		this.#records.clear();
+		this.#parent = undefined;
 		this.#publish(
 			(revision) => ({
 				type: "subagent_controller_disposed",
@@ -410,6 +445,14 @@ export class SubagentController {
 			throw new Error(`Unknown subagent: ${name}`);
 		}
 		return record;
+	}
+
+	#getBoundParent(): AgentSession {
+		this.#assertOpen();
+		if (!this.#parent) {
+			throw new Error("Subagent controller parent is not bound");
+		}
+		return this.#parent;
 	}
 
 	#getRecordForUpdate(name: string): SubagentRecord | undefined {

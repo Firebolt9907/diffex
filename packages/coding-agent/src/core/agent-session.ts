@@ -225,6 +225,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Release resources owned by the session when it is disposed. */
+	onDispose?: () => void;
 }
 
 export interface ExtensionBindings {
@@ -360,6 +362,8 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private readonly _onDispose: (() => void) | undefined;
+	private _disposed = false;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -389,6 +393,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._onDispose = config.onDispose;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -837,6 +842,14 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._disposed) return;
+		this._disposed = true;
+		try {
+			this._onDispose?.();
+		} catch {
+			// Dispose must continue even if an owned resource throws.
+		}
+
 		try {
 			this.abortRetry();
 			this.abortCompaction();

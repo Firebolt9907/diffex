@@ -271,6 +271,7 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export type { SubagentStatus, SubagentSummary } from "./core/subagents/types.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
@@ -378,6 +379,7 @@ export {
 	SettingsSelectorComponent,
 	ShowImagesSelectorComponent,
 	SkillInvocationMessageComponent,
+	SubagentsComponent,
 	ThemeSelectorComponent,
 	ThinkingSelectorComponent,
 	ToolExecutionComponent,

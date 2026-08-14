@@ -373,6 +373,7 @@ export class SubagentController {
 			record.runController?.abort(closedError);
 		}
 		this.#records.clear();
+		this.#parent = undefined;
 		this.#publish(
 			(revision) => ({
 				type: "subagent_controller_disposed",

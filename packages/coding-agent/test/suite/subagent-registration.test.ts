@@ -205,6 +205,35 @@ describe("root subagent tool registration", () => {
 		await controller.shutdown();
 	});
 
+	it("shuts down coordination tools when the root session is disposed", async () => {
+		const harness = await setupHarness();
+		const childStarted = deferred<void>();
+		let childSignal: AbortSignal | undefined;
+		harness.setResponses([
+			async (_context, options) => {
+				childSignal = options?.signal;
+				childStarted.resolve();
+				await new Promise<void>((resolve) => {
+					options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return fauxAssistantMessage("child stopped");
+			},
+		]);
+		const { session } = await createRoot(harness);
+		const spawn = getActiveTool(session, "spawn_agent");
+		const agents = session.getToolDefinition("agents");
+		if (!agents) throw new Error("Missing agents tool definition");
+
+		await spawn.execute("spawn", { name: "worker", task: "keep working" });
+		await childStarted.promise;
+		session.dispose();
+
+		expect(childSignal?.aborted).toBe(true);
+		await expect(agents.execute("list", { timeout_ms: 0 }, undefined, undefined, {} as never)).rejects.toThrow(
+			"Subagent controller is shut down",
+		);
+	});
+
 	it("spawns through the root tool and retrieves the child result", async () => {
 		const harness = await setupHarness();
 		const childContexts: Context[] = [];

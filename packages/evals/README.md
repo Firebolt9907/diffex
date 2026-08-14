@@ -61,7 +61,7 @@ describeEval("Diffex smoke", { harness }, (it) => {
 - `name`: stable harness identity used by reports and comparisons.
 - `model`: optional `{ provider, id }` selection. It overrides the runner's default model.
 - `noTools`: Diffex's tool-disable configuration.
-- `subagents`: Child-agent configuration passed to `createAgentSession()`, including `false` to disable coordination tools or `{ maxConcurrent }` to change concurrency.
+- `subagents`: Child agents are disabled by default so reported usage covers the complete run; pass `{ maxConcurrent }` to enable them explicitly.
 - `transformSystemPrompt`: transforms the complete default prompt before the eval starts.
 - `output`: transforms the final response and `AgentSession` into a JSON-safe domain result.
 

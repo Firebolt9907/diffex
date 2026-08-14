@@ -148,7 +148,7 @@ async function runDiffexCodingAgent<TOutput extends JsonValue>(
 				model,
 				thinkingLevel: "off",
 				noTools: options.noTools,
-				subagents: options.subagents,
+				subagents: options.subagents ?? false,
 			})
 		).session;
 

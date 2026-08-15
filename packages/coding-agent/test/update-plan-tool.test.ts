@@ -165,47 +165,42 @@ describe("update_plan tool", () => {
 		).rejects.toThrow("Plan item 1 status must be pending, in_progress, or completed.");
 	});
 
-	test("publishes a DeepSeek-compatible object schema", () => {
+	test("publishes a provider-compatible object schema", () => {
 		const definition = createUpdatePlanToolDefinition();
 		const parameters = definition.parameters as {
 			type?: string;
-			anyOf?: Array<{
-				additionalProperties?: boolean;
-				properties?: {
-					clear?: { const?: boolean };
-					explanation?: { type?: string };
-					plan?: {
-						minItems?: number;
-						items?: {
-							additionalProperties?: boolean;
-							properties?: {
-								status?: { enum?: string[] };
-							};
+			additionalProperties?: boolean;
+			properties?: {
+				clear?: { const?: boolean };
+				explanation?: { type?: string };
+				plan?: {
+					minItems?: number;
+					items?: {
+						additionalProperties?: boolean;
+						properties?: {
+							status?: { enum?: string[] };
 						};
 					};
 				};
-				required?: string[];
-			}>;
+			};
+			required?: string[];
 		};
-		const update = parameters.anyOf?.[0];
-		const clear = parameters.anyOf?.[1];
 
 		expect(parameters.type).toBe("object");
-		expect(parameters.anyOf).toHaveLength(2);
-		expect(update?.required).toEqual(["plan"]);
-		expect(update?.additionalProperties).toBe(false);
-		expect(update?.properties?.plan?.minItems).toBe(1);
-		expect(update?.properties?.plan?.items?.additionalProperties).toBe(false);
-		expect(update?.properties?.plan?.items?.properties?.status?.enum).toEqual([
+		expect(parameters.additionalProperties).toBe(false);
+		expect(parameters.required).toBeUndefined();
+		for (const keyword of ["oneOf", "anyOf", "allOf", "enum", "const", "not"]) {
+			expect(parameters).not.toHaveProperty(keyword);
+		}
+		expect(parameters.properties?.plan?.minItems).toBe(1);
+		expect(parameters.properties?.plan?.items?.additionalProperties).toBe(false);
+		expect(parameters.properties?.plan?.items?.properties?.status?.enum).toEqual([
 			"pending",
 			"in_progress",
 			"completed",
 		]);
-		expect(update?.properties?.explanation?.type).toBe("string");
-		expect(clear?.required).toEqual(["clear"]);
-		expect(clear?.additionalProperties).toBe(false);
-		expect(clear?.properties?.clear?.const).toBe(true);
-		expect(clear?.properties?.explanation?.type).toBe("string");
+		expect(parameters.properties?.clear?.const).toBe(true);
+		expect(parameters.properties?.explanation?.type).toBe("string");
 	});
 
 	test("sends the object schema through a DeepSeek interaction", async () => {
@@ -238,6 +233,48 @@ describe("update_plan tool", () => {
 		};
 		const updatePlan = sentPayload.tools?.find((tool) => tool.function?.name === "update_plan");
 		expect(updatePlan?.function?.parameters?.type).toBe("object");
+		expect(result.stopReason).toBe("stop");
+	});
+
+	test("sends the object schema through an OpenAI Responses interaction", async () => {
+		const model = getModel("openai", "gpt-5-mini");
+		expect(model).toBeDefined();
+		if (!model) throw new Error("Expected the OpenAI model fixture");
+		let payload: unknown;
+
+		const result = await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "Plan this task", timestamp: Date.now() }],
+				tools: [createUpdatePlanTool()],
+			},
+			{
+				apiKey: "test-key",
+				fetch: async () =>
+					new Response(
+						`data: ${JSON.stringify({
+							type: "response.completed",
+							response: {
+								status: "completed",
+								usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+							},
+						})}\n\n`,
+						{ status: 200, headers: { "content-type": "text/event-stream" } },
+					),
+				onPayload: (requestPayload) => {
+					payload = requestPayload;
+				},
+			},
+		).result();
+
+		const sentPayload = payload as {
+			tools?: Array<{ name?: string; parameters?: Record<string, unknown> & { type?: string } }>;
+		};
+		const updatePlan = sentPayload.tools?.find((tool) => tool.name === "update_plan");
+		expect(updatePlan?.parameters?.type).toBe("object");
+		for (const keyword of ["oneOf", "anyOf", "allOf", "enum", "const", "not"]) {
+			expect(updatePlan?.parameters).not.toHaveProperty(keyword);
+		}
 		expect(result.stopReason).toBe("stop");
 	});
 

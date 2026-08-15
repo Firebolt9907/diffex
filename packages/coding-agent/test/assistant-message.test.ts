@@ -44,6 +44,26 @@ describe("AssistantMessageComponent", () => {
 		expect(lines[lines.length - 1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
 	});
 
+	test("renders headings and code blocks without Markdown delimiters", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{
+					type: "text",
+					text: "### Agent observability vocabulary\n\n```python\nexample...\n```",
+				},
+			]),
+		);
+		const rendered = stripAnsi(component.render(80).join("\n"));
+
+		expect(rendered).toContain("Agent observability vocabulary");
+		expect(rendered).toContain("┌─ python");
+		expect(rendered).toContain("example...");
+		expect(rendered).not.toContain("###");
+		expect(rendered).not.toContain("```");
+	});
+
 	test("does not add OSC 133 zone markers when assistant message contains tool calls", () => {
 		initTheme("dark");
 

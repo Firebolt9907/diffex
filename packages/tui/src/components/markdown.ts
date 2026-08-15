@@ -462,7 +462,6 @@ export class Markdown implements Component {
 		switch (token.type) {
 			case "heading": {
 				const headingLevel = token.depth;
-				const headingPrefix = `${"#".repeat(headingLevel)} `;
 
 				// Build a heading-specific style context so inline tokens (codespan, bold, etc.)
 				// restore heading styling after their own ANSI resets instead of falling back to
@@ -480,8 +479,7 @@ export class Markdown implements Component {
 				};
 
 				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
-				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
-				lines.push(styledHeading);
+				lines.push(headingText);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)
 				}
@@ -519,7 +517,8 @@ export class Markdown implements Component {
 
 			case "code": {
 				const indent = this.theme.codeBlockIndent ?? "  ";
-				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
+				const languageLabel = token.lang ? ` ${token.lang}` : "";
+				lines.push(this.theme.codeBlockBorder(`┌─${languageLabel}`));
 				if (this.theme.highlightCode) {
 					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
 					for (const hlLine of highlightedLines) {
@@ -532,7 +531,7 @@ export class Markdown implements Component {
 						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
 					}
 				}
-				lines.push(this.theme.codeBlockBorder("```"));
+				lines.push(this.theme.codeBlockBorder("└─"));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}

@@ -3,6 +3,11 @@ import type { WorkingIndicatorOptions } from "../../../core/extensions/index.ts"
 import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
 import { keyText } from "./keybinding-hints.ts";
+import { createSpinnerVerbSequence } from "./spinner-verbs.ts";
+
+const SPINNER_VERB_CHANGE_INTERVAL_MS = 5000;
+const SPINNER_VERB_DOT_INTERVAL_MS = 500;
+const SPINNER_VERB_CHANGE_TICKS = SPINNER_VERB_CHANGE_INTERVAL_MS / SPINNER_VERB_DOT_INTERVAL_MS;
 
 export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary" | "subagentWait";
 
@@ -27,15 +32,66 @@ export class StatusIndicator extends Loader {
 }
 
 export class WorkingStatusIndicator extends StatusIndicator {
-	constructor(ui: TUI, message: string, indicator?: WorkingIndicatorOptions) {
+	private readonly nextSpinnerVerb: () => string;
+	private currentSpinnerVerb: string;
+	private verbAnimationIntervalId: NodeJS.Timeout | undefined;
+	private verbAnimationTick = 0;
+
+	constructor(ui: TUI, message?: string, indicator?: WorkingIndicatorOptions) {
+		const nextSpinnerVerb = createSpinnerVerbSequence();
+		const initialSpinnerVerb = message === undefined ? nextSpinnerVerb() : "";
 		super(
 			"working",
 			ui,
 			(spinner) => theme.fg("accent", spinner),
 			(text) => theme.fg("muted", text),
-			message,
+			message ?? `${initialSpinnerVerb}.`,
 			indicator,
 		);
+		this.nextSpinnerVerb = nextSpinnerVerb;
+		this.currentSpinnerVerb = initialSpinnerVerb;
+		if (message === undefined) {
+			this.startVerbAnimation(false);
+		}
+	}
+
+	setWorkingMessage(message?: string): void {
+		if (message !== undefined) {
+			this.stopVerbAnimation();
+			this.setMessage(message);
+			return;
+		}
+		this.startVerbAnimation(true);
+	}
+
+	override dispose(): void {
+		this.stopVerbAnimation();
+		super.dispose();
+	}
+
+	private startVerbAnimation(updateImmediately: boolean): void {
+		this.stopVerbAnimation();
+		if (updateImmediately) {
+			this.currentSpinnerVerb = this.nextSpinnerVerb();
+			this.verbAnimationTick = 0;
+			this.setMessage(`${this.currentSpinnerVerb}.`);
+		}
+		this.verbAnimationIntervalId = setInterval(() => {
+			this.verbAnimationTick += 1;
+			if (this.verbAnimationTick === SPINNER_VERB_CHANGE_TICKS) {
+				this.currentSpinnerVerb = this.nextSpinnerVerb();
+				this.verbAnimationTick = 0;
+			}
+			const dots = ".".repeat((this.verbAnimationTick % 3) + 1);
+			this.setMessage(`${this.currentSpinnerVerb}${dots}`);
+		}, SPINNER_VERB_DOT_INTERVAL_MS);
+	}
+
+	private stopVerbAnimation(): void {
+		if (this.verbAnimationIntervalId !== undefined) {
+			clearInterval(this.verbAnimationIntervalId);
+			this.verbAnimationIntervalId = undefined;
+		}
 	}
 }
 

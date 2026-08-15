@@ -138,7 +138,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.ts";
 import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent, formatCwdForFooter, formatTokens } from "./components/footer.ts";
-import { formatKeyText, keyDisplayText, keyText } from "./components/keybinding-hints.ts";
+import { formatKeyText, keyDisplayText } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
@@ -450,7 +450,6 @@ export class InteractiveMode {
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: WorkingIndicatorOptions | undefined = undefined;
-	private readonly defaultWorkingMessage = "Working...";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -2090,11 +2089,7 @@ export class InteractiveMode {
 		}
 		if (this.session.isStreaming && this.activeStatusIndicator?.kind !== "working") {
 			this.showStatusIndicator(
-				new WorkingStatusIndicator(
-					this.ui,
-					this.workingMessage ?? this.defaultWorkingMessage,
-					this.workingIndicatorOptions,
-				),
+				new WorkingStatusIndicator(this.ui, this.workingMessage, this.workingIndicatorOptions),
 			);
 		}
 		this.ui.requestRender();
@@ -2203,10 +2198,8 @@ export class InteractiveMode {
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
-		if (this.activeStatusIndicator?.kind === "working") {
-			this.activeStatusIndicator.setMessage(
-				`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`,
-			);
+		if (this.activeStatusIndicator instanceof WorkingStatusIndicator) {
+			this.activeStatusIndicator.setWorkingMessage();
 		}
 		this.setHiddenThinkingLabel();
 	}
@@ -2369,8 +2362,8 @@ export class InteractiveMode {
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
-				if (this.activeStatusIndicator?.kind === "working") {
-					this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
+				if (this.activeStatusIndicator instanceof WorkingStatusIndicator) {
+					this.activeStatusIndicator.setWorkingMessage(message);
 				}
 			},
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
@@ -3103,11 +3096,7 @@ export class InteractiveMode {
 				}
 				if (this.workingVisible) {
 					this.showStatusIndicator(
-						new WorkingStatusIndicator(
-							this.ui,
-							this.workingMessage ?? this.defaultWorkingMessage,
-							this.workingIndicatorOptions,
-						),
+						new WorkingStatusIndicator(this.ui, this.workingMessage, this.workingIndicatorOptions),
 					);
 				} else {
 					this.clearStatusIndicator();

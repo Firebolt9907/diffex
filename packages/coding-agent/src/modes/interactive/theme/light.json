@@ -6,7 +6,7 @@
 		"blue": "#547da7",
 		"green": "#588458",
 		"red": "#aa5555",
-		"yellow": "#9a7326",
+		"yellow": "#8F8F67",
 		"text": "#1f2328",
 		"mediumGray": "#6c6c6c",
 		"dimGray": "#767676",
@@ -25,6 +25,7 @@
 		"border": "blue",
 		"borderAccent": "teal",
 		"borderMuted": "lightGray",
+		"editorBorder": "#3C597A",
 		"success": "green",
 		"error": "red",
 		"warning": "yellow",
@@ -34,7 +35,7 @@
 		"thinkingText": "mediumGray",
 		"startupIntroText": "startupIntroText",
 		"startupIntroAccent": "startupIntroAccent",
-		"autocompleteSelected": "startupIntroAccent",
+		"selectionAccent": "startupIntroAccent",
 
 		"selectedBg": "selectedBg",
 		"scrollbarThumb": "selectedBg",
@@ -82,7 +83,7 @@
 		"thinkingXhigh": "#8b008b",
 		"thinkingMax": "#af005f",
 
-		"bashMode": "green"
+		"bashMode": "red"
 	},
 	"export": {
 		"pageBg": "#f8f8f8",

@@ -34,6 +34,7 @@ import {
 	Markdown,
 	matchesKey,
 	ProcessTerminal,
+	SELECTED_LIST_PREFIX,
 	Spacer,
 	setKeybindings,
 	Text,
@@ -596,6 +597,10 @@ export class InteractiveMode {
 		this.defaultEditor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings, {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
+			prompt: SELECTED_LIST_PREFIX,
+			promptStyle: (text) =>
+				this.isBashMode ? theme.fg("bashMode", text.replace(/^>/, "!")) : theme.fg("selectionAccent", text),
+			concealedInputPrefix: "!",
 			placeholder: "Ask Diffex to do something for you.",
 			placeholderStyle: (text) => theme.fg("muted", text),
 		});
@@ -941,16 +946,17 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logo = diffexIntroAccent("Diffex") + diffexIntroText(` v${this.version}`);
-			const projectDirectory = diffexIntroText(
-				formatCwdForFooter(this.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE),
-			);
-			const headerLines = [logo, projectDirectory, ...this.getStartupWhatsNewLines()];
-			const headerDetails = headerLines.join("\n");
+			const getHeaderDetails = () => {
+				const logo = diffexIntroAccent("Diffex") + diffexIntroText(` v${this.version}`);
+				const projectDirectory = diffexIntroText(
+					formatCwdForFooter(this.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE),
+				);
+				return [logo, projectDirectory, ...this.getStartupWhatsNewLines()].join("\n");
+			};
 			this.builtInHeader = new DiffexWelcomeHeader(
 				this.ui,
-				() => headerDetails,
-				() => headerDetails,
+				getHeaderDetails,
+				getHeaderDetails,
 				this.getStartupExpansionState(),
 			);
 
@@ -2827,10 +2833,8 @@ export class InteractiveMode {
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
-			this.isBashMode = text.trimStart().startsWith("!");
-			if (wasBashMode !== this.isBashMode) {
-				this.updateEditorBorderColor();
-			}
+			this.isBashMode = text.startsWith("!");
+			if (wasBashMode !== this.isBashMode) this.updateEditorBorderColor();
 		};
 
 		// Handle clipboard paste (triggered on Ctrl+V). Images are attached by path;
@@ -2883,6 +2887,22 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+
+			if (text.startsWith("!")) {
+				const isExcluded = text.startsWith("!!");
+				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+				if (!command) return;
+				if (this.session.isBashRunning) {
+					this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+					this.editor.setText(text);
+					return;
+				}
+				this.editor.addToHistory?.(text);
+				await this.handleBashCommand(command, isExcluded);
+				this.isBashMode = false;
+				this.updateEditorBorderColor();
+				return;
+			}
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3017,24 +3037,6 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.shutdown();
 				return;
-			}
-
-			// Handle bash command (! for normal, !! for excluded from context)
-			if (text.startsWith("!")) {
-				const isExcluded = text.startsWith("!!");
-				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
-				if (command) {
-					if (this.session.isBashRunning) {
-						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
-						this.editor.setText(text);
-						return;
-					}
-					this.editor.addToHistory?.(text);
-					await this.handleBashCommand(command, isExcluded);
-					this.isBashMode = false;
-					this.updateEditorBorderColor();
-					return;
-				}
 			}
 
 			// Queue input during compaction (extension commands execute immediately)
@@ -4038,8 +4040,7 @@ export class InteractiveMode {
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
-			const level = this.session.thinkingLevel || "off";
-			this.editor.borderColor = theme.getThinkingBorderColor(level);
+			this.editor.borderColor = getEditorTheme().borderColor;
 		}
 		this.ui.requestRender();
 	}
@@ -4137,6 +4138,10 @@ export class InteractiveMode {
 	// =========================================================================
 
 	clearEditor(): void {
+		if (this.isBashMode) {
+			this.isBashMode = false;
+			this.updateEditorBorderColor();
+		}
 		this.editor.setText("");
 		this.ui.requestRender();
 	}
@@ -6268,9 +6273,6 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return;
 			}
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ Session cleared")}`, 1, 1));
-			this.ui.requestRender();
 		} catch (error: unknown) {
 			await this.handleFatalRuntimeError("Failed to create session", error);
 		}

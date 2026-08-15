@@ -233,6 +233,9 @@ export interface EditorTheme {
 export interface EditorOptions {
 	paddingX?: number;
 	autocompleteMaxVisible?: number;
+	prompt?: string;
+	promptStyle?: (text: string) => string;
+	concealedInputPrefix?: string;
 	placeholder?: string;
 	placeholderStyle?: (text: string) => string;
 }
@@ -243,6 +246,7 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 };
 
 const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS = 20;
+const CURSOR_BLINK_INTERVAL_MS = 500;
 const DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS = ["@", "#"];
 
 function escapeCharacterClass(value: string): string {
@@ -282,8 +286,13 @@ export class Editor implements Component, Focusable {
 	protected tui: TUI;
 	private theme: EditorTheme;
 	private paddingX: number = 0;
+	private prompt: string = "";
+	private promptStyle: (text: string) => string = (text) => text;
+	private concealedInputPrefix: string = "";
 	private placeholder: string = "";
 	private placeholderStyle: (text: string) => string = (text) => text;
+	private cursorBlinkVisible = true;
+	private cursorBlinkTimer?: ReturnType<typeof setTimeout>;
 
 	// Store last render width for cursor navigation
 	private lastWidth: number = 80;
@@ -354,6 +363,9 @@ export class Editor implements Component, Focusable {
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
+		this.prompt = options.prompt ?? "";
+		this.promptStyle = options.promptStyle ?? ((text) => text);
+		this.concealedInputPrefix = options.concealedInputPrefix ?? "";
 		this.placeholder = options.placeholder ?? "";
 		this.placeholderStyle = options.placeholderStyle ?? ((text) => text);
 	}
@@ -421,6 +433,28 @@ export class Editor implements Component, Focusable {
 
 	private isEditorEmpty(): boolean {
 		return this.state.lines.length === 1 && this.state.lines[0] === "";
+	}
+
+	private updateCursorBlink(shouldBlink: boolean): void {
+		if (!shouldBlink) {
+			if (this.cursorBlinkTimer) {
+				clearTimeout(this.cursorBlinkTimer);
+				this.cursorBlinkTimer = undefined;
+			}
+			this.cursorBlinkVisible = true;
+			return;
+		}
+
+		if (this.cursorBlinkTimer) return;
+		this.cursorBlinkTimer = setTimeout(() => {
+			this.cursorBlinkTimer = undefined;
+			if (!this.focused || !this.isEditorEmpty() || this.placeholder.length === 0 || this.autocompleteState) {
+				this.cursorBlinkVisible = true;
+				return;
+			}
+			this.cursorBlinkVisible = !this.cursorBlinkVisible;
+			this.tui.requestRender();
+		}, CURSOR_BLINK_INTERVAL_MS);
 	}
 
 	private isOnFirstVisualLine(): boolean {
@@ -493,7 +527,10 @@ export class Editor implements Component, Focusable {
 	render(width: number): string[] {
 		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
 		const paddingX = Math.min(this.paddingX, maxPadding);
-		const contentWidth = Math.max(1, width - paddingX * 2);
+		const innerWidth = Math.max(1, width - paddingX * 2);
+		const prompt = sliceByColumn(this.prompt, 0, Math.max(0, innerWidth - 1), true);
+		const promptWidth = visibleWidth(prompt);
+		const contentWidth = Math.max(1, innerWidth - promptWidth);
 
 		// Layout width: with padding the cursor can overflow into it,
 		// without padding we reserve 1 column for the cursor.
@@ -546,8 +583,14 @@ export class Editor implements Component, Focusable {
 		// hardware cursor for IME candidate-window placement even while
 		// autocomplete (e.g. slash-command menu) is visible.
 		const emitCursorMarker = this.focused;
+		this.updateCursorBlink(
+			this.focused && this.isEditorEmpty() && this.placeholder.length > 0 && !this.autocompleteState,
+		);
 
-		for (const layoutLine of visibleLines) {
+		for (let visibleLineIndex = 0; visibleLineIndex < visibleLines.length; visibleLineIndex++) {
+			const layoutLine = visibleLines[visibleLineIndex]!;
+			const layoutLineIndex = this.scrollOffset + visibleLineIndex;
+			const linePrompt = layoutLineIndex === 0 ? this.promptStyle(prompt) : " ".repeat(promptWidth);
 			let displayText = layoutLine.text;
 			let lineVisibleWidth = visibleWidth(layoutLine.text);
 			let cursorInPadding = false;
@@ -556,7 +599,16 @@ export class Editor implements Component, Focusable {
 
 			if (shouldShowPlaceholder) {
 				const marker = emitCursorMarker ? CURSOR_MARKER : "";
-				displayText = marker + this.placeholderStyle(sliceByColumn(this.placeholder, 0, contentWidth, true));
+				const placeholder = sliceByColumn(this.placeholder, 0, contentWidth, true);
+				const firstGrapheme = [...this.segment(placeholder, "grapheme")][0]?.segment;
+				const cursorGrapheme = firstGrapheme ?? " ";
+				const rest = firstGrapheme ? placeholder.slice(firstGrapheme.length) : "";
+				const cursor = `\x1b[7m${cursorGrapheme}\x1b[0m`;
+				displayText =
+					marker +
+					(this.focused && this.cursorBlinkVisible
+						? cursor + this.placeholderStyle(rest)
+						: this.placeholderStyle(placeholder));
 				lineVisibleWidth = visibleWidth(displayText);
 			}
 			// Add cursor if this line has it
@@ -593,7 +645,7 @@ export class Editor implements Component, Focusable {
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
 
 			// Render the line (no side borders, just horizontal lines above and below)
-			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
+			result.push(`${leftPadding}${linePrompt}${displayText}${padding}${lineRightPadding}`);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
@@ -611,7 +663,7 @@ export class Editor implements Component, Focusable {
 			for (const line of autocompleteResult) {
 				const lineWidth = visibleWidth(line);
 				const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
-				result.push(`${leftPadding}${line}${linePadding}${rightPadding}`);
+				result.push(`${leftPadding}${" ".repeat(promptWidth)}${line}${linePadding}${rightPadding}`);
 			}
 		}
 
@@ -935,8 +987,14 @@ export class Editor implements Component, Focusable {
 
 		// Process each logical line
 		for (let i = 0; i < this.state.lines.length; i++) {
-			const line = this.state.lines[i] || "";
+			const logicalLine = this.state.lines[i] || "";
+			const concealedPrefixLength =
+				i === 0 && this.concealedInputPrefix && logicalLine.startsWith(this.concealedInputPrefix)
+					? this.concealedInputPrefix.length
+					: 0;
+			const line = logicalLine.slice(concealedPrefixLength);
 			const isCurrentLine = i === this.state.cursorLine;
+			const cursorPos = Math.max(0, this.state.cursorCol - concealedPrefixLength);
 			const lineVisibleWidth = visibleWidth(line);
 
 			if (lineVisibleWidth <= contentWidth) {
@@ -945,7 +1003,7 @@ export class Editor implements Component, Focusable {
 					layoutLines.push({
 						text: line,
 						hasCursor: true,
-						cursorPos: this.state.cursorCol,
+						cursorPos,
 					});
 				} else {
 					layoutLines.push({
@@ -961,7 +1019,6 @@ export class Editor implements Component, Focusable {
 					const chunk = chunks[chunkIndex];
 					if (!chunk) continue;
 
-					const cursorPos = this.state.cursorCol;
 					const isLastChunk = chunkIndex === chunks.length - 1;
 
 					// Determine if cursor is in this chunk
@@ -1763,20 +1820,25 @@ export class Editor implements Component, Focusable {
 		const visualLines: Array<{ logicalLine: number; startCol: number; length: number }> = [];
 
 		for (let i = 0; i < this.state.lines.length; i++) {
-			const line = this.state.lines[i] || "";
+			const logicalLine = this.state.lines[i] || "";
+			const concealedPrefixLength =
+				i === 0 && this.concealedInputPrefix && logicalLine.startsWith(this.concealedInputPrefix)
+					? this.concealedInputPrefix.length
+					: 0;
+			const line = logicalLine.slice(concealedPrefixLength);
 			const lineVisWidth = visibleWidth(line);
 			if (line.length === 0) {
 				// Empty line still takes one visual line
-				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
+				visualLines.push({ logicalLine: i, startCol: concealedPrefixLength, length: 0 });
 			} else if (lineVisWidth <= width) {
-				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
+				visualLines.push({ logicalLine: i, startCol: concealedPrefixLength, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
 				const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
-						startCol: chunk.startIndex,
+						startCol: concealedPrefixLength + chunk.startIndex,
 						length: chunk.endIndex - chunk.startIndex,
 					});
 				}

@@ -1,4 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/diffex-agent-core";
+import { getModel, streamSimple } from "@earendil-works/diffex-ai/compat";
 import type { TUI } from "@earendil-works/diffex-tui";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
@@ -164,9 +165,10 @@ describe("update_plan tool", () => {
 		).rejects.toThrow("Plan item 1 status must be pending, in_progress, or completed.");
 	});
 
-	test("publishes an exact strict update-or-clear schema", () => {
+	test("publishes a DeepSeek-compatible object schema", () => {
 		const definition = createUpdatePlanToolDefinition();
 		const parameters = definition.parameters as {
+			type?: string;
 			anyOf?: Array<{
 				additionalProperties?: boolean;
 				properties?: {
@@ -188,6 +190,7 @@ describe("update_plan tool", () => {
 		const update = parameters.anyOf?.[0];
 		const clear = parameters.anyOf?.[1];
 
+		expect(parameters.type).toBe("object");
 		expect(parameters.anyOf).toHaveLength(2);
 		expect(update?.required).toEqual(["plan"]);
 		expect(update?.additionalProperties).toBe(false);
@@ -205,9 +208,63 @@ describe("update_plan tool", () => {
 		expect(clear?.properties?.explanation?.type).toBe("string");
 	});
 
+	test("sends the object schema through a DeepSeek interaction", async () => {
+		const model = getModel("deepseek", "deepseek-v4-flash");
+		expect(model).toBeDefined();
+		if (!model) throw new Error("Expected the DeepSeek model fixture");
+		let payload: unknown;
+
+		const result = await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "Plan this task", timestamp: Date.now() }],
+				tools: [createUpdatePlanTool()],
+			},
+			{
+				apiKey: "test-key",
+				fetch: async () =>
+					new Response(
+						'data: {"id":"chatcmpl-test","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+						{ status: 200, headers: { "content-type": "text/event-stream" } },
+					),
+				onPayload: (requestPayload) => {
+					payload = requestPayload;
+				},
+			},
+		).result();
+
+		const sentPayload = payload as {
+			tools?: Array<{ function?: { name?: string; parameters?: { type?: string } } }>;
+		};
+		const updatePlan = sentPayload.tools?.find((tool) => tool.function?.name === "update_plan");
+		expect(updatePlan?.function?.parameters?.type).toBe("object");
+		expect(result.stopReason).toBe("stop");
+	});
+
 	test("marks both tool representations as sequential", () => {
 		expect(createUpdatePlanToolDefinition().executionMode).toBe("sequential");
 		expect(createUpdatePlanTool().executionMode).toBe("sequential");
+	});
+
+	test("does not render partial update_plan arguments as invalid", () => {
+		const definition = createUpdatePlanToolDefinition() as ToolDefinition;
+		const component = new ToolExecutionComponent(
+			"update_plan",
+			"tool-streaming",
+			{},
+			{},
+			definition,
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		const streaming = stripAnsi(component.render(120).join("\n"));
+		expect(streaming).toContain("update_plan");
+		expect(streaming).not.toContain("[invalid arg]");
+
+		component.setArgsComplete();
+		const complete = stripAnsi(component.render(120).join("\n"));
+		expect(complete).toContain("[invalid arg]");
 	});
 
 	test("renders update explanations and checklists once while suppressing the successful result body", () => {

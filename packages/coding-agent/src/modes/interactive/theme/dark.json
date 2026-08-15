@@ -51,10 +51,10 @@
 		"toolTitle": "text",
 		"toolOutput": "gray",
 
-		"mdHeading": "#f0c674",
+		"mdHeading": "#64A7E3",
 		"mdLink": "#81a2be",
 		"mdLinkUrl": "dimGray",
-		"mdCode": "accent",
+		"mdCode": "#8AA2BA",
 		"mdCodeBlock": "green",
 		"mdCodeBlockBorder": "gray",
 		"mdQuote": "gray",

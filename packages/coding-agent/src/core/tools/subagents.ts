@@ -125,7 +125,11 @@ export function createSpawnAgentTool(
 	return {
 		name: "spawn_agent",
 		label: "Spawn Agent",
-		description: "Start an independent child agent for a focused task and return immediately after acceptance.",
+		description:
+			"Start an independent child agent asynchronously. The tool returns after acceptance, but the enclosing parent prompt remains active until coordinated child work is delivered.",
+		promptGuidelines: [
+			"After spawning child agents, you may finish the current response. The session waits for the frozen child batch and automatically sends one hidden, name-sorted result message before the parent prompt settles.",
+		],
 		parameters: spawnAgentSchema,
 		executionMode: "parallel",
 		execute: async (toolCallId, { name, task }) => {
@@ -195,7 +199,16 @@ export function createAgentsTool(
 			});
 			const details: AgentsDetails = Object.freeze({
 				timed_out: result.timedOut,
-				agents: result.agents,
+				agents: Object.freeze(
+					result.agents.map((agent) =>
+						Object.freeze({
+							name: agent.name,
+							status: agent.status,
+							...(agent.result === undefined ? {} : { result: agent.result }),
+							...(agent.error === undefined ? {} : { error: agent.error }),
+						}),
+					),
+				),
 			});
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],

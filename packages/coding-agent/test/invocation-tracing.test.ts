@@ -227,6 +227,7 @@ describe("CLI invocation tracing", () => {
 		const directories = setup();
 		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
 		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+		await trace.startSpan({ name: "test.operation" }, () => {});
 		const path = trace.destinationPath;
 		if (!path) throw new Error("Invocation trace path was not created");
 
@@ -242,12 +243,15 @@ describe("CLI invocation tracing", () => {
 		await trace.attachSession(manager, "startup");
 		const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
 		const catalog = new TraceEvidenceCatalog({ agentDir: directories.agentDir, scope });
-		const firstPath = trace.destinationPath;
-		if (!firstPath) throw new Error("Invocation trace path was not created");
 
 		expect(await catalog.highWaterCursor(scope)).toBe(0);
 		const firstEntryOrdinal = manager.getEntryCount();
-		manager.appendSessionInfo("first operation");
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "first operation" }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage(fauxAssistantMessage("first response"));
 		await trace.startSpan(
 			{
 				name: "diffex.coding_agent.operation",
@@ -255,15 +259,31 @@ describe("CLI invocation tracing", () => {
 			},
 			() => {},
 		);
-		await trace.operationSettled({ operationId: "operation-1", sessionManager: manager, firstEntryOrdinal });
+		await trace.startSpan({ name: "test.task" }, () => {});
+		const firstPath = trace.destinationPath;
+		if (!firstPath) throw new Error("Invocation trace path was not created");
+		await trace.operationSettled({
+			operationId: "operation-1",
+			taskLineageId: "operation-1",
+			sessionManager: manager,
+			firstEntryOrdinal,
+		});
 
 		await expect(lockfile.check(firstPath, { realpath: false })).resolves.toBe(false);
 		expect(await catalog.highWaterCursor(scope)).toBe(1);
 		expect(await catalog.listSuccessful(scope, 0, 1)).toHaveLength(1);
 		expect(footer(await readTrace(firstPath))?.terminationStatus).toBe("completed");
+		expect((await readTrace(firstPath)).find((record) => record.type === "session_segment")).toMatchObject({
+			taskLineageId: "operation-1",
+		});
 
 		const secondEntryOrdinal = manager.getEntryCount();
-		manager.appendSessionInfo("second operation");
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "second operation" }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage(fauxAssistantMessage("second response"));
 		await trace.startSpan(
 			{
 				name: "diffex.coding_agent.operation",
@@ -271,6 +291,7 @@ describe("CLI invocation tracing", () => {
 			},
 			() => {},
 		);
+		await trace.startSpan({ name: "test.task" }, () => {});
 		const secondPath = trace.destinationPath;
 		if (!secondPath) throw new Error("Second invocation trace path was not created");
 		expect(secondPath).not.toBe(firstPath);
@@ -302,8 +323,22 @@ describe("CLI invocation tracing", () => {
 			firstTrace.attachSession(firstManager, "startup"),
 			secondTrace.attachSession(secondManager, "startup"),
 		]);
-		firstManager.appendSessionInfo("first process");
-		secondManager.appendSessionInfo("second process");
+		await Promise.all([
+			firstTrace.startSpan({ name: "test.task" }, () => {}),
+			secondTrace.startSpan({ name: "test.task" }, () => {}),
+		]);
+		firstManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "first process" }],
+			timestamp: Date.now(),
+		});
+		secondManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "second process" }],
+			timestamp: Date.now(),
+		});
+		firstManager.appendMessage(fauxAssistantMessage("first process response"));
+		secondManager.appendMessage(fauxAssistantMessage("second process response"));
 		await Promise.all([
 			firstTrace.startSpan(
 				{
@@ -442,6 +477,16 @@ describe("CLI invocation tracing", () => {
 		expect(footer(resumedRecords)?.terminationStatus).toBe("completed");
 	});
 
+	it("does not store invocation traces when persisted self-evolution is off", async () => {
+		const directories = setup();
+		writeFileSync(join(directories.agentDir, "settings.json"), JSON.stringify({ evolution: { enabled: false } }));
+
+		const result = await runCli(directories, [...commonArgs(directories), "-p", "hello"]);
+
+		expect(result).toMatchObject({ code: 0, signal: null, stdout: "first response\n", stderr: "" });
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+	});
+
 	it("attaches a new binding when the active session is replaced", async () => {
 		const directories = setup();
 		const result = await runCli(directories, [...commonArgs(directories), "-p", "/replace-trace-session"]);
@@ -459,6 +504,233 @@ describe("CLI invocation tracing", () => {
 		expect((await runCli(directories, [...commonArgs(directories), "--list-models"])).code).toBe(0);
 		expect((await runCli(directories, [...commonArgs(directories), "--no-session", "-p", "hello"])).code).toBe(0);
 		expect(tracePaths(directories.agentDir)).toEqual([]);
+	});
+
+	it("does not create a trace for persisted startup and routine shutdown", async () => {
+		const directories = setup();
+		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+
+		await trace.attachSession(manager, "startup");
+		await trace.harnessActivated("version-1");
+		await trace.close();
+
+		expect(trace.destinationPath).toBeUndefined();
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+	});
+
+	it("starts tracing in the same session after self-evolution is enabled", async () => {
+		const directories = setup();
+		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({
+			agentDir: directories.agentDir,
+			sessionManager: manager,
+			enabled: false,
+		});
+		await trace.attachSession(manager, "startup");
+
+		const disabledEntryOrdinal = manager.getEntryCount();
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "disabled operation" }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage(fauxAssistantMessage("disabled response"));
+		await trace.startSpan(
+			{
+				name: "diffex.coding_agent.operation",
+				attributes: { "diffex.operation.id": "disabled-operation" },
+			},
+			() => {},
+		);
+		await trace.operationSettled({
+			operationId: "disabled-operation",
+			sessionManager: manager,
+			firstEntryOrdinal: disabledEntryOrdinal,
+		});
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+
+		await trace.setEnabled(true);
+		const enabledEntryOrdinal = manager.getEntryCount();
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "enabled operation" }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage(fauxAssistantMessage("enabled response"));
+		await trace.startSpan(
+			{
+				name: "diffex.coding_agent.operation",
+				attributes: { "diffex.operation.id": "enabled-operation" },
+			},
+			() => {},
+		);
+		await trace.operationSettled({
+			operationId: "enabled-operation",
+			sessionManager: manager,
+			firstEntryOrdinal: enabledEntryOrdinal,
+		});
+
+		const records = await readTrace(onlyTracePath(directories.agentDir));
+		expect(records.find((record) => record.type === "session_segment")).toMatchObject({
+			operationId: "enabled-operation",
+			cursor: { start: { entryOrdinal: enabledEntryOrdinal } },
+		});
+		expect(JSON.stringify(records)).not.toContain("disabled-operation");
+		await trace.close();
+	});
+
+	it("discards an open trace and stops collecting after self-evolution is disabled", async () => {
+		const directories = setup();
+		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+		await trace.attachSession(manager, "startup");
+		await trace.recordDiagnostics([{ type: "warning", message: "open trace" }]);
+		expect(tracePaths(directories.agentDir)).toHaveLength(1);
+
+		await trace.setEnabled(false);
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+
+		await trace.startSpan({ name: "test.operation" }, () => {});
+		await trace.recordDiagnostics([{ type: "warning", message: "disabled trace" }]);
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+		await trace.close();
+	});
+
+	it("keeps exit-only startup, resume, and switch flows out of evolution", async () => {
+		const directories = setup();
+		const initial = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const replacementDirectory = join(directories.projectDir, "replacement");
+		mkdirSync(replacementDirectory);
+		const replacement = SessionManager.create(replacementDirectory, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({
+			agentDir: directories.agentDir,
+			sessionManager: initial,
+		});
+		await trace.attachSession(initial, "startup");
+		await trace.harnessActivated("version-1");
+		await trace.attachSession(replacement, "switch");
+		await trace.close();
+		const resumed = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: initial });
+		await resumed.trace.attachSession(initial, "resume");
+		await resumed.trace.close();
+
+		const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
+		const catalog = new TraceEvidenceCatalog({ agentDir: directories.agentDir, scope });
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+		expect(await catalog.highWaterCursor(scope)).toBe(0);
+		expect(await catalog.listSuccessful(scope, 0, 0)).toEqual([]);
+	});
+
+	it.each([
+		{ terminationStatus: "completed" as const, expectedRawTraceCount: 0 },
+		{ terminationStatus: "aborted" as const, expectedRawTraceCount: 1 },
+	])(
+		"keeps lifecycle extension hooks out of evolution after $terminationStatus shutdown",
+		async ({ terminationStatus, expectedRawTraceCount }) => {
+			const directories = setup();
+			const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+			const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+			await trace.attachSession(manager, "startup");
+			await trace.harnessActivated("version-1");
+			await trace.startSpan(
+				{
+					name: "diffex.coding_agent.extension_hook",
+					attributes: {
+						"diffex.extension.hook": "session_start",
+						"diffex.extension.path": "/extensions/widget.ts",
+					},
+				},
+				() => {},
+			);
+			await trace.close(terminationStatus);
+
+			const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
+			const catalog = new TraceEvidenceCatalog({ agentDir: directories.agentDir, scope });
+			expect(tracePaths(directories.agentDir)).toHaveLength(expectedRawTraceCount);
+			expect(await catalog.listSuccessful(scope, 0, await catalog.highWaterCursor(scope))).toEqual([]);
+			expect(await catalog.excludedThroughCursor(scope, 0, await catalog.highWaterCursor(scope))).toBe(
+				expectedRawTraceCount,
+			);
+		},
+	);
+
+	it("removes a completed prompt trace when no substantive payload was recorded", async () => {
+		const directories = setup();
+		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+		await trace.attachSession(manager, "startup");
+		await trace.startSpan(
+			{
+				name: "diffex.coding_agent.operation",
+				attributes: { "diffex.operation.id": "empty-prompt", "diffex.operation.kind": "prompt" },
+			},
+			() => {},
+		);
+		await trace.operationSettled({ operationId: "empty-prompt", sessionManager: manager, firstEntryOrdinal: 0 });
+
+		expect(trace.destinationPath).toBeUndefined();
+		expect(tracePaths(directories.agentDir)).toEqual([]);
+		await trace.close();
+	});
+
+	it("keeps a substantive prompt eligible while excluding its trailing shutdown", async () => {
+		const directories = setup();
+		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
+		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+		await trace.attachSession(manager, "startup");
+		const firstEntryOrdinal = manager.getEntryCount();
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Make a focused change" }],
+			timestamp: Date.now(),
+		});
+		manager.appendMessage(fauxAssistantMessage("Focused change verified"));
+		await trace.startSpan(
+			{
+				name: "diffex.coding_agent.operation",
+				attributes: {
+					"diffex.operation.id": "prompt-operation",
+					"diffex.operation.kind": "prompt",
+					"diffex.task.lineage.id": "prompt-operation",
+				},
+			},
+			() => {},
+		);
+		await trace.operationSettled({
+			operationId: "prompt-operation",
+			taskLineageId: "prompt-operation",
+			sessionManager: manager,
+			firstEntryOrdinal,
+		});
+		await trace.startSpan(
+			{
+				name: "diffex.coding_agent.operation",
+				attributes: { "diffex.operation.id": "exit-operation", "diffex.operation.kind": "abort" },
+			},
+			() => {},
+		);
+		await trace.operationSettled({
+			operationId: "exit-operation",
+			sessionManager: manager,
+			firstEntryOrdinal: manager.getEntryCount(),
+		});
+
+		const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
+		const catalog = new TraceEvidenceCatalog({ agentDir: directories.agentDir, scope });
+		const materializations = await catalog.listSuccessful(scope, 0, await catalog.highWaterCursor(scope));
+		expect(materializations).toHaveLength(1);
+		expect(
+			materializations[0]?.invocation.evidence.some((entry) => JSON.stringify(entry).includes("exit-operation")),
+		).toBe(false);
+		expect(
+			materializations[0]?.invocation.evidence.some((entry) =>
+				entry.order.causalIdentifiers.some(
+					(identifier) => identifier.name === "diffex.task.lineage.id" && identifier.value === "prompt-operation",
+				),
+			),
+		).toBe(true);
+		await trace.close();
 	});
 
 	it("continues after trace creation fails and reports one warning", async () => {
@@ -483,6 +755,9 @@ describe("CLI invocation tracing", () => {
 		expect(result.stderr).toContain("intentional tracing test failure");
 		const records = await readTrace(onlyTracePath(directories.agentDir));
 		expect(footer(records)?.terminationStatus).toBe("failed");
+		const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
+		const catalog = new TraceEvidenceCatalog({ agentDir: directories.agentDir, scope });
+		expect(await catalog.listSuccessful(scope, 0, await catalog.highWaterCursor(scope))).toHaveLength(1);
 	});
 
 	it.each([
@@ -509,6 +784,15 @@ describe("CLI invocation tracing", () => {
 		const directories = setup();
 		const manager = SessionManager.create(directories.projectDir, join(directories.agentDir, "sessions"));
 		const { trace } = await createInvocationTrace({ agentDir: directories.agentDir, sessionManager: manager });
+		let finishOperation: (() => void) | undefined;
+		const operation = trace.startSpan(
+			{ name: "test.operation" },
+			() =>
+				new Promise<void>((resolveOperation) => {
+					finishOperation = resolveOperation;
+				}),
+		);
+		await vi.waitFor(() => expect(trace.destinationPath).toBeDefined());
 		const probePath = join(directories.root, "probe", "writer.jsonl");
 		await mkdir(dirname(probePath), { recursive: true });
 		const probe = await open(probePath, "wx");
@@ -520,6 +804,8 @@ describe("CLI invocation tracing", () => {
 
 		await expect(trace.attachSession(manager, "startup")).resolves.toBeUndefined();
 		manager.appendSessionInfo("writer survived");
+		finishOperation?.();
+		await operation;
 		await expect(
 			trace.operationSettled({ operationId: "operation", sessionManager: manager, firstEntryOrdinal: 0 }),
 		).resolves.toBeUndefined();
@@ -527,7 +813,7 @@ describe("CLI invocation tracing", () => {
 		await trace.close("completed");
 
 		const result = await readJsonlTraceFile(trace.destinationPath!);
-		expect(result.records.map((record) => record.type)).toEqual(["trace_header"]);
+		expect(result.records.map((record) => record.type)).toEqual(["trace_header", "span_start"]);
 		expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain("missing_footer");
 	});
 });

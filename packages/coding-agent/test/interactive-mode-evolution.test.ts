@@ -62,8 +62,12 @@ function overview(): EvolutionOverview {
 
 function client(): EvolutionMenuClient {
 	return {
+		getEnabled: () => true,
+		setEnabled: vi.fn(async () => {}),
 		subscribe: () => () => {},
 		overview: vi.fn().mockResolvedValue(overview()),
+		listHarnessVersionInfo: vi.fn().mockResolvedValue([]),
+		listCurrentDirectoryHarnessVersionInfo: vi.fn().mockResolvedValue([]),
 		listJobs: vi.fn().mockResolvedValue([]),
 		jobDetail: vi.fn().mockRejectedValue(new Error("unused")),
 		proposalDetail: vi.fn().mockRejectedValue(new Error("unused")),

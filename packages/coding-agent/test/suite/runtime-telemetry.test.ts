@@ -1,6 +1,11 @@
 import { InMemoryTelemetryContext } from "@earendil-works/diffex-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/diffex-ai";
-import { HarnessStateStore, type HarnessVersionBundle } from "@earendil-works/diffex-harness-state";
+import {
+	HARNESS_VERSION_SCHEMA_VERSION,
+	HarnessStateStore,
+	type HarnessVersionBundle,
+	INITIAL_HARNESS_VERSION_METADATA,
+} from "@earendil-works/diffex-harness-state";
 import { afterEach, describe, expect, it } from "vitest";
 import { SubagentController } from "../../src/core/subagents/controller.ts";
 import { captureSubagentSessionConfig } from "../../src/core/subagents/services.ts";
@@ -174,7 +179,13 @@ describe("coding-agent runtime telemetry", () => {
 		const version = `sha256:${"1".repeat(64)}`;
 		const bundle: HarnessVersionBundle = {
 			state: { memory: "captured memory" },
-			manifest: { schemaVersion: 1, version, base: null, artifacts: [] },
+			manifest: {
+				schemaVersion: HARNESS_VERSION_SCHEMA_VERSION,
+				version,
+				base: null,
+				metadata: INITIAL_HARNESS_VERSION_METADATA,
+				artifacts: [],
+			},
 		};
 		const harness = await createHarness({
 			telemetryContext: telemetry,

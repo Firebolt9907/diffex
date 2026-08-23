@@ -198,6 +198,7 @@ async function controlPlaneFixture<TExecutor extends EvolutionStageExecutor>(
 		materialization(2),
 		materialization(3),
 	],
+	highWaterCursor?: number,
 ): Promise<ControlPlaneFixture<TExecutor>> {
 	const root = await mkdtemp(join(tmpdir(), "diffex-evolution-control-"));
 	temporaryDirectories.push(root);
@@ -228,7 +229,7 @@ async function controlPlaneFixture<TExecutor extends EvolutionStageExecutor>(
 			events: eventSink,
 			evidence: {
 				async highWaterCursor() {
-					return materializations.at(-1)?.ingestionCursor ?? 0;
+					return highWaterCursor ?? materializations.at(-1)?.ingestionCursor ?? 0;
 				},
 				async listSuccessful(_scope, afterCursor, throughCursor) {
 					return materializations.filter(
@@ -256,6 +257,60 @@ async function createManualJob(fixture: ControlPlaneFixture) {
 }
 
 describe("durable evolution control plane", () => {
+	it("durably consumes an excluded-only evidence range", async () => {
+		const fixture = await controlPlaneFixture(new RecordingExecutor(), []);
+		const controlPlane = new EvolutionControlPlane(
+			{
+				version: "1.0.0",
+				clock: fixture.clock,
+				ids: new SequenceIds(),
+				artifacts: fixture.persistence,
+				jobs: fixture.persistence,
+				cursors: fixture.persistence,
+				leases: fixture.persistence,
+				ledger: fixture.persistence,
+				events: { emit() {} },
+				evidence: {
+					async highWaterCursor() {
+						return 3;
+					},
+					async listSuccessful() {
+						return [];
+					},
+					async excludedThroughCursor() {
+						return 3;
+					},
+				},
+				snapshots: {
+					async capture() {
+						return snapshotContext();
+					},
+				},
+				executor: new RecordingExecutor(),
+			},
+			{ leaseTtlMs: 5_000, heartbeatIntervalMs: 1_000 },
+		);
+
+		await expect(controlPlane.createJob({ scope, trigger: "manual" })).resolves.toEqual({
+			status: "not-created",
+			reason: "no-new-evidence",
+		});
+		expect(await fixture.persistence.load(scope)).toMatchObject({ sequence: 3 });
+	});
+
+	it("commits a mixed range through excluded evidence after eligible work completes", async () => {
+		const fixture = await controlPlaneFixture(new RecordingExecutor({ noOp: true }), [materialization(2)], 3);
+		const created = await createManualJob(fixture);
+
+		const completed = await fixture.controlPlane.runJob(created.jobId);
+
+		expect(completed).toMatchObject({
+			outcome: "completed",
+			completion: { kind: "no-op", processedEvidenceCursor: 3 },
+		});
+		expect(await fixture.persistence.load(scope)).toMatchObject({ sequence: 3, committedByJobId: created.jobId });
+	});
+
 	it.each(EXECUTABLE_STAGES)("resumes %s with stable idempotency and one completion", async (crashStage) => {
 		const fixture = await controlPlaneFixture(new RecordingExecutor({ crashStage }));
 		const created = await createManualJob(fixture);

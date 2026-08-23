@@ -258,6 +258,191 @@ function jsonObject(value: unknown, description: string): JsonObject {
 }
 
 describe("recursive reflector", () => {
+	it("limits each leaf to three high-impact lessons", async () => {
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1_000 },
+		);
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				const node = jsonObject(request.input.node, "node");
+				const lesson = lessonForRequest(request.input);
+				if (node.kind !== "leaf") {
+					return {
+						output: { complete: true, lessons: [lesson] },
+						model: { provider: "faux", model: "fixture" },
+					};
+				}
+				expect(request.input.control).toMatchObject({ maximumLessons: 3 });
+				expect(jsonObject(request.outputSchema.properties, "schema properties").lessons).toMatchObject({
+					maxItems: 3,
+				});
+				return {
+					output: { complete: true, lessons: [lesson, lesson, lesson, lesson] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		const result = await reflector.reflect(input);
+
+		const leaves = result.nodes.filter((node) => node.kind === "leaf");
+		expect(leaves.length).toBeGreaterThan(0);
+		expect(leaves.every((node) => node.lessonIds.length === 3)).toBe(true);
+	});
+
+	it("uses separate synthesis and final lesson limits", async () => {
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1, synthesisFanout: 2 },
+		);
+		const observedLimits = new Set<number>();
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				const lessonSchema = jsonObject(
+					jsonObject(request.outputSchema.properties, "schema properties").lessons,
+					"lesson schema",
+				);
+				const maxItems = Number(lessonSchema.maxItems);
+				observedLimits.add(maxItems);
+				expect(request.input.control).toMatchObject({ maximumLessons: maxItems });
+				const lesson = lessonForRequest(request.input);
+				return {
+					output: {
+						complete: true,
+						lessons: maxItems === 10 ? Array.from({ length: 10 }, () => lesson) : [lesson],
+					},
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		const result = await reflector.reflect(input);
+
+		expect([...observedLimits].sort((left, right) => left - right)).toEqual([3, 5, 10]);
+		expect(result.finalLessonIds).toHaveLength(10);
+	});
+
+	it("charges every provider round reported by the model executor", async () => {
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1_000 },
+		);
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				request.onForegroundWaitStart?.();
+				request.onForegroundWaitEnd?.(5);
+				await request.beforeProviderCall?.();
+				request.onProviderCallComplete?.({
+					durationMs: 10,
+					outputTokens: 3,
+					outcome: "completed",
+					retry: false,
+				});
+				await request.beforeProviderCall?.();
+				request.onProviderCallComplete?.({
+					durationMs: 20,
+					outputTokens: 4,
+					outcome: "completed",
+					retry: true,
+				});
+				request.onInternalToolRound?.();
+				return {
+					output: { complete: true, lessons: [lessonForRequest(request.input)] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		const result = await reflector.reflect(input);
+
+		const events = await persistence.read("job-1");
+		expect(events.filter((event) => event.type === "reflector-model-call")).toHaveLength(result.nodes.length * 2);
+		expect(result.nodes.every((node) => node.runtime?.providerCalls === 2)).toBe(true);
+		expect(result.nodes.every((node) => node.runtime?.providerLatencyMs === 30)).toBe(true);
+		expect(result.nodes.every((node) => node.runtime?.internalToolRounds === 1)).toBe(true);
+		expect(result.nodes.every((node) => node.runtime?.outputTokens === 7)).toBe(true);
+		expect(result.nodes.every((node) => node.runtime?.retries === 1)).toBe(true);
+		expect(result.nodes.every((node) => node.runtime?.foregroundWaitMs === 5)).toBe(true);
+		expect(result.nodes.every((node) => (node.runtime?.nodeDurationMs ?? -1) >= 0)).toBe(true);
+	});
+
+	it("checkpoints timed-out nodes and continues independent leaves", async () => {
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 2, synthesisFanout: 8, nodeDeadlineMs: 10 },
+		);
+		let calls = 0;
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				calls += 1;
+				if (calls === 1) return new Promise<never>(() => {});
+				return {
+					output: { complete: true, lessons: [lessonForRequest(request.input)] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		const result = await reflector.reflect(input);
+
+		expect(result.nodes.map((node) => node.status)).toEqual(["timed-out", "complete", "complete", "timed-out"]);
+		expect(result.finalLessonIds).toEqual([]);
+		expect(result.coverage.entries.slice(0, 2)).toEqual([
+			expect.objectContaining({ disposition: "skipped", diagnosticCodes: expect.arrayContaining(["node-timeout"]) }),
+			expect.objectContaining({ disposition: "skipped", diagnosticCodes: expect.arrayContaining(["node-timeout"]) }),
+		]);
+		expect(result.coverage.entries.slice(2).every((entry) => entry.disposition === "analyzed")).toBe(true);
+		expect(
+			(await persistence.read("job-1")).filter((event) => event.type === "reflection-node-checkpointed"),
+		).toHaveLength(4);
+	});
+
+	it("runs independent leaves with deterministic concurrency of two", async () => {
+		const runReflection = async () => {
+			const { persistence, reflector } = await reflectorFixture();
+			let activeLeaves = 0;
+			let maximumActiveLeaves = 0;
+			const input = reflectInput({
+				async execute(request) {
+					if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+					const node = jsonObject(request.input.node, "node");
+					if (node.kind === "leaf") {
+						activeLeaves += 1;
+						maximumActiveLeaves = Math.max(maximumActiveLeaves, activeLeaves);
+						await new Promise((resolve) => setTimeout(resolve, 10));
+						activeLeaves -= 1;
+					}
+					return {
+						output: { complete: true, lessons: [lessonForRequest(request.input)] },
+						model: { provider: "faux", model: "fixture" },
+					};
+				},
+			});
+			await reflector.reflect(input);
+			const modelCallIds = (await persistence.read("job-1"))
+				.filter((event) => event.type === "reflector-model-call")
+				.map((event) => event.modelCallId)
+				.sort();
+			return { maximumActiveLeaves, modelCallIds };
+		};
+
+		const first = await runReflection();
+		const second = await runReflection();
+
+		expect(first.maximumActiveLeaves).toBe(2);
+		expect(first.modelCallIds).toEqual(second.modelCallIds);
+		expect(new Set(first.modelCallIds).size).toBe(first.modelCallIds.length);
+	});
+
 	it("reflects a larger corpus recursively without changing foreground tools", async () => {
 		const { persistence, reflector } = await reflectorFixture();
 		const foregroundTools = [{ name: "read" }, { name: "edit" }];
@@ -380,6 +565,12 @@ describe("recursive reflector", () => {
 				const node = jsonObject(request.input.node, "node");
 				if (!inspectedLeaf && node.kind === "leaf") {
 					const evidenceRefs = references(request.input, "evidence", "evidenceRef");
+					if (evidenceRefs[0] !== "E1") {
+						return {
+							output: { complete: true, lessons: [lessonForRequest(request.input)] },
+							model: { provider: "faux", model: "fixture" },
+						};
+					}
 					expect(evidenceRefs).toEqual(["E1", "E2"]);
 					const byName = new Map(request.tools.map((tool) => [tool.name, tool]));
 					await expect(byName.get("search_evidence")?.execute({ query: "focused test passed" })).resolves.toEqual({
@@ -560,7 +751,11 @@ describe("recursive reflector", () => {
 	);
 
 	it("retries invalid structured output within the model-call budget", async () => {
-		const { persistence, reflector } = await reflectorFixture();
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1_000 },
+		);
 		const input = reflectInput({
 			execute() {
 				return Promise.resolve({
@@ -576,23 +771,25 @@ describe("recursive reflector", () => {
 			diagnostics: {
 				node: { kind: "leaf", evidenceIds: expect.any(Array) },
 				invalidAliases: ["evidence-user-l"],
-				permittedAliases: ["E1", "E2"],
+				permittedAliases: ["E1", "E2", "E3", "E4"],
 				attemptDetails: [
 					{
 						submissionMethod: "unspecified",
-						validationError: "supportingEvidenceRefs contains an unknown reference. Permitted references: E1, E2",
+						validationError:
+							"supportingEvidenceRefs contains an unknown reference. Permitted references: E1, E2, E3, E4",
 						output: { complete: true, lessons: [leafLesson(["evidence-user-l"])] },
 					},
 					{
 						submissionMethod: "unspecified",
-						validationError: "supportingEvidenceRefs contains an unknown reference. Permitted references: E1, E2",
+						validationError:
+							"supportingEvidenceRefs contains an unknown reference. Permitted references: E1, E2, E3, E4",
 						output: { complete: true, lessons: [leafLesson(["evidence-user-l"])] },
 					},
 				],
 			},
 		});
 		const events = await persistence.read("job-1");
-		expect(events.filter((event) => event.type === "reflector-model-call")).toHaveLength(2);
+		expect(events.filter((event) => event.type === "reflector-model-call")).toHaveLength(4);
 		expect(events.filter((event) => event.type === "reflection-node-checkpointed")).toHaveLength(0);
 	});
 
@@ -679,24 +876,30 @@ describe("recursive reflector", () => {
 	});
 
 	it("explains an invalid response when retrying the same reflection node", async () => {
-		const { reflector } = await reflectorFixture();
-		let calls = 0;
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1_000 },
+		);
+		let targetCalls = 0;
 		const input = reflectInput({
 			async execute(request) {
 				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
-				calls += 1;
-				if (calls === 1) {
+				const node = jsonObject(request.input.node, "node");
+				const evidenceRefs = node.kind === "leaf" ? references(request.input, "evidence", "evidenceRef") : [];
+				if (evidenceRefs.includes("E1")) targetCalls += 1;
+				if (targetCalls === 1 && evidenceRefs.includes("E1")) {
 					expect(request.input.control).not.toHaveProperty("responseCorrection");
 					return {
-						output: { complete: true, lessons: [leafLesson(["3"])] },
+						output: { complete: true, lessons: [leafLesson(["99"])] },
 						model: { provider: "faux", model: "fixture" },
 					};
 				}
-				if (calls === 2) {
+				if (targetCalls === 2 && evidenceRefs.includes("E1")) {
 					expect(request.input.control).toMatchObject({
 						responseCorrection: {
 							reason:
-								'supportingEvidenceRefs contains an unknown reference; "3" omitted the required type prefix and would be "E3", which is not permitted. Permitted references: E1, E2',
+								'supportingEvidenceRefs contains an unknown reference; "99" omitted the required type prefix and would be "E99", which is not permitted. Permitted references: E1, E2, E3, E4',
 						},
 					});
 				} else {
@@ -712,11 +915,11 @@ describe("recursive reflector", () => {
 		await expect(reflector.reflect(input)).resolves.toMatchObject({ nodes: expect.any(Array) });
 	});
 
-	it("stops after five incomplete refinement rounds by default", async () => {
+	it("stops after two incomplete refinement rounds by default", async () => {
 		const { persistence } = await reflectorFixture();
 		const reflector = new RecursiveReflector(
 			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
-			{ maxUnitsPerSlice: 2, maxResponseRetries: 1 },
+			{ maxUnitsPerSlice: 1_000, maxResponseRetries: 1 },
 		);
 		const input = reflectInput({
 			async execute(request) {
@@ -732,8 +935,72 @@ describe("recursive reflector", () => {
 			reasonCode: "reflection-budget-exhausted",
 		});
 		expect((await persistence.read("job-1")).filter((event) => event.type === "reflector-model-call")).toHaveLength(
-			5,
+			4,
 		);
+	});
+
+	it("limits each leaf to six evidence-tool calls", async () => {
+		const { persistence } = await reflectorFixture();
+		const reflector = new RecursiveReflector(
+			{ version: "1.0.0", artifacts: persistence, ledger: persistence },
+			{ maxUnitsPerSlice: 1_000 },
+		);
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				const node = jsonObject(request.input.node, "node");
+				if (node.kind === "leaf") {
+					expect(request.input.control).toMatchObject({
+						maximumToolCalls: 6,
+						maximumRefinementRounds: 2,
+						structuredResponseRetries: 2,
+					});
+					const search = request.tools.find((tool) => tool.name === "search_evidence");
+					for (let count = 0; count < 6; count += 1) await search?.execute({ query: "evidence" });
+					await expect(search?.execute({ query: "evidence" })).rejects.toThrow("node tool-call budget");
+				}
+				return {
+					output: { complete: true, lessons: [lessonForRequest(request.input)] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		await expect(reflector.reflect(input)).rejects.toMatchObject({ reasonCode: "reflection-budget-exhausted" });
+		expect(
+			(await persistence.read("job-1")).filter(
+				(event) => event.type === "reflector-tool-call" && event.denialCode === "tool-budget-exhausted",
+			),
+		).toHaveLength(2);
+	});
+
+	it("limits synthesis nodes to two lesson inspections", async () => {
+		const { persistence, reflector } = await reflectorFixture();
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				const node = jsonObject(request.input.node, "node");
+				if (node.kind === "synthesis") {
+					expect(request.input.control).toMatchObject({ maximumToolCalls: 2 });
+					const inspect = request.tools.find((tool) => tool.name === "inspect_child_lessons");
+					const lessonRefs = references(request.input, "childLessons", "lessonRef");
+					await inspect?.execute({ lessonRefs });
+					await inspect?.execute({ lessonRefs });
+					await expect(inspect?.execute({ lessonRefs })).rejects.toThrow("node tool-call budget");
+				}
+				return {
+					output: { complete: true, lessons: [lessonForRequest(request.input)] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		await expect(reflector.reflect(input)).rejects.toMatchObject({ reasonCode: "reflection-budget-exhausted" });
+		expect(
+			(await persistence.read("job-1")).filter(
+				(event) => event.type === "reflector-tool-call" && event.denialCode === "tool-budget-exhausted",
+			),
+		).toHaveLength(1);
 	});
 
 	it("fails when a model catches a hard tool-budget denial", async () => {

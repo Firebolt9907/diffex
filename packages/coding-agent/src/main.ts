@@ -714,9 +714,20 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		sessionManager.appendSessionInfo(name);
 	}
-	const invocationTraceResult = await createInvocationTrace({ agentDir, sessionManager });
+	const invocationTraceResult = await createInvocationTrace({
+		agentDir,
+		sessionManager,
+		enabled: startupSettingsManager.getEvolutionEnabled(),
+		onDiagnostic: (diagnostic) => reportDiagnostics([diagnostic]),
+	});
 	const invocationTrace = invocationTraceResult.trace;
-	const evolutionCoordinator = new EvolutionRuntimeCoordinator(invocationTrace);
+	const evolutionCoordinator = new EvolutionRuntimeCoordinator(invocationTrace, {
+		getEnabled: () => startupSettingsManager.getEvolutionEnabled(),
+		setEnabled: async (enabled) => {
+			startupSettingsManager.setEvolutionEnabled(enabled);
+			await startupSettingsManager.flush();
+		},
+	});
 	if (invocationTraceResult.diagnostic) {
 		reportDiagnostics([invocationTraceResult.diagnostic]);
 	}

@@ -130,6 +130,7 @@ export type EvolutionTriggerKind = "automatic" | "manual";
 
 export interface EvolutionRepositorySnapshot {
 	readonly repositoryId: string;
+	readonly directoryId?: string;
 	readonly rootPath: string;
 	readonly revision: string;
 }
@@ -302,7 +303,17 @@ export interface EvidenceCoverageMap {
 	readonly finalLessonIds: readonly string[];
 }
 
-export type ReflectionNodeStatus = "pending" | "complete" | "failed";
+export type ReflectionNodeStatus = "pending" | "complete" | "failed" | "timed-out";
+
+export interface ReflectionNodeRuntime {
+	readonly providerCalls: number;
+	readonly providerLatencyMs: number;
+	readonly internalToolRounds: number;
+	readonly outputTokens: number;
+	readonly retries: number;
+	readonly foregroundWaitMs: number;
+	readonly nodeDurationMs: number;
+}
 
 export interface EvolutionReferenceNormalization {
 	readonly field: string;
@@ -322,6 +333,7 @@ export interface ReflectionNode {
 	readonly lessonIds: readonly string[];
 	readonly resultDigest: string;
 	readonly status: ReflectionNodeStatus;
+	readonly runtime?: ReflectionNodeRuntime;
 }
 
 export type LessonKind =

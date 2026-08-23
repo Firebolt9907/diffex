@@ -124,6 +124,7 @@ export {
 	EvolutionControlService,
 	type EvolutionControlServiceDependencies,
 	type EvolutionHarnessControl,
+	type EvolutionHarnessVersionInfo,
 	type EvolutionJobDetail,
 	type EvolutionJobObservability,
 	type EvolutionJobSummary,
@@ -146,6 +147,12 @@ export {
 	type EvolutionToolDenialCode,
 	EvolutionToolDeniedError,
 } from "./errors.ts";
+export {
+	classifyEvolutionEvidence,
+	type EvolutionEvidenceEligibility,
+	NON_SUBSTANTIVE_RUNTIME_TRACE_REASON,
+	selectEvolutionEvidence,
+} from "./evidence-eligibility.ts";
 export {
 	type EvolutionMemoryBlock,
 	EvolutionMemoryWriter,

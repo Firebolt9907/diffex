@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	AGENT_RUNTIME_TELEMETRY_SCHEMA,
@@ -10,9 +10,11 @@ import {
 } from "@earendil-works/diffex-agent-core";
 import { uuidv7 } from "@earendil-works/diffex-ai";
 import lockfile from "proper-lockfile";
+import { classifyEvolutionEvidence } from "#evolution";
 import {
 	createJsonlTraceContext,
 	type JsonlTraceContext,
+	materializeJsonlInvocation,
 	type SessionAttachmentReason,
 	type TraceTerminationStatus,
 } from "#harness-trace";
@@ -38,8 +40,10 @@ export interface InvocationTraceCreationResult {
 export interface CreateInvocationTraceOptions {
 	agentDir: string;
 	sessionManager: SessionManager;
+	enabled?: boolean;
 	diffexVersion?: string;
 	sourceRevision?: string;
+	onDiagnostic?: (diagnostic: AgentSessionRuntimeDiagnostic) => void;
 }
 
 interface InvocationTraceRecorderHandle {
@@ -79,6 +83,7 @@ function finalTerminationStatus(
 export class InvocationTrace implements AgentSessionLifecycleObserver, TelemetryContext {
 	readonly telemetryContext: TelemetryContext = this;
 	readonly #createRecorder: InvocationTraceRecorderFactory | undefined;
+	readonly #onDiagnostic: ((diagnostic: AgentSessionRuntimeDiagnostic) => void) | undefined;
 	readonly #sessions = new Map<SessionManager, InvocationSessionAttachmentReason>();
 	readonly #sessionBindings = new Map<SessionManager, string>();
 	readonly #pendingOperations = new Set<string>();
@@ -93,13 +98,22 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 	#intervalTerminationStatus: TraceTerminationStatus = "completed";
 	#signalTermination: TraceTerminationStatus | undefined;
 	#settlementQueue: Promise<void> = Promise.resolve();
+	#enabled: boolean;
 	#closed = false;
+	#recorderUnavailableReported = false;
 
-	constructor(initial?: InvocationTraceRecorderHandle, createRecorder?: InvocationTraceRecorderFactory) {
+	constructor(
+		initial?: InvocationTraceRecorderHandle,
+		createRecorder?: InvocationTraceRecorderFactory,
+		onDiagnostic?: (diagnostic: AgentSessionRuntimeDiagnostic) => void,
+		enabled = true,
+	) {
 		this.#recorder = initial?.recorder;
 		this.#releaseTraceLock = initial?.releaseTraceLock;
 		this.#lastDestinationPath = initial?.recorder.destinationPath;
 		this.#createRecorder = createRecorder;
+		this.#onDiagnostic = onDiagnostic;
+		this.#enabled = enabled;
 		if (initial || createRecorder) this.#registerSignalObservers();
 	}
 
@@ -113,6 +127,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 		for (const signal of signals) {
 			const handler = () => {
 				this.#signalTermination = "aborted";
+				if (this.#enabled) void this.#ensureRecorder();
 			};
 			process.on(signal, handler);
 			this.#signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -145,17 +160,24 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 	}
 
 	async #ensureRecorder(): Promise<JsonlTraceContext | undefined> {
-		if (this.#closed) return undefined;
+		if (this.#closed || !this.#enabled) return undefined;
 		if (this.#recorder) return this.#recorder;
 		if (!this.#createRecorder) return undefined;
 		if (!this.#recorderCreation) {
 			this.#recorderCreation = this.#createRecorder()
 				.then(async (handle) => {
-					if (this.#closed) {
+					if (this.#closed || !this.#enabled) {
+						const destinationPath = handle.recorder.destinationPath;
 						try {
-							await handle.recorder.close(finalTerminationStatus("completed", this.#signalTermination));
+							await handle.recorder.close("aborted");
 						} finally {
-							await handle.releaseTraceLock();
+							try {
+								await handle.releaseTraceLock();
+							} finally {
+								await unlink(destinationPath).catch((error: NodeJS.ErrnoException) => {
+									if (error.code !== "ENOENT") throw error;
+								});
+							}
 						}
 						return undefined;
 					}
@@ -165,7 +187,16 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 					await this.#initializeRecorder(handle.recorder);
 					return handle.recorder;
 				})
-				.catch(() => undefined)
+				.catch((error: unknown) => {
+					if (!this.#recorderUnavailableReported) {
+						this.#recorderUnavailableReported = true;
+						this.#onDiagnostic?.({
+							type: "warning",
+							message: `Invocation tracing is unavailable: ${errorMessage(error)}`,
+						});
+					}
+					return undefined;
+				})
 				.finally(() => {
 					this.#recorderCreation = undefined;
 				});
@@ -190,6 +221,10 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 			options.name === OPERATION_SPAN_NAME && typeof options.attributes?.[OPERATION_ID_ATTRIBUTE] === "string"
 				? options.attributes[OPERATION_ID_ATTRIBUTE]
 				: undefined;
+		if (!this.#enabled) {
+			if (operationId) this.#untracedOperations.add(operationId);
+			return NOOP_TELEMETRY_CONTEXT.startSpan(options, callback);
+		}
 		const skipsIdleAbort =
 			operationId !== undefined &&
 			options.attributes?.[OPERATION_KIND_ATTRIBUTE] === "abort" &&
@@ -214,7 +249,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 	async attachSession(sessionManager: SessionManager, reason: InvocationSessionAttachmentReason): Promise<void> {
 		if (!sessionManager.isPersisted()) return;
 		if (!this.#sessions.has(sessionManager)) this.#sessions.set(sessionManager, reason);
-		const recorder = await this.#ensureRecorder();
+		const recorder = this.#recorder ?? (await this.#recorderCreation);
 		if (!recorder || this.#sessionBindings.has(sessionManager)) return;
 		const path = sessionManager.getSessionFile();
 		if (!path) return;
@@ -233,6 +268,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 
 	operationSettled(options: {
 		operationId: string;
+		taskLineageId?: string;
 		sessionManager: SessionManager;
 		firstEntryOrdinal: number;
 	}): Promise<void> {
@@ -247,6 +283,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 						bindingId,
 						lane: "main",
 						operationId: options.operationId,
+						...(options.taskLineageId === undefined ? {} : { taskLineageId: options.taskLineageId }),
 						cursor: { kind: "coding-agent-v3", ...cursor },
 					});
 				}
@@ -261,7 +298,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 
 	async harnessActivated(version: string): Promise<void> {
 		this.#activeHarnessVersion = version;
-		const recorder = await this.#ensureRecorder();
+		const recorder = this.#recorder ?? (await this.#recorderCreation);
 		if (!recorder || version === this.#recorderHarnessVersion) return;
 		recorder.activateHarness({
 			harnessVersion: version,
@@ -272,7 +309,7 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 	}
 
 	async recordDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): Promise<void> {
-		if (diagnostics.length === 0) return;
+		if (!this.#enabled || diagnostics.length === 0) return;
 		const recorder = await this.#ensureRecorder();
 		if (!recorder) return;
 		for (const diagnostic of diagnostics) {
@@ -292,6 +329,27 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 		await recorder.flush();
 	}
 
+	async setEnabled(enabled: boolean): Promise<void> {
+		if (this.#enabled === enabled) return;
+		this.#enabled = enabled;
+		if (enabled) return;
+		await this.#settlementQueue;
+		await this.#recorderCreation;
+		const destinationPath = this.#recorder?.destinationPath;
+		try {
+			await this.#closeCurrentRecorder("aborted");
+		} finally {
+			if (destinationPath) {
+				await unlink(destinationPath).catch((error: NodeJS.ErrnoException) => {
+					if (error.code !== "ENOENT") throw error;
+				});
+				if (this.#lastDestinationPath === destinationPath) this.#lastDestinationPath = undefined;
+			}
+		}
+		this.#pendingOperations.clear();
+		this.#untracedOperations.clear();
+	}
+
 	async #closeCurrentRecorder(terminationStatus: TraceTerminationStatus): Promise<void> {
 		const recorder = this.#recorder;
 		const releaseTraceLock = this.#releaseTraceLock;
@@ -301,10 +359,21 @@ export class InvocationTrace implements AgentSessionLifecycleObserver, Telemetry
 		this.#recorderHarnessVersion = undefined;
 		this.#intervalTerminationStatus = "completed";
 		if (!recorder) return;
+		const finalStatus = finalTerminationStatus(terminationStatus, this.#signalTermination);
 		try {
-			await recorder.close(finalTerminationStatus(terminationStatus, this.#signalTermination));
+			await recorder.close(finalStatus);
 		} finally {
 			await releaseTraceLock?.();
+		}
+		if (finalStatus !== "completed") return;
+		try {
+			const invocation = await materializeJsonlInvocation(recorder.destinationPath);
+			if (invocation.integrity === "complete" && !classifyEvolutionEvidence(invocation).eligible) {
+				await unlink(recorder.destinationPath);
+				if (this.#lastDestinationPath === recorder.destinationPath) this.#lastDestinationPath = undefined;
+			}
+		} catch {
+			// Preserve traces that cannot be classified safely.
 		}
 	}
 
@@ -356,16 +425,5 @@ export async function createInvocationTrace(
 		}
 	};
 
-	try {
-		const initial = await createRecorder();
-		return { trace: new InvocationTrace(initial, createRecorder) };
-	} catch (error) {
-		return {
-			trace: new InvocationTrace(undefined, createRecorder),
-			diagnostic: {
-				type: "warning",
-				message: `Invocation tracing is unavailable: ${errorMessage(error)}`,
-			},
-		};
-	}
+	return { trace: new InvocationTrace(undefined, createRecorder, options.onDiagnostic, options.enabled) };
 }

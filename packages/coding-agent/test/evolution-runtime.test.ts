@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/diffex-ai";
@@ -16,6 +16,7 @@ import {
 	type CodingAgentEvolutionRuntime,
 	createCodingAgentEvolutionRuntime,
 	EvolutionRuntimeCoordinator,
+	resolveEvolutionDirectoryIdentity,
 	TraceEvidenceCatalog,
 } from "../src/core/evolution-runtime.ts";
 import type { InvocationTrace } from "../src/core/invocation-trace.ts";
@@ -76,6 +77,21 @@ describe("coding-agent evolution runtime", () => {
 			const path = temporaryDirectories.pop();
 			if (path) rmSync(path, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps a directory identity stable when its path changes", async () => {
+		const parent = join(tmpdir(), `diffex-directory-identity-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const originalPath = join(parent, "before");
+		const renamedPath = join(parent, "after");
+		mkdirSync(originalPath, { recursive: true });
+		temporaryDirectories.push(parent);
+
+		const original = await resolveEvolutionDirectoryIdentity(originalPath);
+		renameSync(originalPath, renamedPath);
+		const renamed = await resolveEvolutionDirectoryIdentity(renamedPath);
+
+		expect(renamed.directoryId).toBe(original.directoryId);
+		expect(renamed.rootPath).toBe(realpathSync(renamedPath));
 	});
 
 	it("shares one global control scope across working directories", async () => {
@@ -152,6 +168,64 @@ describe("coding-agent evolution runtime", () => {
 		expect(order).toEqual(["trace", "automatic"]);
 		await coordinator.stop();
 		expect(runtime.stop).toHaveBeenCalledOnce();
+	});
+
+	it("does not schedule automatic evolution when self-evolution is disabled", async () => {
+		const trace = {
+			operationSettled: vi.fn(async () => {}),
+			harnessActivated: vi.fn(async () => {}),
+		} as unknown as InvocationTrace;
+		const runtime: CodingAgentEvolutionRuntime = {
+			control: { subscribe: () => () => {} } as unknown as EvolutionControlService,
+			start: vi.fn(async () => {}),
+			evaluateAutomatic: vi.fn(),
+			stop: vi.fn(async () => {}),
+		};
+		const coordinator = new EvolutionRuntimeCoordinator(trace, {
+			getEnabled: () => false,
+			setEnabled: vi.fn(),
+		});
+		await coordinator.replace(runtime);
+		expect(runtime.start).not.toHaveBeenCalled();
+
+		await coordinator.operationSettled({
+			operationId: "operation-disabled",
+			sessionManager: {} as never,
+			firstEntryOrdinal: 0,
+		});
+
+		expect(trace.operationSettled).toHaveBeenCalledOnce();
+		expect(runtime.evaluateAutomatic).not.toHaveBeenCalled();
+	});
+
+	it("stops and restarts evolution collection within the same session", async () => {
+		let enabled = true;
+		const trace = {
+			operationSettled: vi.fn(async () => {}),
+			harnessActivated: vi.fn(async () => {}),
+			setEnabled: vi.fn(async () => {}),
+		} as unknown as InvocationTrace;
+		const runtime: CodingAgentEvolutionRuntime = {
+			control: { subscribe: () => () => {} } as unknown as EvolutionControlService,
+			start: vi.fn(async () => {}),
+			evaluateAutomatic: vi.fn(),
+			stop: vi.fn(async () => {}),
+		};
+		const coordinator = new EvolutionRuntimeCoordinator(trace, {
+			getEnabled: () => enabled,
+			setEnabled: async (next) => {
+				enabled = next;
+			},
+		});
+		await coordinator.replace(runtime);
+
+		await coordinator.setEnabled(false);
+		expect(trace.setEnabled).toHaveBeenCalledWith(false);
+		expect(runtime.stop).toHaveBeenCalledOnce();
+
+		await coordinator.setEnabled(true);
+		expect(trace.setEnabled).toHaveBeenCalledWith(true);
+		expect(runtime.start).toHaveBeenCalledTimes(2);
 	});
 
 	it("keeps trace cursors stable and isolates unreadable evidence", async () => {
@@ -241,6 +315,37 @@ describe("coding-agent evolution runtime", () => {
 		]);
 	});
 
+	it("persists the reason for excluding a lifecycle-only trace", async () => {
+		const root = join(tmpdir(), `diffex-excluded-evidence-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const traceDirectory = join(root, "traces");
+		mkdirSync(traceDirectory, { recursive: true });
+		temporaryDirectories.push(root);
+		const tracePath = join(traceDirectory, "lifecycle.jsonl");
+		writeFileSync(tracePath, "lifecycle\n");
+		const scope: EvolutionScope = { repositoryId: "global", scopeId: "global" };
+		const catalog = new TraceEvidenceCatalog({
+			agentDir: root,
+			scope,
+			materializeInvocation: async () => ({
+				...materializedInvocation("lifecycle", "/session.jsonl"),
+				evidence: [],
+			}),
+		});
+
+		expect(await catalog.listSuccessful(scope, 0, await catalog.highWaterCursor(scope))).toEqual([]);
+		expect(JSON.parse(readFileSync(join(traceDirectory, ".evolution-exclusions.json"), "utf8"))).toEqual({
+			version: 1,
+			exclusions: [
+				{
+					materializationId: "lifecycle",
+					traceName: "lifecycle.jsonl",
+					reason: "non-substantive-runtime-trace",
+				},
+			],
+		});
+		expect(await catalog.excludedThroughCursor(scope, 0, 1)).toBe(1);
+	});
+
 	it("keeps adversarial evidence outside model control instructions", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -320,6 +425,39 @@ describe("coding-agent evolution runtime", () => {
 			output: { complete: true, lessons: [] },
 			submissionMethod: "response-tool",
 		});
+	});
+
+	it("stops the internal evolution tool loop after ten provider rounds", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses(
+			Array.from({ length: 10 }, () => fauxAssistantMessage(fauxToolCall("inspect", {}), { stopReason: "toolUse" })),
+		);
+		const executor = new CodingAgentEvolutionModelExecutor(harness.session, harness.session.modelRuntime, {
+			async waitUntilBackgroundAllowed() {},
+		});
+		const model = harness.getModel();
+		let providerCalls = 0;
+
+		await expect(
+			executor.execute({
+				stage: "reflector",
+				model: {
+					provider: model.provider,
+					model: model.id,
+					configurationDigest: `sha256:${"1".repeat(64)}`,
+				},
+				promptVersion: "reflector-v1",
+				idempotencyKey: "bounded-provider-rounds",
+				input: {},
+				outputSchema: { type: "object" },
+				tools: [],
+				beforeProviderCall() {
+					providerCalls += 1;
+				},
+			}),
+		).rejects.toThrow("exceeded 10 tool rounds");
+		expect(providerCalls).toBe(10);
 	});
 
 	it("returns a denied evidence-tool request to the model for correction", async () => {
@@ -424,8 +562,11 @@ describe("coding-agent evolution runtime", () => {
 				timestamp: "2026-08-20T12:00:01.000Z",
 				spanId: 1,
 				parentSpanId: null,
-				name: "diffex.agent.run",
-				attributes: { outcome: "focused verification passed" },
+				name: "diffex.coding_agent.operation",
+				attributes: {
+					"diffex.operation.kind": "prompt",
+					outcome: "focused verification failed",
+				},
 			},
 			{
 				type: "span_end",
@@ -433,7 +574,10 @@ describe("coding-agent evolution runtime", () => {
 				timestamp: "2026-08-20T12:00:02.000Z",
 				spanId: 1,
 				attributes: {},
-				status: { status: "ok" },
+				status: {
+					status: "error",
+					error: { name: "Error", message: "focused verification failed" },
+				},
 			},
 			{
 				type: "trace_footer",
@@ -459,7 +603,7 @@ describe("coding-agent evolution runtime", () => {
 								summary: "Keep focused verification",
 								preconditions: [],
 								observedOutcome: "Verification passed",
-								supportingEvidenceRefs: ["2"],
+								supportingEvidenceRefs: ["1"],
 								counterevidenceRefs: [],
 								applicabilityBoundaries: [],
 								uncertainty: null,

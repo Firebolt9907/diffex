@@ -52,6 +52,20 @@ async function fixture() {
 	return { harnessState, initial: initial.bundle, initialMemory, snapshot, writer };
 }
 
+async function emptyFixture() {
+	const root = await mkdtemp(join(tmpdir(), "diffex-evolution-empty-writer-"));
+	temporaryDirectories.push(root);
+	const harnessState = new HarnessStateStore(join(root, "agent"));
+	const initial = await harnessState.initialize();
+	const writer = new EvolutionMemoryWriter({
+		version: "1.0.0",
+		harnessState,
+		statePath: join(root, "writer-state"),
+	});
+	const snapshot = await writer.captureSnapshot();
+	return { harnessState, initial, root, snapshot, writer };
+}
+
 function batch(
 	snapshot: Awaited<ReturnType<EvolutionMemoryWriter["captureSnapshot"]>>,
 	mutations: readonly EvolutionMutation[],
@@ -80,6 +94,215 @@ function batch(
 }
 
 describe("evolution memory writer", () => {
+	it("numbers model-authored lessons and rejects lessons longer than three sentences", async () => {
+		const { harnessState, snapshot, writer } = await emptyFixture();
+		const numberedBatch = batch(
+			snapshot,
+			[
+				{
+					mutationId: "mutation-numbered",
+					proposalId: "proposal-numbered",
+					target: { kind: "evolution-memory", expectedHarnessVersion: snapshot.harnessVersion },
+					payload: {
+						operation: "ADD",
+						destination: { section: "verification", anchor: "runtime-verification" },
+						content: "Lesson 99: Verify the runtime. Capture the result. Fix visible regressions.",
+						intendedScope: ["verification"],
+					},
+				},
+			],
+			{ batchId: "batch-numbered", activationEventId: "activation-numbered" },
+		);
+		const numberedWrite = await writer.write(numberedBatch, {
+			idempotencyKey: "write-numbered",
+			lease: writerLease,
+		});
+		await writer.activate(numberedBatch, numberedWrite, {
+			idempotencyKey: "activate-numbered",
+			lease: writerLease,
+		});
+		expect((await harnessState.loadCurrent()).state.memory).toBe(
+			"Lesson 1: Verify the runtime. Capture the result. Fix visible regressions.\n",
+		);
+
+		const numberedSnapshot = await writer.captureSnapshot();
+		const overlongBatch = batch(
+			numberedSnapshot,
+			[
+				{
+					mutationId: "mutation-overlong",
+					proposalId: "proposal-overlong",
+					target: { kind: "evolution-memory", expectedHarnessVersion: numberedSnapshot.harnessVersion },
+					payload: {
+						operation: "ADD",
+						destination: { section: "verification", anchor: "runtime-verification" },
+						content: "First sentence. Second sentence. Third sentence. Fourth sentence.",
+						intendedScope: ["verification"],
+					},
+				},
+			],
+			{ batchId: "batch-overlong", activationEventId: "activation-overlong" },
+		);
+		await expect(
+			writer.write(overlongBatch, { idempotencyKey: "write-overlong", lease: writerLease }),
+		).rejects.toThrow("at most 3 sentences");
+		expect((await harnessState.loadCurrent()).state.memory).toBe(
+			"Lesson 1: Verify the runtime. Capture the result. Fix visible regressions.\n",
+		);
+	});
+
+	it("compacts lesson numbers durably when writer sidecar state is unavailable", async () => {
+		const { harnessState, root, snapshot, writer } = await emptyFixture();
+		const addition = batch(
+			snapshot,
+			["first", "second", "third"].map(
+				(label, index): EvolutionMutation => ({
+					mutationId: `mutation-${label}-lesson`,
+					proposalId: `proposal-${label}-lesson`,
+					target: { kind: "evolution-memory", expectedHarnessVersion: snapshot.harnessVersion },
+					payload: {
+						operation: "ADD",
+						destination: { section: "verification", anchor: `${label}-lesson` },
+						content: `Keep ${label} lesson content ${String(index + 1)}.`,
+						intendedScope: ["verification"],
+					},
+				}),
+			),
+			{ batchId: "batch-three-lessons", activationEventId: "activation-three-lessons" },
+		);
+		const additionWrite = await writer.write(addition, { idempotencyKey: "write-three", lease: writerLease });
+		await writer.activate(addition, additionWrite, { idempotencyKey: "activate-three", lease: writerLease });
+
+		const addedSnapshot = await writer.captureSnapshot();
+		const removedItem = addedSnapshot.activeMemoryItems[1];
+		if (removedItem === undefined) throw new Error("Expected the second lesson memory item");
+		const removal = batch(
+			addedSnapshot,
+			[
+				{
+					mutationId: "mutation-remove-second-lesson",
+					proposalId: "proposal-remove-second-lesson",
+					target: { kind: "evolution-memory", expectedHarnessVersion: addedSnapshot.harnessVersion },
+					payload: {
+						operation: "REMOVE",
+						memoryItemId: removedItem.memoryItemId,
+						expectedContentDigest: removedItem.contentDigest,
+						reason: "Exercise durable lesson numbering",
+					},
+				},
+			],
+			{ batchId: "batch-remove-second-lesson", activationEventId: "activation-remove-second-lesson" },
+		);
+		const removalWrite = await writer.write(removal, { idempotencyKey: "write-remove-second", lease: writerLease });
+		await writer.activate(removal, removalWrite, {
+			idempotencyKey: "activate-remove-second",
+			lease: writerLease,
+		});
+		const compacted = await harnessState.loadCurrent();
+		expect(compacted.state.memory).toBe(
+			"Lesson 1: Keep first lesson content 1.\n\nLesson 2: Keep third lesson content 3.\n",
+		);
+		expect(compacted.manifest.metadata.evolutionMemory.nextLessonNumber).toBe(3);
+
+		const recoveredWriter = new EvolutionMemoryWriter({
+			version: "1.0.0",
+			harnessState,
+			statePath: join(root, "recovered-writer-state"),
+		});
+		const recoveredSnapshot = await recoveredWriter.captureSnapshot();
+		const fourthAddition = batch(
+			recoveredSnapshot,
+			[
+				{
+					mutationId: "mutation-fourth-lesson",
+					proposalId: "proposal-fourth-lesson",
+					target: { kind: "evolution-memory", expectedHarnessVersion: recoveredSnapshot.harnessVersion },
+					payload: {
+						operation: "ADD",
+						destination: { section: null, anchor: "Lesson 3: Keep third lesson content 3." },
+						content: "Continue the durable lesson sequence.",
+						intendedScope: ["verification"],
+					},
+				},
+			],
+			{ batchId: "batch-fourth-lesson", activationEventId: "activation-fourth-lesson" },
+		);
+		const fourthWrite = await recoveredWriter.write(fourthAddition, {
+			idempotencyKey: "write-fourth",
+			lease: writerLease,
+		});
+		await recoveredWriter.activate(fourthAddition, fourthWrite, {
+			idempotencyKey: "activate-fourth",
+			lease: writerLease,
+		});
+
+		expect((await harnessState.loadCurrent()).state.memory).toBe(
+			"Lesson 1: Keep first lesson content 1.\n\nLesson 2: Keep third lesson content 3.\n\nLesson 3: Continue the durable lesson sequence.\n",
+		);
+	});
+
+	it("bootstraps blank memory by appending additions in mutation order", async () => {
+		const { harnessState, initial, snapshot, writer } = await emptyFixture();
+		const selectedBatch = batch(snapshot, [
+			{
+				mutationId: "mutation-verification",
+				proposalId: "proposal-verification",
+				target: { kind: "evolution-memory", expectedHarnessVersion: snapshot.harnessVersion },
+				payload: {
+					operation: "ADD",
+					destination: { section: "verification", anchor: "runtime-verification-for-ui-scene-flows" },
+					content: "- Verify UI and scene-flow changes in a real runtime.",
+					intendedScope: ["verification"],
+				},
+			},
+			{
+				mutationId: "mutation-capability-honesty",
+				proposalId: "proposal-capability-honesty",
+				target: { kind: "evolution-memory", expectedHarnessVersion: snapshot.harnessVersion },
+				payload: {
+					operation: "ADD",
+					destination: { section: "capability-honesty", anchor: "durable-memory-commitments" },
+					content: "- Confirm persistence before promising durable recall.",
+					intendedScope: ["capability-honesty"],
+				},
+			},
+		]);
+
+		const writeResult = await writer.write(selectedBatch, {
+			idempotencyKey: "write-empty",
+			lease: writerLease,
+		});
+		expect(writeResult.status).toBe("written");
+		expect((await harnessState.loadCurrent()).state.memory).toBe("");
+
+		const activation = await writer.activate(selectedBatch, writeResult, {
+			idempotencyKey: "activate-empty",
+			lease: writerLease,
+		});
+
+		expect(activation.status).toBe("activated");
+		expect(activation.resultingHarnessVersion).not.toBe(initial.manifest.version);
+		expect((await harnessState.loadCurrent()).state.memory).toBe(
+			"Lesson 1: Verify UI and scene-flow changes in a real runtime.\n\nLesson 2: Confirm persistence before promising durable recall.\n",
+		);
+		const activatedSnapshot = await writer.captureSnapshot();
+		expect(activatedSnapshot.activeMemoryItems).toHaveLength(2);
+		expect(activatedSnapshot.activeMemoryItems).toEqual([
+			expect.objectContaining({
+				contentDigest: computeEvolutionContentDigest(
+					"Lesson 1: Verify UI and scene-flow changes in a real runtime.",
+				),
+				ledger: { origin: "evolution", creationEventId: "activation-event-1", supersessionEventId: null },
+			}),
+			expect.objectContaining({
+				contentDigest: computeEvolutionContentDigest(
+					"Lesson 2: Confirm persistence before promising durable recall.",
+				),
+				ledger: { origin: "evolution", creationEventId: "activation-event-1", supersessionEventId: null },
+			}),
+		]);
+	});
+
 	it("stages selected deltas and atomically activates one harness revision", async () => {
 		const { harnessState, initial, initialMemory, snapshot, writer } = await fixture();
 		const mutations: readonly EvolutionMutation[] = [
@@ -123,12 +346,12 @@ describe("evolution memory writer", () => {
 		const current = await harnessState.loadCurrent();
 		expect(current.manifest.base).toBe(initial.manifest.version);
 		expect(current.state.memory).toBe(
-			"# Evolution memory\n\n## Existing\n\n- Preserve this manual rule.\n\nTail bytes stay exact.\n\n- Apply selected deltas as one batch.\n",
+			"# Evolution memory\n\n## Existing\n\n- Preserve this manual rule.\n\nTail bytes stay exact.\n\nLesson 1: Apply selected deltas as one batch.\n",
 		);
 		const activatedSnapshot = await writer.captureSnapshot();
 		expect(activatedSnapshot.activeMemoryItems).toHaveLength(3);
 		expect(activatedSnapshot.activeMemoryItems.at(-1)).toMatchObject({
-			contentDigest: computeEvolutionContentDigest("- Apply selected deltas as one batch."),
+			contentDigest: computeEvolutionContentDigest("Lesson 1: Apply selected deltas as one batch."),
 			creationRevision: current.manifest.version,
 			ledger: { origin: "evolution", creationEventId: "activation-event-1", supersessionEventId: null },
 		});

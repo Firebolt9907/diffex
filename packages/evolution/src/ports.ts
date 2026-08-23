@@ -63,6 +63,13 @@ export interface EvolutionModelTool {
 	execute(input: JsonObject): Promise<JsonObject>;
 }
 
+export interface ReflectorProviderCallMetrics {
+	readonly durationMs: number;
+	readonly outputTokens: number;
+	readonly outcome: "completed" | "failed" | "timed-out";
+	readonly retry: boolean;
+}
+
 export interface ReflectorModelRequest {
 	readonly stage: "reflector";
 	readonly model: EvolutionModelIdentity;
@@ -71,6 +78,11 @@ export interface ReflectorModelRequest {
 	readonly input: JsonObject;
 	readonly outputSchema: JsonObject;
 	readonly tools: readonly EvolutionModelTool[];
+	readonly beforeProviderCall?: () => void | Promise<void>;
+	readonly onProviderCallComplete?: (metrics: ReflectorProviderCallMetrics) => void;
+	readonly onInternalToolRound?: () => void;
+	readonly onForegroundWaitStart?: () => void;
+	readonly onForegroundWaitEnd?: (durationMs: number) => void;
 	readonly signal?: AbortSignal;
 }
 
@@ -266,6 +278,7 @@ export interface EvolutionEvidenceCatalog {
 		afterCursor: number,
 		throughCursor: number,
 	): Promise<readonly SuccessfulMaterialization[]>;
+	excludedThroughCursor?(scope: EvolutionScope, afterCursor: number, throughCursor: number): Promise<number>;
 }
 
 export interface EvolutionSnapshotContext {

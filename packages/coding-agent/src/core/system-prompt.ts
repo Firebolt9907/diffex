@@ -16,6 +16,8 @@ export interface BuildSystemPromptOptions {
 	promptGuidelines?: string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
+	/** Activated harness evolution memory. Empty memory is omitted from the prompt. */
+	evolutionMemory?: { version: string; memory: string };
 	/** Working directory. */
 	cwd: string;
 	/** Pre-loaded context files. */
@@ -32,6 +34,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		toolSnippets,
 		promptGuidelines,
 		appendSystemPrompt,
+		evolutionMemory,
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
@@ -39,6 +42,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const promptCwd = cwd.replace(/\\/g, "/");
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
+	const evolutionSection = evolutionMemory?.memory
+		? `\n\n<evolution_memory version="${evolutionMemory.version}">\n${evolutionMemory.memory}\n</evolution_memory>`
+		: "";
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
@@ -49,6 +55,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		if (appendSection) {
 			prompt += appendSection;
 		}
+		prompt += evolutionSection;
 
 		// Append project context files
 		if (contextFiles.length > 0) {
@@ -118,7 +125,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside Diffex, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+	let prompt = `You are Diffex, an expert coding agent. You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
 ${toolsList}
@@ -135,11 +142,12 @@ Diffex documentation (read only when the user asks about Diffex itself, its SDK,
 - When reading Diffex docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
 - When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), Diffex packages (docs/packages.md), environment variables (docs/environment-variables.md)
 - When working on Diffex topics, read the docs and examples, and follow .md cross-references before implementing
-- Always read Diffex .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
+- Always read Diffex.md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
 
 	if (appendSection) {
 		prompt += appendSection;
 	}
+	prompt += evolutionSection;
 
 	// Append project context files
 	if (contextFiles.length > 0) {

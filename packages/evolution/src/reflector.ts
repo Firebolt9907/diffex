@@ -5,8 +5,8 @@ import type {
 	EvolutionArtifactMetadata,
 	EvolutionArtifactProducer,
 	EvolutionLedgerEvent,
+	EvolutionReferenceNormalization,
 	JsonObject,
-	JsonValue,
 	Lesson,
 	LessonKind,
 	ReflectionNode,
@@ -15,6 +15,7 @@ import type {
 	ReflectorToolCallLedgerEvent,
 } from "./contracts.ts";
 import { EvolutionExecutionError } from "./errors.ts";
+import { EvolutionModelReferenceCatalog, EvolutionModelReferenceError, referenceArray } from "./model-references.ts";
 import type {
 	EvolutionArtifact,
 	EvolutionArtifactStore,
@@ -24,12 +25,8 @@ import type {
 	Reflector,
 	ReflectorInput,
 } from "./ports.ts";
-import {
-	computeEvolutionContentDigest,
-	createEvolutionArtifactMetadata,
-	serializeEvolutionValue,
-} from "./provenance.ts";
-import { type ReflectorToolAudit, ReflectorToolRegistry } from "./reflector-tools.ts";
+import { computeEvolutionContentDigest, createEvolutionArtifactMetadata } from "./provenance.ts";
+import { type ReflectorNodeReferences, type ReflectorToolAudit, ReflectorToolRegistry } from "./reflector-tools.ts";
 
 const DEFAULT_MAX_TOOL_CALLS = 200;
 const DEFAULT_MAX_MODEL_CALLS = 100;
@@ -97,6 +94,7 @@ interface LessonDraft {
 	readonly applicabilityBoundaries: readonly string[];
 	readonly uncertainty: string | null;
 	readonly actionableTakeaway: string;
+	readonly sourceIds: readonly string[];
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -117,15 +115,12 @@ function unique(values: readonly string[]): string[] {
 	return [...new Set(values)];
 }
 
-function jsonClone(value: unknown): JsonValue {
-	return JSON.parse(serializeEvolutionValue(value)) as JsonValue;
-}
-
 function stringArray(value: unknown, name: string): readonly string[] {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
 		throw new Error(`${name} must be an array of non-empty strings`);
 	}
-	return unique(value);
+	if (new Set(value).size !== value.length) throw new Error(`${name} must not contain duplicates`);
+	return value;
 }
 
 function requiredString(record: Readonly<Record<string, unknown>>, name: string): string {
@@ -134,18 +129,13 @@ function requiredString(record: Readonly<Record<string, unknown>>, name: string)
 	return value;
 }
 
-function parseLessonDraft(value: unknown, permittedEvidenceIds: ReadonlySet<string>): LessonDraft {
-	if (!isRecord(value)) throw new Error("lesson must be an object");
+function lessonContent(
+	value: Readonly<Record<string, unknown>>,
+): Omit<LessonDraft, "counterevidenceIds" | "evidenceIds" | "sourceIds"> {
 	const kind = value.kind;
 	if (typeof kind !== "string" || !LESSON_KINDS.has(kind as LessonKind)) {
 		throw new Error(`Unsupported lesson kind "${String(kind)}"`);
 	}
-	const evidenceIds = stringArray(value.supportingEvidenceIds, "supportingEvidenceIds");
-	const counterevidenceIds = stringArray(value.counterevidenceIds, "counterevidenceIds");
-	for (const evidenceId of [...evidenceIds, ...counterevidenceIds]) {
-		if (!permittedEvidenceIds.has(evidenceId)) throw new Error(`Lesson cites unknown evidence "${evidenceId}"`);
-	}
-	if (evidenceIds.length === 0) throw new Error("A lesson must cite supporting evidence");
 	const uncertainty = value.uncertainty;
 	if (uncertainty !== null && typeof uncertainty !== "string") {
 		throw new Error("uncertainty must be a string or null");
@@ -155,25 +145,163 @@ function parseLessonDraft(value: unknown, permittedEvidenceIds: ReadonlySet<stri
 		summary: requiredString(value, "summary"),
 		preconditions: stringArray(value.preconditions, "preconditions"),
 		observedOutcome: requiredString(value, "observedOutcome"),
-		evidenceIds,
-		counterevidenceIds,
 		applicabilityBoundaries: stringArray(value.applicabilityBoundaries, "applicabilityBoundaries"),
 		uncertainty,
 		actionableTakeaway: requiredString(value, "actionableTakeaway"),
 	};
 }
 
+function parseLeafLessonDraft(
+	value: unknown,
+	evidence: ReflectorNodeReferences["evidence"],
+	normalizations: EvolutionReferenceNormalization[],
+): LessonDraft {
+	if (!isRecord(value)) throw new Error("lesson must be an object");
+	const supporting = referenceArray(value.supportingEvidenceRefs, "supportingEvidenceRefs", evidence, {
+		allowEmpty: false,
+		normalizeBare: true,
+		normalizations,
+	});
+	const counter = referenceArray(value.counterevidenceRefs, "counterevidenceRefs", evidence, {
+		normalizeBare: true,
+		normalizations,
+	});
+	const evidenceIds = supporting.map((entry) => entry.evidence.evidenceId);
+	const counterevidenceIds = counter.map((entry) => entry.evidence.evidenceId);
+	if (evidenceIds.length === 0) throw new Error("A lesson must cite supporting evidence");
+	return {
+		...lessonContent(value),
+		evidenceIds,
+		counterevidenceIds,
+		sourceIds: unique([...evidenceIds, ...counterevidenceIds]),
+	};
+}
+
+function parseSynthesisLessonDraft(value: unknown, lessons: EvolutionModelReferenceCatalog<Lesson>): LessonDraft {
+	if (!isRecord(value)) throw new Error("lesson must be an object");
+	const sources = referenceArray(value.sourceLessonRefs, "sourceLessonRefs", lessons, { allowEmpty: false });
+	const counters = referenceArray(value.counterLessonRefs, "counterLessonRefs", lessons);
+	const counterIds = new Set(counters.map((lesson) => lesson.lessonId));
+	if (sources.some((lesson) => counterIds.has(lesson.lessonId))) {
+		throw new EvolutionModelReferenceError(
+			"counterLessonRefs",
+			[],
+			lessons.references,
+			"must not overlap sourceLessonRefs",
+		);
+	}
+	const evidenceIds = unique([
+		...sources.flatMap((lesson) => lesson.evidenceIds),
+		...counters.flatMap((lesson) => lesson.counterevidenceIds),
+	]);
+	const counterevidenceIds = unique([
+		...sources.flatMap((lesson) => lesson.counterevidenceIds),
+		...counters.flatMap((lesson) => lesson.evidenceIds),
+	]);
+	if (evidenceIds.length === 0) throw new Error("A synthesized lesson must retain supporting evidence");
+	return {
+		...lessonContent(value),
+		evidenceIds,
+		counterevidenceIds,
+		sourceIds: unique([...sources, ...counters].map((lesson) => lesson.lessonId)),
+	};
+}
+
 function parseResponse(
 	response: EvolutionModelResponse,
-	permittedEvidenceIds: ReadonlySet<string>,
-): { readonly complete: boolean; readonly lessons: readonly LessonDraft[] } {
+	context:
+		| { readonly kind: "leaf"; readonly evidence: ReflectorNodeReferences["evidence"] }
+		| { readonly kind: "synthesis"; readonly lessons: EvolutionModelReferenceCatalog<Lesson> },
+): {
+	readonly complete: boolean;
+	readonly lessons: readonly LessonDraft[];
+	readonly referenceNormalizations: readonly EvolutionReferenceNormalization[];
+} {
 	if (response.output.complete !== true && response.output.complete !== false) {
 		throw new Error("Reflector response complete must be boolean");
 	}
 	if (!Array.isArray(response.output.lessons)) throw new Error("Reflector response lessons must be an array");
+	const referenceNormalizations: EvolutionReferenceNormalization[] = [];
 	return {
 		complete: response.output.complete,
-		lessons: response.output.lessons.map((lesson) => parseLessonDraft(lesson, permittedEvidenceIds)),
+		lessons: response.output.lessons.map((lesson) =>
+			context.kind === "leaf"
+				? parseLeafLessonDraft(lesson, context.evidence, referenceNormalizations)
+				: parseSynthesisLessonDraft(lesson, context.lessons),
+		),
+		referenceNormalizations,
+	};
+}
+
+function reflectorOutputSchema(kind: "leaf" | "synthesis", references: readonly string[]): JsonObject {
+	const referenceProperties: JsonObject =
+		kind === "leaf"
+			? {
+					supportingEvidenceRefs: {
+						type: "array",
+						minItems: 1,
+						uniqueItems: true,
+						items: { type: "string", enum: references },
+					},
+					counterevidenceRefs: {
+						type: "array",
+						uniqueItems: true,
+						items: { type: "string", enum: references },
+					},
+				}
+			: {
+					sourceLessonRefs: {
+						type: "array",
+						minItems: 1,
+						uniqueItems: true,
+						items: { type: "string", enum: references },
+					},
+					counterLessonRefs: {
+						type: "array",
+						uniqueItems: true,
+						items: { type: "string", enum: references },
+					},
+				};
+	const referenceFields: readonly string[] =
+		kind === "leaf" ? ["supportingEvidenceRefs", "counterevidenceRefs"] : ["sourceLessonRefs", "counterLessonRefs"];
+	return {
+		type: "object",
+		additionalProperties: false,
+		required: ["complete", "lessons"],
+		properties: {
+			complete: { type: "boolean" },
+			lessons: {
+				type: "array",
+				items: {
+					type: "object",
+					additionalProperties: false,
+					required: [
+						"kind",
+						"summary",
+						"preconditions",
+						"observedOutcome",
+						...referenceFields,
+						"applicabilityBoundaries",
+						"uncertainty",
+						"actionableTakeaway",
+					],
+					properties: {
+						kind: { enum: [...LESSON_KINDS] },
+						summary: { type: "string", minLength: 1 },
+						preconditions: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
+						observedOutcome: { type: "string", minLength: 1 },
+						...referenceProperties,
+						applicabilityBoundaries: {
+							type: "array",
+							uniqueItems: true,
+							items: { type: "string", minLength: 1 },
+						},
+						uncertainty: { type: ["string", "null"] },
+						actionableTakeaway: { type: "string", minLength: 1 },
+					},
+				},
+			},
+		},
 	};
 }
 
@@ -416,11 +544,24 @@ export class RecursiveReflector implements Reflector {
 		completed: ReadonlyMap<string, CompletedNode>,
 		chargeModelCall: () => number,
 	): Promise<CompletedNode> {
-		const permittedEvidenceIds = new Set(plan.evidenceIds);
+		const nodeReferences = registry.nodeReferences(plan.evidenceIds);
+		const childLessons = plan.childNodeIds.flatMap((nodeId) => completed.get(nodeId)?.lessons ?? []);
+		const lessonReferences = new EvolutionModelReferenceCatalog("lesson", childLessons);
+		const tools =
+			plan.kind === "leaf" ? registry.toolsForEvidence(nodeReferences) : registry.toolsForLessons(lessonReferences);
+		const outputSchema = reflectorOutputSchema(
+			plan.kind,
+			plan.kind === "leaf" ? nodeReferences.evidence.references : lessonReferences.references,
+		);
+		const denialStart = registry.recoverableDenials.length;
 		let response: EvolutionModelResponse | null = null;
 		let parsed: ReturnType<typeof parseResponse> | null = null;
 		let lastError: unknown = null;
 		let lastFailure: "model" | "response" | null = null;
+		let responseCorrection: string | null = null;
+		const rejectedResponses: JsonObject[] = [];
+		const invalidReferences = new Set<string>();
+		const permittedReferences = new Set<string>();
 		for (let round = 1; round <= this.#maxReflectionRounds && parsed?.complete !== true; round += 1) {
 			for (let attempt = 1; attempt <= this.#maxResponseRetries; attempt += 1) {
 				const modelCallSequence = chargeModelCall();
@@ -440,8 +581,9 @@ export class RecursiveReflector implements Reflector {
 							model: input.input.modelConfiguration,
 							promptVersion: input.input.promptVersions.reflector,
 							idempotencyKey: `${input.idempotencyKey}:${plan.nodeId}:${round}`,
-							input: this.#modelInput(input, plan, completed, round),
-							tools: registry.tools,
+							input: this.#modelInput(input, plan, nodeReferences, lessonReferences, round, responseCorrection),
+							outputSchema,
+							tools,
 							signal: input.signal,
 						}),
 						input.signal,
@@ -459,16 +601,35 @@ export class RecursiveReflector implements Reflector {
 					});
 				}
 				try {
-					parsed = parseResponse(response, permittedEvidenceIds);
+					parsed = parseResponse(
+						response,
+						plan.kind === "leaf"
+							? { kind: "leaf", evidence: nodeReferences.evidence }
+							: { kind: "synthesis", lessons: lessonReferences },
+					);
 					if (plan.parentNodeId === null && parsed.lessons.length > this.#maxCuratorLessons) {
 						throw new Error(`Final lesson set exceeds the Curator limit of ${this.#maxCuratorLessons}`);
 					}
 					lastError = null;
 					lastFailure = null;
+					responseCorrection = null;
 					break;
 				} catch (error) {
 					lastError = error;
 					lastFailure = "response";
+					responseCorrection = error instanceof Error ? error.message : "Response validation failed";
+					if (error instanceof EvolutionModelReferenceError) {
+						for (const reference of error.invalidReferences) invalidReferences.add(reference);
+						for (const reference of error.permittedReferences) permittedReferences.add(reference);
+					}
+					rejectedResponses.push({
+						reflectionRound: round,
+						attempt,
+						model: response.model,
+						submissionMethod: response.submissionMethod ?? "unspecified",
+						validationError: responseCorrection,
+						output: response.output,
+					});
 				}
 			}
 			if (lastError !== null) {
@@ -480,6 +641,31 @@ export class RecursiveReflector implements Reflector {
 						reasonCode: lastFailure === "model" ? "model-call-failed" : "reflection-invalid-response",
 						retryable: lastFailure === "model",
 						cause: lastError,
+						diagnostics: {
+							node: {
+								nodeId: plan.nodeId,
+								kind: plan.kind,
+								depth: plan.depth,
+								parentNodeId: plan.parentNodeId,
+								childNodeIds: plan.childNodeIds,
+								sliceIds: plan.sliceIds,
+								evidenceIds: plan.evidenceIds,
+							},
+							invalidAliases: [...invalidReferences],
+							permittedAliases: [...permittedReferences],
+							attemptDetails: rejectedResponses,
+							aliasResolutionMaps: {
+								documents: nodeReferences.documents.resolutionMap((document) => document.descriptor.documentId),
+								evidence: nodeReferences.evidence.resolutionMap((entry) => entry.evidence.evidenceId),
+								lessons: lessonReferences.resolutionMap((lesson) => lesson.lessonId),
+							},
+							recoverableToolDenials: registry.recoverableDenials.slice(denialStart).map((denial) => ({
+								toolName: denial.toolName,
+								denialCode: denial.denialCode,
+								requestedDocumentRef: denial.requestedDocumentRef,
+								requestedSliceRef: denial.requestedSliceRef,
+							})),
+						},
 					},
 				);
 			}
@@ -500,15 +686,10 @@ export class RecursiveReflector implements Reflector {
 		};
 		const lessons = parsed.lessons.map((draft, index): Lesson => {
 			const lessonId = stableId("lesson", { nodeId: plan.nodeId, index, draft });
-			const content = { lessonId, ...draft, scope: input.input.metadata.scope };
+			const { sourceIds, ...lessonContent } = draft;
+			const content = { lessonId, ...lessonContent, scope: input.input.metadata.scope };
 			return {
-				metadata: this.#metadata(
-					input,
-					modelProducer,
-					lessonId,
-					unique([...draft.evidenceIds, ...draft.counterevidenceIds]),
-					content,
-				),
+				metadata: this.#metadata(input, modelProducer, lessonId, sourceIds, content),
 				lessonId,
 				kind: draft.kind,
 				summary: draft.summary,
@@ -539,7 +720,9 @@ export class RecursiveReflector implements Reflector {
 			metadata: this.#metadata(input, modelProducer, plan.nodeId, plan.evidenceIds, nodeContent),
 			...nodeContent,
 		};
-		const lessonReferences = await Promise.all(lessons.map((lesson) => this.#dependencies.artifacts.put(lesson)));
+		const lessonArtifactReferences = await Promise.all(
+			lessons.map((lesson) => this.#dependencies.artifacts.put(lesson)),
+		);
 		const nodeReference = await this.#dependencies.artifacts.put(node);
 		const checkpointId = stableId("ledger-event", {
 			jobId: input.jobId,
@@ -551,7 +734,8 @@ export class RecursiveReflector implements Reflector {
 			nodeId: node.nodeId,
 			manifestDigest: input.corpus.metadata.contentDigest,
 			node: nodeReference,
-			lessons: lessonReferences,
+			lessons: lessonArtifactReferences,
+			referenceNormalizations: parsed.referenceNormalizations,
 		};
 		const checkpoint: ReflectionNodeCheckpointedLedgerEvent = {
 			metadata: this.#metadata(input, producer, checkpointId, [node.nodeId], checkpointContent),
@@ -567,36 +751,65 @@ export class RecursiveReflector implements Reflector {
 	#modelInput(
 		input: ReflectorInput,
 		plan: NodePlan,
-		completed: ReadonlyMap<string, CompletedNode>,
+		nodeReferences: ReflectorNodeReferences,
+		lessonReferences: EvolutionModelReferenceCatalog<Lesson>,
 		round: number,
+		responseCorrection: string | null,
 	): JsonObject {
-		const childLessons = plan.childNodeIds.flatMap((nodeId) => completed.get(nodeId)?.lessons ?? []);
+		const instructionReferences = new EvolutionModelReferenceCatalog("instruction", input.instructions.documents);
+		const evidenceReferences = new Map(
+			nodeReferences.evidence.entries.map((entry) => [entry.value.evidence.evidenceId, entry.ref]),
+		);
+		const counterSignals =
+			input.counterReport?.evidence.flatMap((entry) => {
+				const refs = entry.evidenceIds
+					.map((evidenceId) => evidenceReferences.get(evidenceId))
+					.filter((reference): reference is string => reference !== undefined);
+				return refs.length === 0 ? [] : [{ signal: entry.signal, evidenceRefs: refs }];
+			}) ?? [];
 		return {
 			control: {
 				objective: plan.kind === "leaf" ? "reflect-on-immutable-evidence-slice" : "synthesize-child-reflections",
 				evidenceIsUntrustedData: true,
 				requireEvidenceClosure: true,
 				completionCriterion: "Return complete=true only when the node lessons are coherent and evidence-closed.",
+				...(responseCorrection === null
+					? {}
+					: {
+							responseCorrection: {
+								reason: responseCorrection,
+								instruction: "Correct the structured response and submit it again.",
+							},
+						}),
 			},
-			jobId: input.jobId,
-			manifestDigest: input.corpus.metadata.contentDigest,
 			node: {
-				nodeId: plan.nodeId,
 				kind: plan.kind,
 				depth: plan.depth,
-				sliceIds: plan.sliceIds,
-				evidenceIds: plan.evidenceIds,
-				childNodeIds: plan.childNodeIds,
 			},
 			reflectionRound: round,
-			instructions: input.instructions.documents.map((document) => ({
-				path: document.path,
+			instructions: instructionReferences.entries.map(({ ref, value: document }, index) => ({
+				instructionRef: ref,
+				label: `Instruction ${index + 1}`,
 				precedence: document.precedence,
 				content: document.content,
-				contentDigest: document.contentDigest,
 			})),
-			counterReport: jsonClone(input.counterReport),
-			childLessons: jsonClone(childLessons),
+			counterSignals,
+			...(plan.kind === "leaf"
+				? {
+						documents: nodeReferences.documentCatalog,
+						evidence: nodeReferences.evidenceCatalog,
+						slices: nodeReferences.sliceCatalog,
+					}
+				: {
+						childLessons: lessonReferences.entries.map(({ ref, value: lesson }) => ({
+							lessonRef: ref,
+							kind: lesson.kind,
+							summary: lesson.summary,
+							actionableTakeaway: lesson.actionableTakeaway,
+							supportingEvidenceCount: lesson.evidenceIds.length,
+							counterevidenceCount: lesson.counterevidenceIds.length,
+						})),
+					}),
 		};
 	}
 
@@ -677,7 +890,18 @@ export class RecursiveReflector implements Reflector {
 			budgetCharge: { modelCalls: 0, reflectionRounds: 0, toolCalls: 1 },
 		};
 		const event: ReflectorToolCallLedgerEvent = {
-			metadata: this.#metadata(input, producer, eventId, audit.resolvedEvidenceIds, content),
+			metadata: this.#metadata(
+				input,
+				producer,
+				eventId,
+				unique([
+					...audit.resolvedDocumentIds,
+					...audit.resolvedEvidenceIds,
+					...audit.resolvedLessonIds,
+					...audit.resolvedSliceIds,
+				]),
+				content,
+			),
 			eventId,
 			jobId: input.jobId,
 			type: "reflector-tool-call",

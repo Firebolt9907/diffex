@@ -304,6 +304,12 @@ export interface EvidenceCoverageMap {
 
 export type ReflectionNodeStatus = "pending" | "complete" | "failed";
 
+export interface EvolutionReferenceNormalization {
+	readonly field: string;
+	readonly providedReference: string;
+	readonly normalizedReference: string;
+}
+
 export interface ReflectionNode {
 	readonly metadata: EvolutionArtifactMetadata;
 	readonly nodeId: string;
@@ -440,7 +446,6 @@ export type EvolutionMemoryDelta = EvolutionMemoryAddDelta | EvolutionMemoryRemo
 interface EvolutionProposalBase {
 	readonly metadata: EvolutionArtifactMetadata;
 	readonly proposalId: string;
-	readonly summary: string;
 	readonly scope: EvolutionProposalScope;
 	readonly lessonIds: readonly string[];
 	readonly supportingEvidenceIds: readonly string[];
@@ -785,11 +790,28 @@ export interface ReflectorToolCallLedgerEvent extends EvolutionLedgerEventBase {
 	readonly toolName: string;
 	readonly manifestDigest: string;
 	readonly requestDigest: string;
-	readonly requestedSliceId: string | null;
+	readonly requestedDocumentRef: string | null;
+	readonly requestedSliceRef: string | null;
+	readonly resolvedDocumentIds: readonly string[];
 	readonly resolvedEvidenceIds: readonly string[];
+	readonly resolvedLessonIds: readonly string[];
+	readonly resolvedSliceIds: readonly string[];
 	readonly resultDigest: string | null;
 	readonly denialCode: string | null;
 	readonly budgetCharge: ReflectorBudgetCharge;
+}
+
+export interface CuratorToolCallLedgerEvent extends EvolutionLedgerEventBase {
+	readonly type: "curator-tool-call";
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly requestDigest: string;
+	readonly requestedReferences: readonly string[];
+	readonly resolvedInstructionPaths: readonly string[];
+	readonly resolvedLessonIds: readonly string[];
+	readonly resolvedMemoryItemIds: readonly string[];
+	readonly resultDigest: string | null;
+	readonly denialCode: string | null;
 }
 
 export interface ReflectorModelCallLedgerEvent extends EvolutionLedgerEventBase {
@@ -809,6 +831,7 @@ export interface ReflectionNodeCheckpointedLedgerEvent extends EvolutionLedgerEv
 	readonly manifestDigest: string;
 	readonly node: EvolutionArtifactReference;
 	readonly lessons: readonly EvolutionArtifactReference[];
+	readonly referenceNormalizations: readonly EvolutionReferenceNormalization[];
 }
 
 export type EvolutionLedgerEvent =
@@ -821,5 +844,6 @@ export type EvolutionLedgerEvent =
 	| JobFailedLedgerEvent
 	| ProposalRolledBackLedgerEvent
 	| ReflectionNodeCheckpointedLedgerEvent
+	| CuratorToolCallLedgerEvent
 	| ReflectorModelCallLedgerEvent
 	| ReflectorToolCallLedgerEvent;

@@ -4,6 +4,7 @@ import type {
 	EvidenceCorpusManifest,
 	EvidenceCoverageMap,
 	EvolutionArtifactReference,
+	EvolutionFailureReasonCode,
 	EvolutionInputSnapshot,
 	EvolutionJob,
 	EvolutionJobStage,
@@ -23,6 +24,7 @@ import type {
 	InstructionDocumentSnapshot,
 	InstructionSnapshot,
 	JsonObject,
+	JsonValue,
 	Lesson,
 	MutationBatch,
 	MutationWriteReceipt,
@@ -67,6 +69,7 @@ export interface ReflectorModelRequest {
 	readonly promptVersion: string;
 	readonly idempotencyKey: string;
 	readonly input: JsonObject;
+	readonly outputSchema: JsonObject;
 	readonly tools: readonly EvolutionModelTool[];
 	readonly signal?: AbortSignal;
 }
@@ -78,7 +81,7 @@ export interface CuratorModelRequest {
 	readonly idempotencyKey: string;
 	readonly input: JsonObject;
 	readonly outputSchema: JsonObject;
-	readonly tools?: never;
+	readonly tools: readonly EvolutionModelTool[];
 	readonly signal?: AbortSignal;
 }
 
@@ -86,6 +89,7 @@ export type EvolutionModelRequest = CuratorModelRequest | ReflectorModelRequest;
 
 export interface EvolutionModelResponse {
 	readonly output: JsonObject;
+	readonly submissionMethod?: "json-text" | "response-tool";
 	readonly model: {
 		readonly provider: string;
 		readonly model: string;
@@ -94,6 +98,32 @@ export interface EvolutionModelResponse {
 
 export interface EvolutionModelExecutor {
 	execute(request: EvolutionModelRequest): Promise<EvolutionModelResponse>;
+}
+
+export interface EvolutionFailureRecord {
+	readonly schemaVersion: 1;
+	readonly jobId: string;
+	readonly trigger: EvolutionTriggerKind;
+	readonly stage: EvolutionJobStage;
+	readonly outcome: "retryable-failed" | "terminal-failed";
+	readonly reasonCode: EvolutionFailureReasonCode;
+	readonly failedAt: string;
+	readonly attempt: number;
+	readonly error: {
+		readonly name: string;
+		readonly message: string;
+		readonly stack: string | null;
+		readonly cause: {
+			readonly name: string;
+			readonly message: string;
+			readonly stack: string | null;
+		} | null;
+		readonly diagnostics: JsonValue | null;
+	};
+}
+
+export interface EvolutionFailureReporter {
+	record(failure: EvolutionFailureRecord): Promise<void>;
 }
 
 export interface PreReflectionStageInput {
@@ -131,6 +161,7 @@ export interface Reflector {
 }
 
 export interface CuratorInput {
+	readonly jobId: string;
 	readonly input: EvolutionInputSnapshot;
 	readonly corpus: EvidenceCorpusManifest;
 	readonly instructions: InstructionSnapshot;

@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { contentText, type Message, type Model, type Tool } from "@earendil-works/diffex-ai";
 import type { HarnessStateStore, HarnessVersion } from "@earendil-works/diffex-harness-state";
+import lockfile from "proper-lockfile";
 import type { TSchema } from "typebox";
 import {
 	computeEvolutionContentDigest,
@@ -30,6 +31,7 @@ import {
 	type EvolutionSnapshotSource,
 	type EvolutionStartResult,
 	EvolutionTargetAdapterRegistry,
+	EvolutionToolDeniedError,
 	FileEvolutionPersistence,
 	type InteractivePriorityGate,
 	type JsonObject,
@@ -42,68 +44,20 @@ import { materializeJsonlInvocation } from "#harness-trace";
 import { VERSION } from "../config.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionLifecycleObserver, AgentSessionOperationSettlement } from "./agent-session-lifecycle.ts";
-import type { InvocationTrace } from "./invocation-trace.ts";
+import { FileEvolutionFailureReporter } from "./evolution-failure-reporter.ts";
+import { INVOCATION_TRACE_LOCK_STALE_MS, type InvocationTrace } from "./invocation-trace.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 
 const execFileAsync = promisify(execFile);
 const EVOLUTION_DIRECTORY_NAME = "evolution";
+const EVOLUTION_FAILURE_DIRECTORY_NAME = "evolution-failures";
 const TRACE_DIRECTORY_NAME = "traces";
+const TRACE_EVIDENCE_INDEX_NAME = ".evolution-index.json";
+const TRACE_EVIDENCE_INDEX_VERSION = 1;
+const GLOBAL_EVOLUTION_SCOPE: EvolutionScope = { repositoryId: "global", scopeId: "global" };
 const RESPONSE_TOOL_NAME = "submit_evolution_response";
 const MAX_MODEL_ROUNDS = 24;
-
-const REFLECTOR_RESPONSE_SCHEMA = {
-	type: "object",
-	additionalProperties: false,
-	required: ["complete", "lessons"],
-	properties: {
-		complete: { type: "boolean" },
-		lessons: {
-			type: "array",
-			items: {
-				type: "object",
-				additionalProperties: false,
-				required: [
-					"kind",
-					"summary",
-					"preconditions",
-					"observedOutcome",
-					"supportingEvidenceIds",
-					"counterevidenceIds",
-					"applicabilityBoundaries",
-					"uncertainty",
-					"actionableTakeaway",
-				],
-				properties: {
-					kind: {
-						enum: [
-							"counterexample",
-							"direct-instruction",
-							"failure-workaround",
-							"harmful-memory",
-							"incorrect-source-of-truth",
-							"missing-capability",
-							"missing-verification",
-							"orchestration-inefficiency",
-							"repository-constraint",
-							"successful-strategy",
-							"tool-behavior",
-							"unresolved-work",
-						],
-					},
-					summary: { type: "string", minLength: 1 },
-					preconditions: { type: "array", items: { type: "string", minLength: 1 } },
-					observedOutcome: { type: "string", minLength: 1 },
-					supportingEvidenceIds: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-					counterevidenceIds: { type: "array", items: { type: "string", minLength: 1 } },
-					applicabilityBoundaries: { type: "array", items: { type: "string", minLength: 1 } },
-					uncertainty: { type: ["string", "null"] },
-					actionableTakeaway: { type: "string", minLength: 1 },
-				},
-			},
-		},
-	},
-} as const satisfies JsonObject;
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -120,6 +74,15 @@ function parseJsonObject(text: string): JsonObject | null {
 	} catch {
 		return null;
 	}
+}
+
+function evolutionToolError(error: unknown): JsonObject {
+	return {
+		error: {
+			name: error instanceof Error ? error.name : "Error",
+			message: error instanceof Error ? error.message : String(error),
+		},
+	};
 }
 
 function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -172,8 +135,8 @@ export class CodingAgentEvolutionModelExecutor implements EvolutionModelExecutor
 
 	async execute(request: EvolutionModelRequest): Promise<EvolutionModelResponse> {
 		const model = this.#model(request);
-		const evolutionTools = request.stage === "reflector" ? request.tools : [];
-		const responseSchema = request.stage === "curator" ? request.outputSchema : REFLECTOR_RESPONSE_SCHEMA;
+		const evolutionTools = request.tools;
+		const responseSchema = request.outputSchema;
 		const responseTool: Tool = {
 			name: RESPONSE_TOOL_NAME,
 			description: "Submit the complete structured response after inspecting all required evidence.",
@@ -219,24 +182,46 @@ export class CodingAgentEvolutionModelExecutor implements EvolutionModelExecutor
 			const calls = assistant.content.filter((part) => part.type === "toolCall");
 			for (const call of calls) {
 				if (call.name === RESPONSE_TOOL_NAME) {
-					return { output: call.arguments as JsonObject, model: { provider: model.provider, model: model.id } };
+					return {
+						output: call.arguments as JsonObject,
+						submissionMethod: "response-tool",
+						model: { provider: model.provider, model: model.id },
+					};
 				}
 				const tool = evolutionTools.find((candidate) => candidate.name === call.name);
-				const output = tool
-					? await tool.execute(call.arguments as JsonObject)
-					: { error: `Unknown evolution tool ${call.name}` };
+				let output: JsonObject;
+				let isError = false;
+				if (tool === undefined) {
+					output = evolutionToolError(new Error(`Unknown evolution tool ${call.name}`));
+					isError = true;
+				} else {
+					try {
+						output = await tool.execute(call.arguments as JsonObject);
+					} catch (error) {
+						request.signal?.throwIfAborted();
+						if (error instanceof EvolutionToolDeniedError && !error.recoverable) throw error;
+						output = evolutionToolError(error);
+						isError = true;
+					}
+				}
 				messages.push({
 					role: "toolResult",
 					toolCallId: call.id,
 					toolName: call.name,
 					content: [{ type: "text", text: JSON.stringify(output) }],
-					isError: tool === undefined,
+					isError,
 					timestamp: Date.now(),
 				});
 			}
 			if (calls.length === 0) {
 				const parsed = parseJsonObject(contentText(assistant.content));
-				if (parsed) return { output: parsed, model: { provider: model.provider, model: model.id } };
+				if (parsed) {
+					return {
+						output: parsed,
+						submissionMethod: "json-text",
+						model: { provider: model.provider, model: model.id },
+					};
+				}
 				messages.push({
 					role: "user",
 					content: `Return the result through ${RESPONSE_TOOL_NAME}.`,
@@ -250,24 +235,27 @@ export class CodingAgentEvolutionModelExecutor implements EvolutionModelExecutor
 
 export class TraceEvidenceCatalog implements EvolutionEvidenceCatalog {
 	readonly #traceDirectory: string;
-	readonly #repositoryRoot: string;
+	readonly #indexPath: string;
+	readonly #indexLockPath: string;
 	readonly #scope: EvolutionScope;
-	readonly #excludedTracePath: string | undefined;
 	readonly #materializeInvocation: typeof materializeJsonlInvocation;
+	readonly #isTraceActive: (path: string) => Promise<boolean>;
 	readonly #cache = new Map<string, Promise<SuccessfulMaterialization | null>>();
 
 	constructor(options: {
 		agentDir: string;
-		repositoryRoot: string;
 		scope: EvolutionScope;
-		excludedTracePath?: string;
 		materializeInvocation?: typeof materializeJsonlInvocation;
+		isTraceActive?: (path: string) => Promise<boolean>;
 	}) {
 		this.#traceDirectory = join(options.agentDir, TRACE_DIRECTORY_NAME);
-		this.#repositoryRoot = resolve(options.repositoryRoot);
+		this.#indexPath = join(this.#traceDirectory, TRACE_EVIDENCE_INDEX_NAME);
+		this.#indexLockPath = join(this.#traceDirectory, ".evolution-index");
 		this.#scope = options.scope;
-		this.#excludedTracePath = options.excludedTracePath;
 		this.#materializeInvocation = options.materializeInvocation ?? materializeJsonlInvocation;
+		this.#isTraceActive =
+			options.isTraceActive ??
+			((path) => lockfile.check(path, { realpath: false, stale: INVOCATION_TRACE_LOCK_STALE_MS }));
 	}
 
 	#assertScope(scope: EvolutionScope): void {
@@ -276,65 +264,98 @@ export class TraceEvidenceCatalog implements EvolutionEvidenceCatalog {
 		}
 	}
 
-	async #paths(): Promise<readonly string[]> {
+	async #readIndex(): Promise<string[]> {
 		try {
-			const paths = (await readdir(this.#traceDirectory, { withFileTypes: true }))
-				.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-				.map((entry) => join(this.#traceDirectory, entry.name))
-				.filter((path) => path !== this.#excludedTracePath);
-			const discovered = await Promise.all(
-				paths.map(async (path) => {
-					try {
-						const file = await stat(path, { bigint: true });
-						return { path, createdAt: file.birthtimeNs === 0n ? file.ctimeNs : file.birthtimeNs };
-					} catch {
-						return null;
-					}
-				}),
-			);
-			return discovered
-				.filter((entry): entry is { path: string; createdAt: bigint } => entry !== null)
-				.sort((left, right) => {
-					if (left.createdAt < right.createdAt) return -1;
-					if (left.createdAt > right.createdAt) return 1;
-					return left.path.localeCompare(right.path);
-				})
-				.map((entry) => entry.path);
+			const parsed: unknown = JSON.parse(await readFile(this.#indexPath, "utf8"));
+			if (
+				!isRecord(parsed) ||
+				parsed.version !== TRACE_EVIDENCE_INDEX_VERSION ||
+				!Array.isArray(parsed.entries) ||
+				!parsed.entries.every(
+					(entry): entry is string =>
+						typeof entry === "string" && basename(entry) === entry && entry.endsWith(".jsonl"),
+				) ||
+				new Set(parsed.entries).size !== parsed.entries.length
+			) {
+				throw new Error("Evolution trace evidence index is invalid");
+			}
+			return parsed.entries;
 		} catch (error) {
 			if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
 			throw error;
 		}
 	}
 
-	async #sessionBelongsToRepository(path: string): Promise<boolean> {
+	async #writeIndex(entries: readonly string[]): Promise<void> {
+		const temporaryPath = join(this.#traceDirectory, `.${TRACE_EVIDENCE_INDEX_NAME}.${randomUUID()}.tmp`);
 		try {
-			const firstLine = (await readFile(path, "utf8")).split("\n", 1)[0];
-			const header: unknown = JSON.parse(firstLine ?? "");
-			if (!isRecord(header) || typeof header.cwd !== "string") return false;
-			const sessionRoot = await realpath(header.cwd).catch(() => resolve(header.cwd as string));
-			return sessionRoot === this.#repositoryRoot;
-		} catch {
-			return false;
+			await writeFile(
+				temporaryPath,
+				`${JSON.stringify({ version: TRACE_EVIDENCE_INDEX_VERSION, entries }, null, 2)}\n`,
+				{ encoding: "utf8", flag: "wx", mode: 0o600 },
+			);
+			await rename(temporaryPath, this.#indexPath);
+		} catch (error) {
+			await unlink(temporaryPath).catch((cleanupError: unknown) => {
+				if (!(cleanupError instanceof Error && "code" in cleanupError && cleanupError.code === "ENOENT")) {
+					throw cleanupError;
+				}
+			});
+			throw error;
+		}
+	}
+
+	async #paths(): Promise<readonly string[]> {
+		await mkdir(this.#traceDirectory, { recursive: true, mode: 0o700 });
+		const release = await lockfile.lock(this.#indexLockPath, {
+			lockfilePath: `${this.#indexLockPath}.lock`,
+			realpath: false,
+			retries: { retries: 200, factor: 1, minTimeout: 5, maxTimeout: 25, randomize: true },
+			stale: INVOCATION_TRACE_LOCK_STALE_MS,
+			update: 10_000,
+		});
+		try {
+			const indexed = await this.#readIndex();
+			const indexedNames = new Set(indexed);
+			const candidates = await Promise.all(
+				(await readdir(this.#traceDirectory, { withFileTypes: true }))
+					.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl") && !indexedNames.has(entry.name))
+					.map(async (entry) => {
+						const path = join(this.#traceDirectory, entry.name);
+						if (await this.#isTraceActive(path).catch(() => true)) {
+							return null;
+						}
+						try {
+							const file = await stat(path, { bigint: true });
+							return {
+								name: entry.name,
+								createdAt: file.birthtimeNs === 0n ? file.ctimeNs : file.birthtimeNs,
+							};
+						} catch {
+							return null;
+						}
+					}),
+			);
+			const additions = candidates
+				.filter((entry): entry is { name: string; createdAt: bigint } => entry !== null)
+				.sort((left, right) => {
+					if (left.createdAt < right.createdAt) return -1;
+					if (left.createdAt > right.createdAt) return 1;
+					return left.name.localeCompare(right.name);
+				})
+				.map((entry) => entry.name);
+			if (additions.length > 0) {
+				indexed.push(...additions);
+				await this.#writeIndex(indexed);
+			}
+			return indexed.map((name) => join(this.#traceDirectory, name));
+		} finally {
+			await release();
 		}
 	}
 
 	async #materialize(path: string, ingestionCursor: number): Promise<SuccessfulMaterialization | null> {
 		const invocation = await this.#materializeInvocation(path);
-		const sessionPaths = new Set(
-			invocation.evidence.flatMap((evidence) =>
-				evidence.sessionSource === undefined
-					? []
-					: [evidence.sessionSource.resolvedPath ?? evidence.sessionSource.path],
-			),
-		);
-		let belongs = false;
-		for (const sessionPath of sessionPaths) {
-			if (await this.#sessionBelongsToRepository(sessionPath)) {
-				belongs = true;
-				break;
-			}
-		}
-		if (!belongs) return null;
 		const contentDigest = computeEvolutionContentDigest(invocation);
 		return {
 			materializationId: invocation.traceId ?? `materialization-${contentDigest.slice("sha256:".length)}`,
@@ -469,25 +490,22 @@ export interface CreateCodingAgentEvolutionRuntimeOptions {
 	readonly harnessState: HarnessStateStore;
 	readonly modelRuntime: ModelRuntime;
 	readonly resourceLoader: ResourceLoader;
-	readonly currentTracePath?: string;
 }
 
 export async function createCodingAgentEvolutionRuntime(
 	options: CreateCodingAgentEvolutionRuntimeOptions,
 ): Promise<CodingAgentEvolutionRuntime> {
 	const repositoryRoot = await realpath(options.cwd).catch(() => resolve(options.cwd));
-	const repositoryId = computeEvolutionContentDigest(repositoryRoot);
-	const scope: EvolutionScope = { repositoryId, scopeId: repositoryId };
-	const storageRoot = join(options.agentDir, EVOLUTION_DIRECTORY_NAME, repositoryId.replace("sha256:", "sha256-"));
+	const scope = GLOBAL_EVOLUTION_SCOPE;
+	const storageRoot = join(options.agentDir, EVOLUTION_DIRECTORY_NAME);
 	const persistence = new FileEvolutionPersistence(storageRoot);
+	const failures = new FileEvolutionFailureReporter(join(options.agentDir, EVOLUTION_FAILURE_DIRECTORY_NAME));
 	const progress = new EvolutionProgressBus();
 	const clock = { now: () => new Date().toISOString() };
 	const priority = new SessionPriorityGate(options.session);
 	const evidence = new TraceEvidenceCatalog({
 		agentDir: options.agentDir,
-		repositoryRoot,
 		scope,
-		excludedTracePath: options.currentTracePath,
 	});
 	const writer = new EvolutionMemoryWriter({
 		version: VERSION,
@@ -497,7 +515,7 @@ export async function createCodingAgentEvolutionRuntime(
 	const targets = new EvolutionTargetAdapterRegistry({ writers: [writer] });
 	const model = new CodingAgentEvolutionModelExecutor(options.session, options.modelRuntime, priority);
 	const reflector = new RecursiveReflector({ version: VERSION, artifacts: persistence, ledger: persistence });
-	const curator = new StructuredDeltaCurator({ version: VERSION });
+	const curator = new StructuredDeltaCurator({ version: VERSION, ledger: persistence });
 	const ranker = new DeterministicProposalRanker({ version: VERSION });
 	const pipeline = new EvolutionPipeline({
 		version: VERSION,
@@ -517,6 +535,7 @@ export async function createCodingAgentEvolutionRuntime(
 		cursors: persistence,
 		leases: persistence,
 		ledger: persistence,
+		failures,
 		events: progress,
 		evidence,
 		snapshots: new CodingAgentSnapshotSource({

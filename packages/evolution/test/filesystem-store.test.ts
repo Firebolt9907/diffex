@@ -8,6 +8,7 @@ import {
 	type EvolutionArtifactProducer,
 	type EvolutionJob,
 	type EvolutionLeaseToken,
+	type EvolutionLedgerEvent,
 	type EvolutionScope,
 	EvolutionStorageCorruptionError,
 	FileEvolutionPersistence,
@@ -90,6 +91,24 @@ function job(reference: EvolutionJob["inputSnapshot"]): EvolutionJob {
 	};
 }
 
+function ledgerEvent(eventId: string, inputSnapshotId: string): EvolutionLedgerEvent {
+	const content = { inputSnapshotId };
+	return {
+		metadata: createEvolutionArtifactMetadata({
+			artifactId: eventId,
+			producer,
+			sourceIds: ["job-1"],
+			scope,
+			createdAt: "2026-08-19T12:00:00.000Z",
+			content,
+		}),
+		eventId,
+		jobId: "job-1",
+		type: "job-created",
+		inputSnapshotId,
+	};
+}
+
 async function scopeLease(store: FileEvolutionPersistence, ownerId: string): Promise<EvolutionLeaseToken> {
 	const lease = await store.acquire(
 		"scope",
@@ -117,6 +136,44 @@ describe("filesystem evolution persistence", () => {
 		await expect(store.get(first)).rejects.toBeInstanceOf(EvolutionStorageCorruptionError);
 	});
 
+	it("rejects unsupported artifact, job, and ledger schema versions", async () => {
+		const { store } = await storeFixture();
+		const artifact = instructionSnapshot();
+		const incompatibleArtifact = {
+			...artifact,
+			metadata: { ...artifact.metadata, schemaVersion: 2 },
+		} as unknown as InstructionSnapshot;
+		await expect(store.put(incompatibleArtifact)).rejects.toThrow("metadata is invalid or incompatible");
+
+		const reference = await store.put(artifact);
+		const lease = await scopeLease(store, "owner-1");
+		const compatibleJob = job(reference);
+		const incompatibleJob = {
+			...compatibleJob,
+			metadata: { ...compatibleJob.metadata, schemaVersion: 2 },
+		} as unknown as EvolutionJob;
+		await expect(store.create(incompatibleJob, lease)).rejects.toThrow("metadata is invalid or incompatible");
+
+		const event = ledgerEvent("event-1", reference.artifactId);
+		const incompatibleEvent = {
+			...event,
+			metadata: { ...event.metadata, schemaVersion: 2 },
+		} as unknown as EvolutionLedgerEvent;
+		await expect(store.append(incompatibleEvent)).rejects.toThrow("metadata is invalid or incompatible");
+	});
+
+	it("keeps ledger event IDs append-only and idempotent", async () => {
+		const { store } = await storeFixture();
+		const first = ledgerEvent("event-1", "input-1");
+		await store.append(first);
+		await expect(store.append(first)).resolves.toBeUndefined();
+
+		await expect(store.append(ledgerEvent("event-1", "input-2"))).rejects.toThrow(
+			"ledger event ID was reused with different content",
+		);
+		expect(await store.read("job-1")).toEqual([first]);
+	});
+
 	it("fences stale scope owners from job and cursor mutations", async () => {
 		const { store } = await storeFixture();
 		const artifactReference = await store.put(instructionSnapshot());
@@ -138,6 +195,21 @@ describe("filesystem evolution persistence", () => {
 		);
 		expect(await store.commit(scope, 0, 3, "job-1", new Date().toISOString(), secondLease)).toBe("committed");
 		expect(await store.commit(scope, 0, 3, "job-1", new Date().toISOString(), secondLease)).toBe("already-committed");
+	});
+
+	it("admits only one owner across concurrent persistence instances", async () => {
+		const { root, store } = await storeFixture();
+		const peer = new FileEvolutionPersistence(root);
+		const now = new Date().toISOString();
+		const key = computeEvolutionContentDigest(scope);
+
+		const leases = await Promise.all([
+			store.acquire("scope", key, "owner-1", now, 5_000),
+			peer.acquire("scope", key, "owner-2", now, 5_000),
+		]);
+
+		expect(leases.filter((lease) => lease !== null)).toHaveLength(1);
+		expect(leases.filter((lease) => lease === null)).toHaveLength(1);
 	});
 
 	it("uses compare-and-swap revisions for durable job manifests", async () => {

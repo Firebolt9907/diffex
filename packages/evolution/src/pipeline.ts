@@ -7,14 +7,17 @@ import type {
 	EvolutionInputSnapshot,
 	EvolutionLedgerEvent,
 	EvolutionMemoryProposal,
+	EvolutionMemoryWriteOutput,
 	EvolutionProposal,
 	EvolutionProposalLedgerDisposition,
 	EvolutionScope,
+	HarnessActivatedLedgerEvent,
 	HarnessActivationReceipt,
 	InstructionSnapshot,
 	Lesson,
 	MutationBatch,
 	MutationWriteReceipt,
+	MutationWrittenLedgerEvent,
 	ProposalDispositionLedgerEvent,
 	ReflectionNode,
 	ScoredProposal,
@@ -97,6 +100,26 @@ function isMutationWriteReceipt(artifact: EvolutionArtifact): artifact is Mutati
 		"result" in artifact &&
 		isRecord(artifact.result) &&
 		(artifact.result.status === "written" || artifact.result.status === "failed")
+	);
+}
+
+function isEvolutionMemoryWriteOutput(value: unknown): value is EvolutionMemoryWriteOutput {
+	return (
+		isRecord(value) &&
+		typeof value.candidateId === "string" &&
+		typeof value.candidateDigest === "string" &&
+		typeof value.batchHash === "string" &&
+		typeof value.expectedBaseVersion === "string" &&
+		typeof value.expectedBaseDigest === "string" &&
+		typeof value.resultingHarnessVersion === "string" &&
+		typeof value.resultingMemoryDigest === "string" &&
+		Array.isArray(value.operationIds) &&
+		value.operationIds.every((operationId) => typeof operationId === "string") &&
+		isRecord(value.diff) &&
+		Number.isSafeInteger(value.diff.start) &&
+		(value.diff.start as number) >= 0 &&
+		typeof value.diff.removed === "string" &&
+		typeof value.diff.added === "string"
 	);
 }
 
@@ -406,18 +429,88 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 			target: proposal.target,
 			payload: proposal.exactDelta,
 		}));
-		const batchId = stableId("mutation-batch", { idempotencyKey: context.idempotencyKey, mutations });
+		const activationEventId = stableId("ledger-event", {
+			jobId: context.job.jobId,
+			type: "harness-activated",
+			proposalIds: proposals.map((proposal) => proposal.proposalId),
+		});
+		const content = {
+			batchId: stableId("mutation-batch", { idempotencyKey: context.idempotencyKey, mutations }),
+			targetKind: "evolution-memory" as const,
+			expectedBaseVersion: context.input.expectedHarnessBaseVersion,
+			expectedBaseDigest: context.input.harness.memoryContentDigest,
+			baseMemoryItems: context.input.harness.activeMemoryItems,
+			activationEventId,
+			mutations,
+		};
 		return {
 			metadata: this.#metadata(
-				batchId,
+				content.batchId,
 				[context.job.jobId, ...selected.map((scored) => scored.metadata.artifactId)],
 				context.job.metadata.scope,
 				context.input.metadata.createdAt,
-				{ batchId, targetKind: "evolution-memory", mutations },
+				content,
 			),
-			batchId,
-			targetKind: "evolution-memory",
-			mutations,
+			...content,
+		};
+	}
+
+	#mutationWrittenEvent(
+		context: EvolutionStageExecutionContext,
+		batch: MutationBatch,
+		writeResult: MutationWriteReceipt["result"],
+	): MutationWrittenLedgerEvent {
+		const content = { batchId: batch.batchId, writeResult };
+		const eventId = stableId("ledger-event", { idempotencyKey: context.idempotencyKey, ...content });
+		return {
+			metadata: this.#ledgerMetadata(eventId, context, content),
+			eventId,
+			jobId: context.job.jobId,
+			type: "mutation-written",
+			batchId: batch.batchId,
+			writeResult,
+		};
+	}
+
+	#harnessActivatedEvent(
+		context: EvolutionStageExecutionContext,
+		batch: MutationBatch,
+		output: EvolutionMemoryWriteOutput,
+		result: HarnessActivationReceipt["result"],
+		selected: readonly ScoredProposal[],
+	): HarnessActivatedLedgerEvent {
+		if (result.resultingHarnessVersion === null) {
+			throw new EvolutionExecutionError("Activated harness result is missing its revision", {
+				reasonCode: "pipeline-invariant",
+				retryable: false,
+			});
+		}
+		const proposalIds = selected.map((scored) => scored.proposal.proposalId);
+		const evidenceIds = [
+			...new Set(
+				selected.flatMap((scored) => [
+					...scored.proposal.supportingEvidenceIds,
+					...scored.proposal.contradictingEvidenceIds,
+				]),
+			),
+		].sort((left, right) => left.localeCompare(right));
+		const content = {
+			batchId: batch.batchId,
+			proposalIds,
+			evidenceIds,
+			operationIds: output.operationIds,
+			exactDiff: output.diff,
+			parentHarnessVersion: batch.expectedBaseVersion,
+			resultingHarnessVersion: result.resultingHarnessVersion,
+			activationResult: result,
+			rollbackParentHarnessVersion: batch.expectedBaseVersion,
+		};
+		return {
+			metadata: this.#ledgerMetadata(batch.activationEventId, context, content),
+			eventId: batch.activationEventId,
+			jobId: context.job.jobId,
+			type: "harness-activated",
+			...content,
 		};
 	}
 
@@ -597,6 +690,12 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 						retryable: true,
 					});
 				}
+				if (result.batchId !== batch.batchId || !isEvolutionMemoryWriteOutput(result.output)) {
+					throw new EvolutionExecutionError(`Mutation batch "${batch.batchId}" returned an invalid write result`, {
+						reasonCode: "writer-failed",
+						retryable: false,
+					});
+				}
 				const receiptId = stableId("write-receipt", { idempotencyKey: context.idempotencyKey, result });
 				const receipt: MutationWriteReceipt = {
 					metadata: this.#metadata(
@@ -612,6 +711,7 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 				};
 				return {
 					artifacts: [batch, receipt],
+					ledgerEvents: [this.#mutationWrittenEvent(context, batch, result)],
 					state: { mutationBatchId: batch.batchId, writeReceiptId: receiptId },
 					directive: "continue",
 				};
@@ -624,6 +724,22 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 					throw new EvolutionExecutionError("Evolution memory activator or writer lease is unavailable", {
 						reasonCode: "writer-failed",
 						retryable: true,
+					});
+				}
+				if (
+					receipt.batchId !== batch.batchId ||
+					receipt.result.batchId !== batch.batchId ||
+					!isEvolutionMemoryWriteOutput(receipt.result.output) ||
+					receipt.result.output.expectedBaseVersion !== batch.expectedBaseVersion ||
+					receipt.result.output.expectedBaseDigest !== batch.expectedBaseDigest ||
+					receipt.result.output.operationIds.length !== batch.mutations.length ||
+					receipt.result.output.operationIds.some(
+						(operationId, index) => operationId !== batch.mutations[index]?.mutationId,
+					)
+				) {
+					throw new EvolutionExecutionError("Evolution memory write receipt does not match its mutation batch", {
+						reasonCode: "artifact-corrupt",
+						retryable: false,
 					});
 				}
 				let result: Awaited<ReturnType<typeof writer.activate>>;
@@ -645,6 +761,15 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 						},
 					);
 				}
+				if (
+					result.batchId !== batch.batchId ||
+					result.resultingHarnessVersion !== receipt.result.output.resultingHarnessVersion
+				) {
+					throw new EvolutionExecutionError("Harness activation result does not match its staged candidate", {
+						reasonCode: "writer-failed",
+						retryable: false,
+					});
+				}
 				const receiptId = stableId("activation-receipt", { idempotencyKey: context.idempotencyKey, result });
 				const activationReceipt: HarnessActivationReceipt = {
 					metadata: this.#metadata(
@@ -662,9 +787,19 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 					.filter(isScoredProposal)
 					.filter((scored) => scored.disposition === "selected")
 					.map((scored) => this.#proposalDispositionEvent(context, scored, "applied"));
+				const selected = context.priorArtifacts
+					.filter(isScoredProposal)
+					.filter((scored) => scored.disposition === "selected");
+				const activationEvent = this.#harnessActivatedEvent(
+					context,
+					batch,
+					receipt.result.output,
+					result,
+					selected,
+				);
 				return {
 					artifacts: [activationReceipt],
-					ledgerEvents: appliedEvents,
+					ledgerEvents: [...appliedEvents, activationEvent],
 					state: { activationReceiptId: receiptId },
 					directive: "complete-activated",
 					resultingHarnessVersion: result.resultingHarnessVersion,

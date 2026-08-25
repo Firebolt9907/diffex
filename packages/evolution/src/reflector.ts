@@ -9,8 +9,10 @@ import type {
 	JsonObject,
 	Lesson,
 	LessonKind,
+	ReflectionLeafRetryPendingLedgerEvent,
 	ReflectionNode,
 	ReflectionNodeCheckpointedLedgerEvent,
+	ReflectionNodeFailure,
 	ReflectionNodeRuntime,
 	ReflectorModelCallLedgerEvent,
 	ReflectorToolCallLedgerEvent,
@@ -29,11 +31,7 @@ import type {
 import { computeEvolutionContentDigest, createEvolutionArtifactMetadata } from "./provenance.ts";
 import { type ReflectorNodeReferences, type ReflectorToolAudit, ReflectorToolRegistry } from "./reflector-tools.ts";
 
-const DEFAULT_MAX_TOOL_CALLS = 200;
-const DEFAULT_MAX_MODEL_CALLS = 100;
 const DEFAULT_MAX_RECURSION_DEPTH = 8;
-const DEFAULT_MAX_REFLECTION_ROUNDS = 2;
-const DEFAULT_MAX_RESPONSE_RETRIES = 2;
 const DEFAULT_MAX_EVIDENCE_TOOL_CALLS_PER_LEAF = 6;
 const DEFAULT_MAX_LESSON_TOOL_CALLS_PER_SYNTHESIS_NODE = 2;
 const DEFAULT_MAX_LESSONS_PER_LEAF = 3;
@@ -63,8 +61,6 @@ export interface RecursiveReflectorOptions {
 	readonly maxToolCalls?: number;
 	readonly maxModelCalls?: number;
 	readonly maxRecursionDepth?: number;
-	readonly maxReflectionRounds?: number;
-	readonly maxResponseRetries?: number;
 	readonly maxEvidenceToolCallsPerLeaf?: number;
 	readonly maxLessonToolCallsPerSynthesisNode?: number;
 	readonly maxLessonsPerLeaf?: number;
@@ -97,6 +93,16 @@ interface CompletedNode {
 	readonly lessons: readonly Lesson[];
 }
 
+interface RemainingReflectionBudget {
+	readonly modelCalls: number;
+	readonly toolCalls: number;
+}
+
+interface MutableAttemptConsumption {
+	modelCalls: number;
+	toolCalls: number;
+}
+
 interface MutableNodeRuntime {
 	providerCalls: number;
 	providerLatencyMs: number;
@@ -104,6 +110,7 @@ interface MutableNodeRuntime {
 	outputTokens: number;
 	retries: number;
 	foregroundWaitMs: number;
+	priorNodeDurationMs: number;
 	readonly startedAt: number;
 }
 
@@ -115,18 +122,19 @@ function nodeRuntime(runtime: MutableNodeRuntime): ReflectionNodeRuntime {
 		outputTokens: runtime.outputTokens,
 		retries: runtime.retries,
 		foregroundWaitMs: runtime.foregroundWaitMs,
-		nodeDurationMs: performance.now() - runtime.startedAt,
+		nodeDurationMs: runtime.priorNodeDurationMs + performance.now() - runtime.startedAt,
 	};
 }
 
-function newNodeRuntime(): MutableNodeRuntime {
+function newNodeRuntime(prior?: ReflectionNodeRuntime): MutableNodeRuntime {
 	return {
-		providerCalls: 0,
-		providerLatencyMs: 0,
-		internalToolRounds: 0,
-		outputTokens: 0,
-		retries: 0,
-		foregroundWaitMs: 0,
+		providerCalls: prior?.providerCalls ?? 0,
+		providerLatencyMs: prior?.providerLatencyMs ?? 0,
+		internalToolRounds: prior?.internalToolRounds ?? 0,
+		outputTokens: prior?.outputTokens ?? 0,
+		retries: prior?.retries ?? 0,
+		foregroundWaitMs: prior?.foregroundWaitMs ?? 0,
+		priorNodeDurationMs: prior?.nodeDurationMs ?? 0,
 		startedAt: performance.now(),
 	};
 }
@@ -265,8 +273,8 @@ function parseResponse(
 	readonly lessons: readonly LessonDraft[];
 	readonly referenceNormalizations: readonly EvolutionReferenceNormalization[];
 } {
-	if (response.output.complete !== true && response.output.complete !== false) {
-		throw new Error("Reflector response complete must be boolean");
+	if (response.output.complete !== true) {
+		throw new Error("Reflector response complete must be true");
 	}
 	if (!Array.isArray(response.output.lessons)) throw new Error("Reflector response lessons must be an array");
 	const referenceNormalizations: EvolutionReferenceNormalization[] = [];
@@ -293,31 +301,28 @@ function reflectorOutputSchema(
 	references: readonly string[],
 	maxLessons: number | undefined,
 ): JsonObject {
+	const evidenceReferences = references.flatMap((reference) => [reference, reference.slice(1)]);
 	const referenceProperties: JsonObject =
 		kind === "leaf"
 			? {
 					supportingEvidenceRefs: {
 						type: "array",
 						minItems: 1,
-						uniqueItems: true,
-						items: { type: "string", enum: references },
+						items: { type: "string", enum: evidenceReferences },
 					},
 					counterevidenceRefs: {
 						type: "array",
-						uniqueItems: true,
-						items: { type: "string", enum: references },
+						items: { type: "string", enum: evidenceReferences },
 					},
 				}
 			: {
 					sourceLessonRefs: {
 						type: "array",
 						minItems: 1,
-						uniqueItems: true,
 						items: { type: "string", enum: references },
 					},
 					counterLessonRefs: {
 						type: "array",
-						uniqueItems: true,
 						items: { type: "string", enum: references },
 					},
 				};
@@ -328,7 +333,7 @@ function reflectorOutputSchema(
 		additionalProperties: false,
 		required: ["complete", "lessons"],
 		properties: {
-			complete: { type: "boolean" },
+			complete: { enum: [true] },
 			lessons: {
 				type: "array",
 				...(maxLessons === undefined ? {} : { maxItems: maxLessons }),
@@ -348,12 +353,11 @@ function reflectorOutputSchema(
 					properties: {
 						kind: { enum: [...LESSON_KINDS] },
 						summary: { type: "string", minLength: 1 },
-						preconditions: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
+						preconditions: { type: "array", items: { type: "string", minLength: 1 } },
 						observedOutcome: { type: "string", minLength: 1 },
 						...referenceProperties,
 						applicabilityBoundaries: {
 							type: "array",
-							uniqueItems: true,
 							items: { type: "string", minLength: 1 },
 						},
 						uncertainty: { type: ["string", "null"] },
@@ -464,11 +468,9 @@ async function runBounded<T>(
 
 export class RecursiveReflector implements Reflector {
 	readonly #dependencies: RecursiveReflectorDependencies;
-	readonly #maxToolCalls: number;
-	readonly #maxModelCalls: number;
+	readonly #maxToolCalls: number | null;
+	readonly #maxModelCalls: number | null;
 	readonly #maxRecursionDepth: number;
-	readonly #maxReflectionRounds: number;
-	readonly #maxResponseRetries: number;
 	readonly #maxEvidenceToolCallsPerLeaf: number;
 	readonly #maxLessonToolCallsPerSynthesisNode: number;
 	readonly #maxLessonsPerLeaf: number;
@@ -481,22 +483,14 @@ export class RecursiveReflector implements Reflector {
 
 	constructor(dependencies: RecursiveReflectorDependencies, options: RecursiveReflectorOptions = {}) {
 		this.#dependencies = dependencies;
-		this.#maxToolCalls = positiveInteger(options.maxToolCalls, DEFAULT_MAX_TOOL_CALLS, "maxToolCalls");
-		this.#maxModelCalls = positiveInteger(options.maxModelCalls, DEFAULT_MAX_MODEL_CALLS, "maxModelCalls");
+		this.#maxToolCalls =
+			options.maxToolCalls === undefined ? null : positiveInteger(options.maxToolCalls, 1, "maxToolCalls");
+		this.#maxModelCalls =
+			options.maxModelCalls === undefined ? null : positiveInteger(options.maxModelCalls, 1, "maxModelCalls");
 		this.#maxRecursionDepth = positiveInteger(
 			options.maxRecursionDepth,
 			DEFAULT_MAX_RECURSION_DEPTH,
 			"maxRecursionDepth",
-		);
-		this.#maxReflectionRounds = positiveInteger(
-			options.maxReflectionRounds,
-			DEFAULT_MAX_REFLECTION_ROUNDS,
-			"maxReflectionRounds",
-		);
-		this.#maxResponseRetries = positiveInteger(
-			options.maxResponseRetries,
-			DEFAULT_MAX_RESPONSE_RETRIES,
-			"maxResponseRetries",
 		);
 		this.#maxEvidenceToolCallsPerLeaf = positiveInteger(
 			options.maxEvidenceToolCallsPerLeaf,
@@ -541,12 +535,11 @@ export class RecursiveReflector implements Reflector {
 		const priorEvents = await this.#dependencies.ledger.read(input.jobId);
 		const priorToolCalls = priorEvents.filter((event) => event.type === "reflector-tool-call").length;
 		const priorModelCalls = priorEvents.filter((event) => event.type === "reflector-model-call").length;
-		if (priorToolCalls >= this.#maxToolCalls || priorModelCalls >= this.#maxModelCalls) {
-			throw new EvolutionExecutionError("Reflector budget was exhausted by prior attempts", {
-				reasonCode: "reflection-budget-exhausted",
-				retryable: false,
-			});
-		}
+		const providerCallAllowance = positiveInteger(
+			input.model.maxProviderCallsPerExecution,
+			1,
+			"maxProviderCallsPerExecution",
+		);
 		const producer: EvolutionArtifactProducer = {
 			name: "diffex-evolution-reflector",
 			version: this.#dependencies.version,
@@ -557,7 +550,7 @@ export class RecursiveReflector implements Reflector {
 			jobId: input.jobId,
 			input: input.input,
 			corpus: input.corpus,
-			maxToolCalls: this.#maxToolCalls - priorToolCalls,
+			maxToolCalls: Number.MAX_SAFE_INTEGER,
 			signal: stageSignal,
 			audit: (audit) => this.#auditTool(input, producer, audit),
 		});
@@ -567,7 +560,25 @@ export class RecursiveReflector implements Reflector {
 			const slices = registry.planInitialSlices(this.#maxUnitsPerSlice);
 			const plans = this.#buildPlan(input, slices);
 			const completed = await this.#loadCompleted(input, plans, priorEvents);
+			const retryPending = this.#loadRetryPending(input, plans, priorEvents, completed);
+			const attemptConsumption = new Map<string, MutableAttemptConsumption>();
 			let modelCalls = priorModelCalls;
+			let effectiveModelCallLimit = priorModelCalls;
+			const refreshBudgetEnvelope = () => {
+				const remaining = this.#remainingBudget(
+					plans,
+					completed,
+					retryPending,
+					attemptConsumption,
+					providerCallAllowance,
+				);
+				const toolCalls = priorToolCalls + registry.toolCalls;
+				this.#assertBudgetFits(remaining, modelCalls, toolCalls);
+				effectiveModelCallLimit = this.#maxModelCalls ?? modelCalls + remaining.modelCalls;
+				const effectiveToolCallLimit = this.#maxToolCalls ?? toolCalls + remaining.toolCalls;
+				registry.setMaxToolCalls(Math.max(registry.toolCalls, effectiveToolCallLimit - priorToolCalls));
+			};
+			refreshBudgetEnvelope();
 			const executePlan = async (plan: NodePlan) => {
 				if (stageDeadline.expired) {
 					throw new EvolutionExecutionError("Reflector stage active-compute deadline was exhausted", {
@@ -577,50 +588,120 @@ export class RecursiveReflector implements Reflector {
 					});
 				}
 				if (completed.has(plan.nodeId)) return;
-				const timedOutChild = plan.childNodeIds.some((nodeId) => completed.get(nodeId)?.node.status !== "complete");
-				if (timedOutChild) {
-					completed.set(plan.nodeId, await this.#checkpointTimedOut(input, producer, plan, newNodeRuntime()));
+				const unavailableChildNodeIds = plan.childNodeIds.filter(
+					(nodeId) => completed.get(nodeId)?.node.status !== "complete",
+				);
+				const childLessons = plan.childNodeIds.flatMap((nodeId) => {
+					const child = completed.get(nodeId);
+					return child?.node.status === "complete" ? child.lessons : [];
+				});
+				if (plan.kind === "synthesis" && childLessons.length === 0) {
+					completed.set(
+						plan.nodeId,
+						unavailableChildNodeIds.length === 0
+							? await this.#checkpointEmptySynthesis(input, producer, plan, unavailableChildNodeIds)
+							: await this.#checkpointUnavailable(
+									input,
+									producer,
+									plan,
+									"failed",
+									{
+										diagnosticCode: "child-nodes-unavailable",
+										message: "All child reflection lessons are unavailable",
+									},
+									newNodeRuntime(),
+								),
+					);
+					refreshBudgetEnvelope();
 					return;
 				}
-				const nodeDeadline = new ActiveComputeDeadline(this.#nodeDeadlineMs, `Reflection node ${plan.nodeId}`);
-				const runtime = newNodeRuntime();
+				const pending = retryPending.get(plan.nodeId);
+				let nodeAttempt = pending === undefined ? 1 : 2;
+				let runtime = newNodeRuntime(pending?.runtime);
 				let result: CompletedNode;
-				try {
-					result = await this.#executeNode(
-						{ ...input, signal: combinedSignal(stageSignal, nodeDeadline.signal) },
-						producer,
-						registry,
-						plan,
-						completed,
-						() => {
-							modelCalls += 1;
-							if (modelCalls > this.#maxModelCalls) {
-								throw new EvolutionExecutionError("Reflector model-call budget is exhausted", {
-									reasonCode: "reflection-budget-exhausted",
-									retryable: false,
-								});
-							}
-							return modelCalls;
-						},
-						stageDeadline,
-						nodeDeadline,
-						runtime,
+				while (true) {
+					const priorAttemptModelCalls = priorEvents.filter(
+						(event) =>
+							event.type === "reflector-model-call" &&
+							event.nodeId === plan.nodeId &&
+							event.attempt === nodeAttempt,
+					).length;
+					runtime.providerCalls += priorAttemptModelCalls;
+					const consumption = { modelCalls: priorAttemptModelCalls, toolCalls: 0 };
+					attemptConsumption.set(plan.nodeId, consumption);
+					const nodeDeadline = new ActiveComputeDeadline(
+						this.#nodeDeadlineMs,
+						`Reflection node ${plan.nodeId} attempt ${nodeAttempt}`,
 					);
-				} catch (error) {
-					input.signal?.throwIfAborted();
-					if (stageDeadline.expired) {
-						throw new EvolutionExecutionError("Reflector stage active-compute deadline was exhausted", {
-							reasonCode: "reflection-budget-exhausted",
-							retryable: true,
-							cause: error,
-						});
+					const attemptController = new AbortController();
+					try {
+						result = await this.#executeNode(
+							{ ...input, signal: combinedSignal(stageSignal, nodeDeadline.signal, attemptController.signal) },
+							producer,
+							registry,
+							plan,
+							completed,
+							unavailableChildNodeIds,
+							nodeAttempt,
+							priorAttemptModelCalls,
+							() => {
+								if (modelCalls >= effectiveModelCallLimit) {
+									throw new EvolutionExecutionError("Reflector model-call budget is exhausted", {
+										reasonCode: "reflection-budget-exhausted",
+										retryable: false,
+									});
+								}
+								modelCalls += 1;
+							},
+							stageDeadline,
+							nodeDeadline,
+							runtime,
+							consumption,
+						);
+						break;
+					} catch (error) {
+						input.signal?.throwIfAborted();
+						if (stageDeadline.expired) {
+							throw new EvolutionExecutionError("Reflector stage active-compute deadline was exhausted", {
+								reasonCode: "reflection-budget-exhausted",
+								retryable: true,
+								cause: error,
+							});
+						}
+						const timedOut = nodeDeadline.expired;
+						const failure = this.#nodeFailure(error, timedOut);
+						if (plan.kind === "leaf" && nodeAttempt === 1 && (timedOut || this.#isRetryableLeafFailure(error))) {
+							const retry = await this.#checkpointRetryPending(input, producer, plan, failure, runtime);
+							attemptConsumption.delete(plan.nodeId);
+							retryPending.set(plan.nodeId, retry);
+							refreshBudgetEnvelope();
+							runtime = newNodeRuntime(retry.runtime);
+							nodeAttempt = 2;
+							continue;
+						}
+						if (plan.kind === "leaf" && !timedOut && !this.#isRetryableLeafFailure(error)) throw error;
+						if (plan.kind === "leaf") {
+							result = await this.#checkpointUnavailable(
+								input,
+								producer,
+								plan,
+								timedOut ? "timed-out" : "failed",
+								failure,
+								runtime,
+							);
+							break;
+						}
+						if (!timedOut) throw error;
+						result = await this.#checkpointUnavailable(input, producer, plan, "timed-out", failure, runtime);
+						break;
+					} finally {
+						attemptController.abort(new Error(`Reflection node ${plan.nodeId} attempt ended`));
+						nodeDeadline.dispose();
 					}
-					if (!nodeDeadline.expired) throw error;
-					result = await this.#checkpointTimedOut(input, producer, plan, runtime);
-				} finally {
-					nodeDeadline.dispose();
 				}
+				attemptConsumption.delete(plan.nodeId);
 				completed.set(plan.nodeId, result);
+				refreshBudgetEnvelope();
 			};
 			await runBounded(
 				plans.filter((plan) => plan.kind === "leaf"),
@@ -635,6 +716,16 @@ export class RecursiveReflector implements Reflector {
 				.filter((node): node is ReflectionNode => node !== undefined);
 			const lessons = plans.flatMap((plan) => completed.get(plan.nodeId)?.lessons ?? []);
 			const rootPlans = plans.filter((plan) => plan.parentNodeId === null);
+			const unavailableRootNodeIds = rootPlans
+				.filter((plan) => completed.get(plan.nodeId)?.node.status !== "complete")
+				.map((plan) => plan.nodeId);
+			if (unavailableRootNodeIds.length > 0) {
+				throw new EvolutionExecutionError("Reflector root is unavailable", {
+					reasonCode: "model-call-failed",
+					retryable: true,
+					diagnostics: { unavailableRootNodeIds },
+				});
+			}
 			const finalLessonIds = rootPlans.flatMap(
 				(plan) => completed.get(plan.nodeId)?.lessons.map((lesson) => lesson.lessonId) ?? [],
 			);
@@ -696,6 +787,64 @@ export class RecursiveReflector implements Reflector {
 		return plans;
 	}
 
+	#remainingBudget(
+		plans: readonly NodePlan[],
+		completed: ReadonlyMap<string, CompletedNode>,
+		retryPending: ReadonlyMap<string, ReflectionLeafRetryPendingLedgerEvent>,
+		attemptConsumption: ReadonlyMap<string, MutableAttemptConsumption>,
+		providerCallAllowance: number,
+	): RemainingReflectionBudget {
+		let modelCalls = 0;
+		let toolCalls = 0;
+		for (const plan of plans) {
+			if (completed.has(plan.nodeId)) continue;
+			let conversations: number;
+			let toolCallAllowance: number;
+			if (plan.kind === "leaf") {
+				conversations = retryPending.has(plan.nodeId) ? 1 : 2;
+				toolCallAllowance = this.#maxEvidenceToolCallsPerLeaf;
+			} else {
+				const childrenTerminal = plan.childNodeIds.every((nodeId) => completed.has(nodeId));
+				const hasSuccessfulChildLessons = plan.childNodeIds.some(
+					(nodeId) => (completed.get(nodeId)?.lessons.length ?? 0) > 0,
+				);
+				conversations = childrenTerminal && !hasSuccessfulChildLessons ? 0 : 1;
+				toolCallAllowance = this.#maxLessonToolCallsPerSynthesisNode;
+			}
+			const consumption = attemptConsumption.get(plan.nodeId);
+			modelCalls += Math.max(0, conversations * providerCallAllowance - (consumption?.modelCalls ?? 0));
+			toolCalls += Math.max(0, conversations * toolCallAllowance - (consumption?.toolCalls ?? 0));
+			if (!Number.isSafeInteger(modelCalls) || !Number.isSafeInteger(toolCalls)) {
+				throw new EvolutionExecutionError("Reflector remaining-plan budget exceeds safe integer limits", {
+					reasonCode: "reflection-budget-exhausted",
+					retryable: false,
+				});
+			}
+		}
+		return { modelCalls, toolCalls };
+	}
+
+	#assertBudgetFits(remaining: RemainingReflectionBudget, modelCalls: number, toolCalls: number): void {
+		const availableModelCalls =
+			this.#maxModelCalls === null ? remaining.modelCalls : Math.max(0, this.#maxModelCalls - modelCalls);
+		const availableToolCalls =
+			this.#maxToolCalls === null ? remaining.toolCalls : Math.max(0, this.#maxToolCalls - toolCalls);
+		if (availableModelCalls >= remaining.modelCalls && availableToolCalls >= remaining.toolCalls) return;
+		throw new EvolutionExecutionError(
+			`Reflector remaining plan requires ${remaining.modelCalls} model calls and ${remaining.toolCalls} tool calls, but only ${availableModelCalls} model calls and ${availableToolCalls} tool calls are available`,
+			{
+				reasonCode: "reflection-budget-exhausted",
+				retryable: false,
+				diagnostics: {
+					required: { modelCalls: remaining.modelCalls, toolCalls: remaining.toolCalls },
+					available: { modelCalls: availableModelCalls, toolCalls: availableToolCalls },
+					consumed: { modelCalls, toolCalls },
+					ceilings: { modelCalls: this.#maxModelCalls, toolCalls: this.#maxToolCalls },
+				},
+			},
+		);
+	}
+
 	async #loadCompleted(
 		input: ReflectorInput,
 		plans: readonly NodePlan[],
@@ -716,7 +865,9 @@ export class RecursiveReflector implements Reflector {
 			if (
 				!isReflectionNode(nodeArtifact) ||
 				nodeArtifact.nodeId !== event.nodeId ||
-				(nodeArtifact.status !== "complete" && nodeArtifact.status !== "timed-out")
+				(nodeArtifact.status !== "complete" &&
+					nodeArtifact.status !== "failed" &&
+					nodeArtifact.status !== "timed-out")
 			) {
 				throw new EvolutionExecutionError(`Reflection checkpoint "${event.nodeId}" is corrupt`, {
 					reasonCode: "artifact-corrupt",
@@ -734,7 +885,10 @@ export class RecursiveReflector implements Reflector {
 				}
 				lessons.push(artifact);
 			}
-			if (lessons.length !== nodeArtifact.lessonIds.length) {
+			if (
+				lessons.length !== nodeArtifact.lessonIds.length ||
+				(nodeArtifact.status !== "complete" && lessons.length > 0)
+			) {
 				throw new EvolutionExecutionError(`Reflection checkpoint "${event.nodeId}" is incomplete`, {
 					reasonCode: "artifact-corrupt",
 					retryable: false,
@@ -745,24 +899,57 @@ export class RecursiveReflector implements Reflector {
 		return result;
 	}
 
+	#loadRetryPending(
+		input: ReflectorInput,
+		plans: readonly NodePlan[],
+		events: readonly EvolutionLedgerEvent[],
+		completed: ReadonlyMap<string, CompletedNode>,
+	): Map<string, ReflectionLeafRetryPendingLedgerEvent> {
+		const leafIds = new Set(plans.filter((plan) => plan.kind === "leaf").map((plan) => plan.nodeId));
+		const result = new Map<string, ReflectionLeafRetryPendingLedgerEvent>();
+		for (const event of events) {
+			if (
+				event.type === "reflection-leaf-retry-pending" &&
+				event.manifestDigest === input.corpus.metadata.contentDigest &&
+				leafIds.has(event.nodeId) &&
+				!completed.has(event.nodeId)
+			) {
+				result.set(event.nodeId, event);
+			}
+		}
+		return result;
+	}
+
 	async #executeNode(
 		input: ReflectorInput,
 		producer: EvolutionArtifactProducer,
 		registry: ReflectorToolRegistry,
 		plan: NodePlan,
 		completed: ReadonlyMap<string, CompletedNode>,
-		chargeModelCall: () => number,
+		unavailableChildNodeIds: readonly string[],
+		nodeAttempt: number,
+		priorAttemptModelCalls: number,
+		chargeModelCall: () => void,
 		stageDeadline: ActiveComputeDeadline,
 		nodeDeadline: ActiveComputeDeadline,
 		runtime: MutableNodeRuntime,
+		consumption: MutableAttemptConsumption,
 	): Promise<CompletedNode> {
 		const nodeReferences = registry.nodeReferences(plan.evidenceIds);
 		const childLessons = plan.childNodeIds.flatMap((nodeId) => completed.get(nodeId)?.lessons ?? []);
 		const lessonReferences = new EvolutionModelReferenceCatalog("lesson", childLessons);
+		const chargeToolCall = () => {
+			consumption.toolCalls += 1;
+		};
 		const tools =
 			plan.kind === "leaf"
-				? registry.toolsForEvidence(nodeReferences, this.#maxEvidenceToolCallsPerLeaf)
-				: registry.toolsForLessons(lessonReferences, this.#maxLessonToolCallsPerSynthesisNode);
+				? registry.toolsForEvidence(nodeReferences, this.#maxEvidenceToolCallsPerLeaf, input.signal, chargeToolCall)
+				: registry.toolsForLessons(
+						lessonReferences,
+						this.#maxLessonToolCallsPerSynthesisNode,
+						input.signal,
+						chargeToolCall,
+					);
 		const maxLessons =
 			plan.kind === "leaf"
 				? this.#maxLessonsPerLeaf
@@ -775,153 +962,119 @@ export class RecursiveReflector implements Reflector {
 			maxLessons,
 		);
 		const denialStart = registry.recoverableDenials.length;
-		let response: EvolutionModelResponse | null = null;
-		let parsed: ReturnType<typeof parseResponse> | null = null;
-		let lastError: unknown = null;
-		let lastFailure: "model" | "response" | null = null;
-		let responseCorrection: string | null = null;
-		const rejectedResponses: JsonObject[] = [];
-		const invalidReferences = new Set<string>();
-		const permittedReferences = new Set<string>();
-		let nodeModelCallSequence = 0;
-		for (let round = 1; round <= this.#maxReflectionRounds && parsed?.complete !== true; round += 1) {
-			for (let attempt = 1; attempt <= this.#maxResponseRetries; attempt += 1) {
-				if (attempt > 1) runtime.retries += 1;
-				let providerCalls = 0;
-				const beforeProviderCall = async () => {
-					chargeModelCall();
-					providerCalls += 1;
-					runtime.providerCalls += 1;
-					nodeModelCallSequence += 1;
-					const modelCallId = stableId("reflector-model-call", {
-						idempotencyKey: input.idempotencyKey,
-						nodeId: plan.nodeId,
-						round,
-						nodeModelCallSequence,
-					});
-					await this.#dependencies.ledger.append(
-						this.#modelCallEvent(input, producer, modelCallId, plan.nodeId, round, attempt),
-					);
-				};
-				try {
-					response = await abortable(
-						input.model.execute({
-							stage: "reflector",
-							model: input.input.modelConfiguration,
-							promptVersion: input.input.promptVersions.reflector,
-							idempotencyKey: `${input.idempotencyKey}:${plan.nodeId}:${round}`,
-							input: this.#modelInput(input, plan, nodeReferences, lessonReferences, round, responseCorrection),
-							outputSchema,
-							tools,
-							beforeProviderCall,
-							onProviderCallComplete: (metrics) => {
-								runtime.providerLatencyMs += metrics.durationMs;
-								runtime.outputTokens += metrics.outputTokens;
-								if (metrics.retry) runtime.retries += 1;
-							},
-							onInternalToolRound: () => {
-								runtime.internalToolRounds += 1;
-							},
-							onForegroundWaitStart: () => {
-								stageDeadline.pause();
-								nodeDeadline.pause();
-							},
-							onForegroundWaitEnd: (durationMs) => {
-								runtime.foregroundWaitMs += durationMs;
-								nodeDeadline.resume();
-								stageDeadline.resume();
-							},
-							signal: input.signal,
-						}),
-						input.signal,
-					);
-					if (providerCalls === 0) await beforeProviderCall();
-				} catch (error) {
-					input.signal?.throwIfAborted();
-					if (error instanceof EvolutionExecutionError) throw error;
-					if (providerCalls === 0) await beforeProviderCall();
-					lastError = error;
-					lastFailure = "model";
-					continue;
-				}
-				if (registry.budgetExhausted) {
-					throw new EvolutionExecutionError("Reflector tool-call budget is exhausted", {
-						reasonCode: "reflection-budget-exhausted",
-						retryable: false,
-					});
-				}
-				try {
-					parsed = parseResponse(
-						response,
-						plan.kind === "leaf"
-							? { kind: "leaf", evidence: nodeReferences.evidence }
-							: { kind: "synthesis", lessons: lessonReferences },
-						maxLessons,
-					);
-					lastError = null;
-					lastFailure = null;
-					responseCorrection = null;
-					break;
-				} catch (error) {
-					lastError = error;
-					lastFailure = "response";
-					responseCorrection = error instanceof Error ? error.message : "Response validation failed";
-					if (error instanceof EvolutionModelReferenceError) {
-						for (const reference of error.invalidReferences) invalidReferences.add(reference);
-						for (const reference of error.permittedReferences) permittedReferences.add(reference);
-					}
-					rejectedResponses.push({
-						reflectionRound: round,
-						attempt,
-						model: response.model,
-						submissionMethod: response.submissionMethod ?? "unspecified",
-						validationError: responseCorrection,
-						output: response.output,
-					});
-				}
-			}
-			if (lastError !== null) {
-				throw new EvolutionExecutionError(
-					lastFailure === "model"
-						? `Reflector model call failed for "${plan.nodeId}"`
-						: `Reflector returned an invalid response for "${plan.nodeId}"`,
-					{
-						reasonCode: lastFailure === "model" ? "model-call-failed" : "reflection-invalid-response",
-						retryable: lastFailure === "model",
-						cause: lastError,
-						diagnostics: {
-							node: {
-								nodeId: plan.nodeId,
-								kind: plan.kind,
-								depth: plan.depth,
-								parentNodeId: plan.parentNodeId,
-								childNodeIds: plan.childNodeIds,
-								sliceIds: plan.sliceIds,
-								evidenceIds: plan.evidenceIds,
-							},
-							invalidAliases: [...invalidReferences],
-							permittedAliases: [...permittedReferences],
-							attemptDetails: rejectedResponses,
-							aliasResolutionMaps: {
-								documents: nodeReferences.documents.resolutionMap((document) => document.descriptor.documentId),
-								evidence: nodeReferences.evidence.resolutionMap((entry) => entry.evidence.evidenceId),
-								lessons: lessonReferences.resolutionMap((lesson) => lesson.lessonId),
-							},
-							recoverableToolDenials: registry.recoverableDenials.slice(denialStart).map((denial) => ({
-								toolName: denial.toolName,
-								denialCode: denial.denialCode,
-								requestedDocumentRef: denial.requestedDocumentRef,
-								requestedSliceRef: denial.requestedSliceRef,
-							})),
-						},
+		let providerCallHookInvoked = false;
+		let providerCalls = 0;
+		let nodeModelCallSequence = priorAttemptModelCalls;
+		const beforeProviderCall = async () => {
+			providerCallHookInvoked = true;
+			chargeModelCall();
+			consumption.modelCalls += 1;
+			providerCalls += 1;
+			runtime.providerCalls += 1;
+			nodeModelCallSequence += 1;
+			const modelCallId = stableId("reflector-model-call", {
+				idempotencyKey: input.idempotencyKey,
+				nodeId: plan.nodeId,
+				nodeAttempt,
+				nodeModelCallSequence,
+			});
+			await this.#dependencies.ledger.append(
+				this.#modelCallEvent(input, producer, modelCallId, plan.nodeId, nodeAttempt, nodeModelCallSequence),
+			);
+		};
+		let response: EvolutionModelResponse;
+		try {
+			response = await abortable(
+				input.model.execute({
+					stage: "reflector",
+					model: input.input.modelConfiguration,
+					promptVersion: input.input.promptVersions.reflector,
+					idempotencyKey: `${input.idempotencyKey}:${plan.nodeId}:attempt-${nodeAttempt}`,
+					input: this.#modelInput(input, plan, nodeReferences, lessonReferences, unavailableChildNodeIds),
+					outputSchema,
+					tools,
+					validateOutput: (output) => {
+						parseResponse(
+							{ output, model: { provider: "validation", model: "validation" } },
+							plan.kind === "leaf"
+								? { kind: "leaf", evidence: nodeReferences.evidence }
+								: { kind: "synthesis", lessons: lessonReferences },
+							maxLessons,
+						);
 					},
-				);
-			}
+					beforeProviderCall,
+					onProviderCallComplete: (metrics) => {
+						runtime.providerLatencyMs += metrics.durationMs;
+						runtime.outputTokens += metrics.outputTokens;
+						if (metrics.retry) runtime.retries += 1;
+					},
+					onInternalToolRound: () => {
+						runtime.internalToolRounds += 1;
+					},
+					onForegroundWaitStart: () => {
+						stageDeadline.pause();
+						nodeDeadline.pause();
+					},
+					onForegroundWaitEnd: (durationMs) => {
+						runtime.foregroundWaitMs += durationMs;
+						nodeDeadline.resume();
+						stageDeadline.resume();
+					},
+					signal: input.signal,
+				}),
+				input.signal,
+			);
+			if (providerCalls === 0) await beforeProviderCall();
+		} catch (error) {
+			input.signal?.throwIfAborted();
+			if (!providerCallHookInvoked) await beforeProviderCall();
+			if (error instanceof EvolutionExecutionError) throw error;
+			throw new EvolutionExecutionError(`Reflector model call failed for "${plan.nodeId}"`, {
+				reasonCode: "model-call-failed",
+				retryable: true,
+				cause: error,
+				diagnostics: {
+					nodeId: plan.nodeId,
+					nodeAttempt,
+					recoverableToolDenials: registry.recoverableDenials.slice(denialStart).map((denial) => ({
+						toolName: denial.toolName,
+						denialCode: denial.denialCode,
+						requestedDocumentRef: denial.requestedDocumentRef,
+						requestedSliceRef: denial.requestedSliceRef,
+					})),
+				},
+			});
 		}
-		if (response === null || parsed === null || !parsed.complete) {
-			throw new EvolutionExecutionError(`Reflector did not complete "${plan.nodeId}" within the refinement budget`, {
+		if (registry.budgetExhausted || registry.toolBudgetExhausted(tools)) {
+			throw new EvolutionExecutionError("Reflector tool-call budget is exhausted", {
 				reasonCode: "reflection-budget-exhausted",
 				retryable: false,
+			});
+		}
+		let parsed: ReturnType<typeof parseResponse>;
+		try {
+			parsed = parseResponse(
+				response,
+				plan.kind === "leaf"
+					? { kind: "leaf", evidence: nodeReferences.evidence }
+					: { kind: "synthesis", lessons: lessonReferences },
+				maxLessons,
+			);
+		} catch (error) {
+			const invalidReferences = error instanceof EvolutionModelReferenceError ? error.invalidReferences : [];
+			const permittedReferences = error instanceof EvolutionModelReferenceError ? error.permittedReferences : [];
+			throw new EvolutionExecutionError(`Reflector returned an invalid response for "${plan.nodeId}"`, {
+				reasonCode: "reflection-invalid-response",
+				retryable: false,
+				cause: error,
+				diagnostics: {
+					nodeId: plan.nodeId,
+					nodeAttempt,
+					invalidAliases: invalidReferences,
+					permittedAliases: permittedReferences,
+					submissionMethod: response.submissionMethod ?? "unspecified",
+					output: response.output,
+				},
 			});
 		}
 		const modelProducer: EvolutionArtifactProducer = {
@@ -997,10 +1150,62 @@ export class RecursiveReflector implements Reflector {
 		return { node, lessons };
 	}
 
-	async #checkpointTimedOut(
+	#nodeFailure(error: unknown, timedOut: boolean): ReflectionNodeFailure {
+		if (timedOut) {
+			return {
+				diagnosticCode: "node-timeout",
+				message: error instanceof Error ? error.message : "Reflection node execution timed out",
+			};
+		}
+		return {
+			diagnosticCode: error instanceof EvolutionExecutionError ? error.reasonCode : "model-call-failed",
+			message: error instanceof Error ? error.message : String(error),
+		};
+	}
+
+	#isRetryableLeafFailure(error: unknown): boolean {
+		return (
+			error instanceof EvolutionExecutionError &&
+			(error.reasonCode === "model-call-failed" || error.reasonCode === "reflection-invalid-response")
+		);
+	}
+
+	async #checkpointRetryPending(
 		input: ReflectorInput,
 		producer: EvolutionArtifactProducer,
 		plan: NodePlan,
+		failure: ReflectionNodeFailure,
+		runtime: MutableNodeRuntime,
+	): Promise<ReflectionLeafRetryPendingLedgerEvent> {
+		const content = {
+			nodeId: plan.nodeId,
+			manifestDigest: input.corpus.metadata.contentDigest,
+			failure,
+			runtime: nodeRuntime(runtime),
+		};
+		const eventId = stableId("ledger-event", {
+			jobId: input.jobId,
+			type: "reflection-leaf-retry-pending",
+			nodeId: plan.nodeId,
+			manifestDigest: input.corpus.metadata.contentDigest,
+		});
+		const event: ReflectionLeafRetryPendingLedgerEvent = {
+			metadata: this.#metadata(input, producer, eventId, [plan.nodeId], content),
+			eventId,
+			jobId: input.jobId,
+			type: "reflection-leaf-retry-pending",
+			...content,
+		};
+		await this.#dependencies.ledger.append(event);
+		return event;
+	}
+
+	async #checkpointUnavailable(
+		input: ReflectorInput,
+		producer: EvolutionArtifactProducer,
+		plan: NodePlan,
+		status: "failed" | "timed-out",
+		failure: ReflectionNodeFailure,
 		runtime: MutableNodeRuntime,
 	): Promise<CompletedNode> {
 		const nodeContent = {
@@ -1012,9 +1217,57 @@ export class RecursiveReflector implements Reflector {
 			sliceIds: plan.sliceIds,
 			evidenceIds: plan.evidenceIds,
 			lessonIds: [],
-			resultDigest: computeEvolutionContentDigest({ reason: "node-timeout" }),
-			status: "timed-out" as const,
+			resultDigest: computeEvolutionContentDigest({ status, failure }),
+			status,
+			failure,
 			runtime: nodeRuntime(runtime),
+		};
+		const node: ReflectionNode = {
+			metadata: this.#metadata(input, producer, plan.nodeId, plan.evidenceIds, nodeContent),
+			...nodeContent,
+		};
+		const nodeReference = await this.#dependencies.artifacts.put(node);
+		const checkpointId = stableId("ledger-event", {
+			jobId: input.jobId,
+			type: "reflection-node-checkpointed",
+			nodeId: node.nodeId,
+			manifestDigest: input.corpus.metadata.contentDigest,
+		});
+		const checkpointContent = {
+			nodeId: node.nodeId,
+			manifestDigest: input.corpus.metadata.contentDigest,
+			node: nodeReference,
+			lessons: [],
+			referenceNormalizations: [],
+		};
+		await this.#dependencies.ledger.append({
+			metadata: this.#metadata(input, producer, checkpointId, [node.nodeId], checkpointContent),
+			eventId: checkpointId,
+			jobId: input.jobId,
+			type: "reflection-node-checkpointed",
+			...checkpointContent,
+		});
+		return { node, lessons: [] };
+	}
+
+	async #checkpointEmptySynthesis(
+		input: ReflectorInput,
+		producer: EvolutionArtifactProducer,
+		plan: NodePlan,
+		unavailableChildNodeIds: readonly string[],
+	): Promise<CompletedNode> {
+		const nodeContent = {
+			nodeId: plan.nodeId,
+			kind: plan.kind,
+			depth: plan.depth,
+			parentNodeId: plan.parentNodeId,
+			childNodeIds: plan.childNodeIds,
+			sliceIds: plan.sliceIds,
+			evidenceIds: plan.evidenceIds,
+			lessonIds: [],
+			resultDigest: computeEvolutionContentDigest({ empty: true, unavailableChildNodeIds }),
+			status: "complete" as const,
+			runtime: nodeRuntime(newNodeRuntime()),
 		};
 		const node: ReflectionNode = {
 			metadata: this.#metadata(input, producer, plan.nodeId, plan.evidenceIds, nodeContent),
@@ -1049,8 +1302,7 @@ export class RecursiveReflector implements Reflector {
 		plan: NodePlan,
 		nodeReferences: ReflectorNodeReferences,
 		lessonReferences: EvolutionModelReferenceCatalog<Lesson>,
-		round: number,
-		responseCorrection: string | null,
+		unavailableChildNodeIds: readonly string[],
 	): JsonObject {
 		const instructionReferences = new EvolutionModelReferenceCatalog("instruction", input.instructions.documents);
 		const evidenceReferences = new Map(
@@ -1087,22 +1339,11 @@ export class RecursiveReflector implements Reflector {
 				consolidateOverlappingLessons: plan.kind === "synthesis",
 				maximumToolCalls:
 					plan.kind === "leaf" ? this.#maxEvidenceToolCallsPerLeaf : this.#maxLessonToolCallsPerSynthesisNode,
-				maximumRefinementRounds: this.#maxReflectionRounds,
-				structuredResponseRetries: this.#maxResponseRetries,
-				...(responseCorrection === null
-					? {}
-					: {
-							responseCorrection: {
-								reason: responseCorrection,
-								instruction: "Correct the structured response and submit it again.",
-							},
-						}),
 			},
 			node: {
 				kind: plan.kind,
 				depth: plan.depth,
 			},
-			reflectionRound: round,
 			instructions: instructionReferences.entries.map(({ ref, value: document }, index) => ({
 				instructionRef: ref,
 				label: `Instruction ${index + 1}`,
@@ -1117,6 +1358,7 @@ export class RecursiveReflector implements Reflector {
 						slices: nodeReferences.sliceCatalog,
 					}
 				: {
+						unavailableChildNodeIds,
 						childLessons: lessonReferences.entries.map(({ ref, value: lesson }) => ({
 							lessonRef: ref,
 							kind: lesson.kind,
@@ -1138,11 +1380,20 @@ export class RecursiveReflector implements Reflector {
 		completed: ReadonlyMap<string, CompletedNode>,
 	): EvidenceCoverageMap {
 		const entries: EvidenceCoverageEntry[] = [];
-		const timedOutEvidenceIds = new Set(
-			[...completed.values()]
-				.filter((entry) => entry.node.status === "timed-out")
-				.flatMap((entry) => entry.node.evidenceIds),
-		);
+		const unavailableEvidenceDiagnostics = new Map<string, string[]>();
+		for (const entry of completed.values()) {
+			if (entry.node.kind !== "leaf" || (entry.node.status !== "failed" && entry.node.status !== "timed-out")) {
+				continue;
+			}
+			for (const evidenceId of entry.node.evidenceIds) {
+				const diagnostics = unavailableEvidenceDiagnostics.get(evidenceId) ?? [];
+				diagnostics.push(
+					entry.node.failure?.diagnosticCode ??
+						(entry.node.status === "timed-out" ? "node-timeout" : "model-call-failed"),
+				);
+				unavailableEvidenceDiagnostics.set(evidenceId, diagnostics);
+			}
+		}
 		const analyzedEvidenceIds = new Set(
 			[...completed.values()]
 				.filter((entry) => entry.node.kind === "leaf" && entry.node.status === "complete")
@@ -1158,6 +1409,7 @@ export class RecursiveReflector implements Reflector {
 						),
 					),
 				);
+				const unavailableDiagnostics = unavailableEvidenceDiagnostics.get(evidenceId) ?? [];
 				entries.push({
 					documentId: document.documentId,
 					evidenceId,
@@ -1167,7 +1419,7 @@ export class RecursiveReflector implements Reflector {
 							: document.integrity === "partial"
 								? "corrupt"
 								: matching.length === 0 ||
-										(timedOutEvidenceIds.has(evidenceId) && !analyzedEvidenceIds.has(evidenceId))
+										(unavailableDiagnostics.length > 0 && !analyzedEvidenceIds.has(evidenceId))
 									? "skipped"
 									: "analyzed",
 					sliceIds: matching.map((slice) => slice.sliceId),
@@ -1175,9 +1427,7 @@ export class RecursiveReflector implements Reflector {
 					continuationSliceIds,
 					diagnosticCodes: unique([
 						...document.diagnostics.map((diagnostic) => diagnostic.code),
-						...(timedOutEvidenceIds.has(evidenceId) && !analyzedEvidenceIds.has(evidenceId)
-							? ["node-timeout"]
-							: []),
+						...(!analyzedEvidenceIds.has(evidenceId) ? unavailableDiagnostics : []),
 					]),
 				});
 			}
@@ -1248,17 +1498,17 @@ export class RecursiveReflector implements Reflector {
 		producer: EvolutionArtifactProducer,
 		modelCallId: string,
 		nodeId: string,
-		reflectionRound: number,
-		attempt: number,
+		nodeAttempt: number,
+		providerRound: number,
 	): ReflectorModelCallLedgerEvent {
 		const content = {
 			modelCallId,
 			nodeId,
-			attempt,
-			reflectionRound,
+			attempt: nodeAttempt,
+			reflectionRound: providerRound,
 			manifestDigest: input.corpus.metadata.contentDigest,
-			idempotencyKey: `${input.idempotencyKey}:${nodeId}:${reflectionRound}`,
-			budgetCharge: { modelCalls: 1, reflectionRounds: attempt === 1 ? 1 : 0, toolCalls: 0 },
+			idempotencyKey: `${input.idempotencyKey}:${nodeId}:attempt-${nodeAttempt}`,
+			budgetCharge: { modelCalls: 1, reflectionRounds: providerRound === 1 ? 1 : 0, toolCalls: 0 },
 		};
 		return {
 			metadata: this.#metadata(input, producer, modelCallId, [nodeId], content),

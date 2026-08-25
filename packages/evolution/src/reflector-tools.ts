@@ -72,6 +72,8 @@ export interface ReflectorRecoverableToolDenial {
 
 interface NodeToolBudget {
 	readonly maxToolCalls: number;
+	readonly signal?: AbortSignal;
+	readonly onToolCall?: () => void;
 	toolCalls: number;
 }
 
@@ -203,13 +205,13 @@ export class ReflectorToolRegistry {
 	readonly #slices = new Map<string, EvidenceSlice>();
 	readonly #sliceReferences = new Map<string, string>();
 	readonly #sensitiveReplacements = new Map<string, string>();
-	readonly #maxToolCalls: number;
+	#maxToolCalls: number;
 	readonly #signal?: AbortSignal;
 	readonly #audit: (event: ReflectorToolAudit) => Promise<void>;
 	readonly #recoverableDenials: ReflectorRecoverableToolDenial[] = [];
+	readonly #toolBudgets = new WeakMap<readonly EvolutionModelTool[], NodeToolBudget>();
 	#revoked = false;
 	#toolCalls = 0;
-	#nodeBudgetExhausted = false;
 
 	constructor(options: ReflectorToolRegistryOptions) {
 		this.#jobId = options.jobId;
@@ -289,11 +291,23 @@ export class ReflectorToolRegistry {
 	}
 
 	get budgetExhausted(): boolean {
-		return this.#toolCalls > this.#maxToolCalls || this.#nodeBudgetExhausted;
+		return this.#toolCalls > this.#maxToolCalls;
 	}
 
 	get recoverableDenials(): readonly ReflectorRecoverableToolDenial[] {
 		return this.#recoverableDenials;
+	}
+
+	setMaxToolCalls(maxToolCalls: number): void {
+		if (!Number.isSafeInteger(maxToolCalls) || maxToolCalls < this.#toolCalls) {
+			throw new Error("maxToolCalls must be a safe integer no lower than consumed tool calls");
+		}
+		this.#maxToolCalls = maxToolCalls;
+	}
+
+	toolBudgetExhausted(tools: readonly EvolutionModelTool[]): boolean {
+		const budget = this.#toolBudgets.get(tools);
+		return budget !== undefined && budget.toolCalls > budget.maxToolCalls;
 	}
 
 	revoke(): void {
@@ -342,8 +356,13 @@ export class ReflectorToolRegistry {
 		};
 	}
 
-	toolsForEvidence(references: ReflectorNodeReferences, maxToolCalls: number): readonly EvolutionModelTool[] {
-		const budget: NodeToolBudget = { maxToolCalls, toolCalls: 0 };
+	toolsForEvidence(
+		references: ReflectorNodeReferences,
+		maxToolCalls: number,
+		signal?: AbortSignal,
+		onToolCall?: () => void,
+	): readonly EvolutionModelTool[] {
+		const budget: NodeToolBudget = { maxToolCalls, signal, onToolCall, toolCalls: 0 };
 		const permittedEvidenceIds = new Set(references.evidence.entries.map((entry) => entry.value.evidence.evidenceId));
 		const definitions: readonly [Exclude<ReflectorToolName, "inspect_child_lessons">, string, JsonObject][] = [
 			[
@@ -376,20 +395,24 @@ export class ReflectorToolRegistry {
 				),
 			],
 		];
-		return definitions.map(([name, description, inputSchema]) => ({
+		const tools = definitions.map(([name, description, inputSchema]) => ({
 			name,
 			description,
 			inputSchema,
-			execute: (input) => this.#executeEvidence(name, input, references, permittedEvidenceIds, budget),
+			execute: (input: JsonObject) => this.#executeEvidence(name, input, references, permittedEvidenceIds, budget),
 		}));
+		this.#toolBudgets.set(tools, budget);
+		return tools;
 	}
 
 	toolsForLessons(
 		lessons: EvolutionModelReferenceCatalog<Lesson>,
 		maxToolCalls: number,
+		signal?: AbortSignal,
+		onToolCall?: () => void,
 	): readonly EvolutionModelTool[] {
-		const budget: NodeToolBudget = { maxToolCalls, toolCalls: 0 };
-		return [
+		const budget: NodeToolBudget = { maxToolCalls, signal, onToolCall, toolCalls: 0 };
+		const tools: readonly EvolutionModelTool[] = [
 			{
 				name: "inspect_child_lessons",
 				description: "Inspect complete child lesson content without opening raw corpus evidence.",
@@ -406,6 +429,8 @@ export class ReflectorToolRegistry {
 				execute: (input) => this.#executeLessonInspection(input, lessons, budget),
 			},
 		];
+		this.#toolBudgets.set(tools, budget);
+		return tools;
 	}
 
 	planInitialSlices(maxUnitsPerSlice: number): readonly EvidenceSlice[] {
@@ -503,8 +528,10 @@ export class ReflectorToolRegistry {
 			readonly resolvedSliceIds: readonly string[];
 		},
 	): Promise<JsonObject> {
+		if (!this.#revoked) budget.signal?.throwIfAborted();
 		this.#toolCalls += 1;
 		budget.toolCalls += 1;
+		budget.onToolCall?.();
 		const toolCallId = `reflector-tool-${this.#toolCalls}`;
 		const requestedDocumentRef = typeof input.documentRef === "string" ? input.documentRef : null;
 		const requestedSliceRef = typeof input.sliceRef === "string" ? input.sliceRef : null;
@@ -519,15 +546,14 @@ export class ReflectorToolRegistry {
 			if (this.#revoked)
 				throw new EvolutionToolDeniedError("registry-revoked", "Reflector tool registry is revoked");
 			this.#signal?.throwIfAborted();
-			if (this.#toolCalls > this.#maxToolCalls) {
-				throw new EvolutionToolDeniedError("tool-budget-exhausted", "Reflector tool-call budget is exhausted");
-			}
 			if (budget.toolCalls > budget.maxToolCalls) {
-				this.#nodeBudgetExhausted = true;
 				throw new EvolutionToolDeniedError(
 					"tool-budget-exhausted",
 					"Reflection node tool-call budget is exhausted",
 				);
+			}
+			if (this.#toolCalls > this.#maxToolCalls) {
+				throw new EvolutionToolDeniedError("tool-budget-exhausted", "Reflector tool-call budget is exhausted");
 			}
 			const result = run();
 			resolvedDocumentIds = result.resolvedDocumentIds;

@@ -78,6 +78,7 @@ export interface ReflectorModelRequest {
 	readonly input: JsonObject;
 	readonly outputSchema: JsonObject;
 	readonly tools: readonly EvolutionModelTool[];
+	readonly validateOutput?: (output: JsonObject) => void;
 	readonly beforeProviderCall?: () => void | Promise<void>;
 	readonly onProviderCallComplete?: (metrics: ReflectorProviderCallMetrics) => void;
 	readonly onInternalToolRound?: () => void;
@@ -109,6 +110,7 @@ export interface EvolutionModelResponse {
 }
 
 export interface EvolutionModelExecutor {
+	readonly maxProviderCallsPerExecution: number;
 	execute(request: EvolutionModelRequest): Promise<EvolutionModelResponse>;
 }
 

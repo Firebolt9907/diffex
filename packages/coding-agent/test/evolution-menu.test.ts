@@ -190,6 +190,7 @@ function client(currentOverview: EvolutionOverview): {
 	emit: (event: EvolutionProgressEvent) => void;
 	unsubscribed: ReturnType<typeof vi.fn>;
 	startManual: ReturnType<typeof vi.fn>;
+	cancelActive: ReturnType<typeof vi.fn>;
 	overviewCall: ReturnType<typeof vi.fn>;
 	listHarnessVersionInfo: ReturnType<typeof vi.fn>;
 	listCurrentDirectoryHarnessVersionInfo: ReturnType<typeof vi.fn>;
@@ -203,6 +204,7 @@ function client(currentOverview: EvolutionOverview): {
 	let enabled = true;
 	const unsubscribed = vi.fn();
 	const startManual = vi.fn().mockResolvedValue({ status: "created", job: job() });
+	const cancelActive = vi.fn().mockResolvedValue(undefined);
 	const overviewCall = vi.fn().mockResolvedValue(currentOverview);
 	const listHarnessVersionInfo = vi
 		.fn()
@@ -231,12 +233,13 @@ function client(currentOverview: EvolutionOverview): {
 			proposalDetail: proposalDetailCall,
 			startManual,
 			resumeNewest: vi.fn().mockRejectedValue(new Error("unused")),
-			cancelActive: vi.fn().mockRejectedValue(new Error("unused")),
+			cancelActive,
 			rollback: vi.fn().mockRejectedValue(new Error("unused")),
 		},
 		emit: (event) => listener?.(event),
 		unsubscribed,
 		startManual,
+		cancelActive,
 		overviewCall,
 		listHarnessVersionInfo,
 		listCurrentDirectoryHarnessVersionInfo,
@@ -608,6 +611,63 @@ describe("EvolutionMenuComponent", () => {
 
 		component.handleInput("\n");
 		await vi.waitFor(() => expect(fixture.startManual).toHaveBeenCalledOnce());
+	});
+
+	it("confirms that cancellation removes the round and refreshes past its interruption event", async () => {
+		const fixture = client(overview({ activeJob: job() }));
+		const status = vi.fn();
+		const component = new EvolutionMenuComponent(
+			fixture.client,
+			() => {},
+			status,
+			() => {},
+		);
+		await vi.waitFor(() => expect(stripAnsi(component.render(160).join("\n"))).toContain("Cancel"));
+
+		for (let index = 0; index < 6; index += 1) component.handleInput("\u001b[B");
+		component.handleInput("\n");
+		await vi.waitFor(() =>
+			expect(stripAnsi(component.render(160).join("\n"))).toContain(
+				"The evolution round will be removed. Its tokens and invocations will remain available.",
+			),
+		);
+		expect(fixture.cancelActive).not.toHaveBeenCalled();
+
+		const overviewCallsBeforeCancellation = fixture.overviewCall.mock.calls.length;
+		let resolveInterruptedOverview: ((value: EvolutionOverview) => void) | undefined;
+		const interruptedOverview = new Promise<EvolutionOverview>((resolve) => {
+			resolveInterruptedOverview = resolve;
+		});
+		fixture.overviewCall.mockImplementationOnce(() => interruptedOverview).mockResolvedValue(overview());
+		fixture.cancelActive.mockImplementation(async () => {
+			fixture.emit({
+				jobId: "job-active",
+				emittedAt: "2026-08-20T00:02:00.000Z",
+				type: "failed",
+				stage: "reflecting",
+			});
+			await Promise.resolve();
+		});
+
+		component.handleInput("\n");
+		await vi.waitFor(() => expect(fixture.cancelActive).toHaveBeenCalledOnce());
+		await vi.waitFor(() => expect(fixture.overviewCall).toHaveBeenCalledTimes(overviewCallsBeforeCancellation + 1));
+		resolveInterruptedOverview?.(
+			overview({
+				newestResumableJob: job({
+					outcome: "interrupted",
+					reasonCode: "shutdown",
+					terminalAt: "2026-08-20T00:02:00.000Z",
+					resumable: true,
+					cancellable: false,
+				}),
+			}),
+		);
+
+		await vi.waitFor(() => expect(fixture.overviewCall).toHaveBeenCalledTimes(overviewCallsBeforeCancellation + 2));
+		await vi.waitFor(() => expect(stripAnsi(component.render(160).join("\n"))).toContain("Resume [unavailable]"));
+		expect(status).toHaveBeenCalledWith("Evolution round removed", false);
+		component.dispose();
 	});
 
 	it("reports when a manual start has no settled evidence", async () => {

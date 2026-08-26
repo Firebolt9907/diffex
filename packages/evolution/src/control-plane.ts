@@ -118,6 +118,10 @@ function isInputSnapshot(artifact: EvolutionArtifact): artifact is EvolutionInpu
 	return "ingestionHighWaterCursor" in artifact && "evidenceSources" in artifact && "harness" in artifact;
 }
 
+function isCancelledJob(job: EvolutionJob): boolean {
+	return job.resolution?.reasonCode === "cancelled-by-operator";
+}
+
 function isOpenBlockingJob(job: EvolutionJob): boolean {
 	return (
 		job.resolution === null &&
@@ -482,7 +486,7 @@ export class EvolutionControlPlane implements EvolutionJobRunner {
 			if (request.trigger === "automatic") {
 				const previousTerminalAt =
 					scopeJobs
-						.filter((job) => job.trigger === "automatic" && job.terminalAt !== null)
+						.filter((job) => !isCancelledJob(job) && job.trigger === "automatic" && job.terminalAt !== null)
 						.map((job) => job.terminalAt as string)
 						.sort()
 						.at(-1) ?? null;
@@ -888,6 +892,44 @@ export class EvolutionControlPlane implements EvolutionJobRunner {
 				}
 				throw error;
 			}
+		});
+	}
+
+	async cancelJob(jobId: string): Promise<EvolutionJob> {
+		const initial = await this.#dependencies.jobs.load(jobId);
+		if (initial === null) throw new Error(`Unknown evolution job "${jobId}"`);
+		if (initial.outcome === "completed") throw new Error(`Completed evolution job "${jobId}" cannot be cancelled`);
+		const ownerId = this.#dependencies.ids.nextId("lease-owner");
+		const initialLease = await this.#acquireScopeLease(initial.metadata.scope, ownerId);
+		if (initialLease === null) throw new Error(`Evolution scope for job "${jobId}" is already leased`);
+		return this.#withHeartbeat(initialLease, undefined, async (lease) => {
+			const current = await this.#dependencies.jobs.load(jobId);
+			if (current === null) throw new Error(`Unknown evolution job "${jobId}"`);
+			if (current.outcome === "completed") {
+				throw new Error(`Completed evolution job "${jobId}" cannot be cancelled`);
+			}
+			const resolvedAt = this.#dependencies.clock.now();
+			const cancelled = this.#withJobRevision(current, {
+				outcome: "interrupted",
+				reasonCode: "cancelled-by-operator",
+				failureMessage: "Evolution job was cancelled by the operator",
+				resolution: {
+					kind: "administratively-resolved",
+					reasonCode: "cancelled-by-operator",
+					resolvedAt,
+				},
+				terminalAt: resolvedAt,
+				retryNotBefore: null,
+			});
+			await this.#dependencies.jobs.save(cancelled, current.revision, lease());
+			await this.#syncLedger(cancelled);
+			await this.#dependencies.events.emit({
+				jobId,
+				emittedAt: cancelled.updatedAt,
+				type: "failed",
+				stage: cancelled.stage,
+			});
+			return cancelled;
 		});
 	}
 

@@ -41,7 +41,7 @@ export interface EvolutionMenuClient {
 	proposalDetail(jobId: string, proposalId: string): Promise<EvolutionProposalDetail>;
 	startManual(): Promise<EvolutionStartResult>;
 	resumeNewest(): Promise<EvolutionJobSummary>;
-	cancelActive(): Promise<EvolutionJobSummary>;
+	cancelActive(): Promise<void>;
 	rollback(): Promise<EvolutionRollbackAction>;
 }
 
@@ -153,6 +153,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	#focused = false;
 	#pollTimeout: ReturnType<typeof setTimeout> | null = null;
 	#refreshPromise: Promise<void> | null = null;
+	#refreshQueued = false;
 
 	get focused(): boolean {
 		return this.#focused;
@@ -213,8 +214,16 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 
 	refresh(): Promise<void> {
 		if (this.#disposed) return Promise.resolve();
+		this.#refreshQueued = true;
 		if (this.#refreshPromise !== null) return this.#refreshPromise;
-		this.#refreshPromise = this.#refresh();
+		this.#refreshPromise = (async () => {
+			do {
+				this.#refreshQueued = false;
+				await this.#refresh();
+			} while (this.#refreshQueued && !this.#disposed);
+		})().finally(() => {
+			this.#refreshPromise = null;
+		});
 		return this.#refreshPromise;
 	}
 
@@ -236,7 +245,6 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		} catch (error) {
 			this.#onStatus(error instanceof Error ? error.message : String(error), true);
 		} finally {
-			this.#refreshPromise = null;
 			this.#loading = false;
 			this.rebuild();
 			this.#requestRender();
@@ -348,7 +356,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		if (action === "cancel") {
 			return [
 				`Cancel ${overview?.activeJob ? formatEvolutionJobLabel(overview.activeJob) : "the active job"}?`,
-				"The current stage will be interrupted and remain resumable.",
+				"The evolution round will be removed. Its tokens and invocations will remain available.",
 			];
 		}
 		return [
@@ -372,7 +380,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 				);
 			}
 			if (action === "resume") this.#run(() => this.#client.resumeNewest(), "Evolution job resumed");
-			if (action === "cancel") this.#run(() => this.#client.cancelActive(), "Evolution job interrupted");
+			if (action === "cancel") this.#run(() => this.#client.cancelActive(), "Evolution round removed");
 			if (action === "rollback") this.#run(() => this.#client.rollback(), "Harness revision rolled back");
 		};
 		return [

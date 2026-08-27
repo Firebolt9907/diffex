@@ -1,12 +1,13 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentTool } from "@earendil-works/diffex-agent-core";
+import { type AgentTool, InMemoryTelemetryContext } from "@earendil-works/diffex-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/diffex-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
+import { createSkill } from "../../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
 import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
@@ -144,51 +145,110 @@ describe("AgentSession prompt characterization", () => {
 		expect(sawImage).toBe(true);
 	});
 
-	it("expands skill commands before sending the prompt", async () => {
-		const tempDir = join(tmpdir(), `pi-skill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(tempDir, { recursive: true });
-		tempDirs.push(tempDir);
-		const skillPath = join(tempDir, "test-skill.md");
-		writeFileSync(skillPath, "# Test Skill\n\nUse the skill body.");
-
-		const resourceLoader = {
-			...createTestResourceLoader(),
-			getSkills: () => ({
-				skills: [
-					{
-						name: "test",
-						description: "Test skill",
-						filePath: skillPath,
-						disableModelInvocation: false,
-						baseDir: tempDir,
-						sourceInfo: createSyntheticSourceInfo(skillPath, {
-							source: "local",
-							scope: "project",
-							origin: "top-level",
-							baseDir: tempDir,
-						}),
-					},
-				],
-				diagnostics: [],
-			}),
-		};
-		const harness = await createHarness({ resourceLoader });
+	it("does not expand individual skill commands", async () => {
+		const harness = await createHarness();
 		harnesses.push(harness);
-		let expandedPrompt = "";
-
+		let admittedPrompt = "";
 		harness.setResponses([
 			(context) => {
 				const user = context.messages.find((message) => message.role === "user");
-				expandedPrompt = user ? getMessageText(user) : "";
+				admittedPrompt = user ? getMessageText(user) : "";
 				return fauxAssistantMessage("ok");
 			},
 		]);
 
 		await harness.session.prompt("/skill:test explain this");
 
-		expect(expandedPrompt).toContain('<skill name="test" location="');
-		expect(expandedPrompt).toContain("Use the skill body.");
-		expect(expandedPrompt).toContain("explain this");
+		expect(admittedPrompt).toBe("/skill:test explain this");
+	});
+
+	it("loads exactly the explicitly referenced skill snapshot and traces its identity", async () => {
+		const tempDir = join(tmpdir(), `diffex-skill-reference-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		tempDirs.push(tempDir);
+		const selectedPath = join(tempDir, "selected.md");
+		const unselectedPath = join(tempDir, "unselected.md");
+		writeFileSync(
+			selectedPath,
+			"---\nname: selected\ndescription: Selected skill\n---\n\n# Selected\n\nOriginal instructions.",
+		);
+		writeFileSync(
+			unselectedPath,
+			"---\nname: unselected\ndescription: Unselected skill\n---\n\n# Unselected\n\nPrivate instructions.",
+		);
+		const sourceInfo = (filePath: string) =>
+			createSyntheticSourceInfo(filePath, {
+				source: "local",
+				scope: "project",
+				origin: "top-level",
+				baseDir: tempDir,
+			});
+		const resourceLoader = {
+			...createTestResourceLoader(),
+			getSkills: () => ({
+				skills: [
+					createSkill({
+						name: "selected",
+						description: "Selected skill",
+						filePath: selectedPath,
+						baseDir: tempDir,
+						sourceInfo: sourceInfo(selectedPath),
+						content:
+							"---\nname: selected\ndescription: Selected skill\n---\n\n# Selected\n\nOriginal instructions.",
+						disableModelInvocation: true,
+					}),
+					createSkill({
+						name: "unselected",
+						description: "Unselected skill",
+						filePath: unselectedPath,
+						baseDir: tempDir,
+						sourceInfo: sourceInfo(unselectedPath),
+						content:
+							"---\nname: unselected\ndescription: Unselected skill\n---\n\n# Unselected\n\nPrivate instructions.",
+					}),
+				],
+				diagnostics: [],
+			}),
+		};
+		const telemetry = new InMemoryTelemetryContext();
+		const harness = await createHarness({ resourceLoader, telemetryContext: telemetry });
+		harnesses.push(harness);
+		const references = harness.session.createSkillReferences();
+		const selected = references.find((reference) => reference.name === "selected");
+		if (!selected) throw new Error("Selected skill reference was not created");
+		expect(selected.group).toBe("installed-workspace");
+		writeFileSync(selectedPath, "Changed after selection.");
+		let admittedPrompt = "";
+		let admittedSystemPrompt = "";
+
+		harness.setResponses([
+			(context) => {
+				const user = context.messages.find((message) => message.role === "user");
+				admittedPrompt = user ? getMessageText(user) : "";
+				admittedSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("ok");
+			},
+		]);
+
+		await harness.session.prompt(`${selected.reference}\n\nUse this for the task.`);
+
+		expect(admittedPrompt).toContain(`id="${selected.skillId}"`);
+		expect(admittedPrompt).toContain(`version="${selected.version}"`);
+		expect(admittedPrompt).toContain("Original instructions.");
+		expect(admittedPrompt).not.toContain("Changed after selection.");
+		expect(admittedPrompt).not.toContain("Private instructions.");
+		expect(admittedPrompt).toContain("Use this for the task.");
+		expect(admittedSystemPrompt).not.toContain("<name>selected</name>");
+		expect(admittedSystemPrompt).toContain("<name>unselected</name>");
+		const promptOperation = telemetry
+			.getSpans()
+			.find(
+				(span) =>
+					span.name === "diffex.coding_agent.operation" && span.attributes["diffex.operation.kind"] === "prompt",
+			);
+		expect(promptOperation?.attributes["diffex.skill.references"]).toEqual([
+			`${selected.skillId}@${selected.version}`,
+		]);
 	});
 
 	it("expands prompt templates before sending the prompt", async () => {

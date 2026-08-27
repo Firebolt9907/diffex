@@ -14,6 +14,7 @@ import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	EditorComponent,
+	EditorTextPart,
 	Keybinding,
 	KeyId,
 	MarkdownTheme,
@@ -57,7 +58,7 @@ import {
 	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import { type AgentSession, type AgentSessionEvent, parseSkillInvocation } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import {
 	CACHE_TTL_MS,
@@ -94,6 +95,7 @@ import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import type { TuiMode } from "../../core/settings-manager.ts";
+import type { SkillReference } from "../../core/skills.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -157,6 +159,7 @@ import { ScopedModelsSelectorComponent } from "./components/scoped-models-select
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
+import { SkillSelectorComponent } from "./components/skill-selector.ts";
 import {
 	BranchSummaryStatusIndicator,
 	CompactionStatusIndicator,
@@ -490,9 +493,6 @@ export class InteractiveMode {
 		theme,
 	});
 
-	// Skill commands: command name -> skill file path
-	private skillCommands = new Map<string, string>();
-
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
@@ -610,6 +610,7 @@ export class InteractiveMode {
 			concealedInputPrefix: "!",
 			placeholder: "Ask Diffex to do something for you.",
 			placeholderStyle: (text) => theme.fg("muted", text),
+			textTokenStyle: (text) => `\x1b[38;2;196;114;214m${text}\x1b[39m`,
 		});
 		this.editor = this.defaultEditor;
 		this.editorContainer = new Container();
@@ -756,22 +757,8 @@ export class InteractiveMode {
 				getArgumentCompletions: cmd.getArgumentCompletions,
 			}));
 
-		// Build skill commands from session.skills (if enabled)
-		this.skillCommands.clear();
-		const skillCommandList: SlashCommand[] = [];
-		if (this.settingsManager.getEnableSkillCommands()) {
-			for (const skill of this.session.resourceLoader.getSkills().skills) {
-				const commandName = `skill:${skill.name}`;
-				this.skillCommands.set(commandName, skill.filePath);
-				skillCommandList.push({
-					name: commandName,
-					description: this.prefixAutocompleteDescription(skill.description, skill.sourceInfo),
-				});
-			}
-		}
-
 		return new CombinedAutocompleteProvider(
-			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
+			[...slashCommands, ...templateCommands, ...extensionCommands],
 			this.sessionManager.getCwd(),
 			this.fdPath,
 		);
@@ -2605,8 +2592,8 @@ export class InteractiveMode {
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
 		this.editorComponentFactory = factory;
 
-		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		// Save expanded text so editor-specific tokens do not leak across implementations.
+		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 
 		this.disposeActiveSelector();
 		this.editorContainer.clear();
@@ -2920,6 +2907,11 @@ export class InteractiveMode {
 			if (text === "/settings") {
 				this.showSettingsSelector();
 				this.editor.setText("");
+				return;
+			}
+			if (text === "/skills") {
+				this.editor.setText("");
+				this.showSkillsSelector();
 				return;
 			}
 			if (text === "/scoped-models") {
@@ -3569,20 +3561,20 @@ export class InteractiveMode {
 					if (this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
-					const skillBlock = parseSkillBlock(textContent);
-					if (skillBlock) {
-						// Render skill block (collapsible)
-						const component = new SkillInvocationMessageComponent(
-							skillBlock,
-							this.getMarkdownThemeWithSettings(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
-						// Render user message separately if present
-						if (skillBlock.userMessage) {
+					const skillInvocation = parseSkillInvocation(textContent);
+					if (skillInvocation) {
+						for (const skillBlock of skillInvocation.skills) {
+							const component = new SkillInvocationMessageComponent(
+								skillBlock,
+								this.getMarkdownThemeWithSettings(),
+							);
+							component.setExpanded(this.toolOutputExpanded);
+							this.chatContainer.addChild(component);
+						}
+						if (skillInvocation.userMessage) {
 							this.chatContainer.addChild(new Spacer(1));
 							const userComponent = new UserMessageComponent(
-								skillBlock.userMessage,
+								skillInvocation.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
 								this.getMarkdownTransformers(),
@@ -4445,6 +4437,41 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private showSkillsSelector(): void {
+		const references = this.session.createSkillReferences();
+		if (references.length === 0) {
+			this.showStatus("No skills available");
+			return;
+		}
+		this.showSelector((done) => {
+			const selector = new SkillSelectorComponent(
+				references,
+				(selected: SkillReference[]) => {
+					done();
+					const editorText = this.editor.getExpandedText?.() ?? this.editor.getText();
+					if (this.editor.setTextWithTokens) {
+						const parts: EditorTextPart[] = [];
+						for (const [index, reference] of selected.entries()) {
+							if (index > 0) parts.push("\n");
+							parts.push({ value: reference.reference, displayText: reference.name });
+						}
+						if (editorText.trim()) parts.push("\n\n", editorText);
+						this.editor.setTextWithTokens(parts);
+					} else {
+						const referenceText = selected.map((reference) => reference.reference).join("\n");
+						this.editor.setText([referenceText, editorText].filter((value) => value.trim()).join("\n\n"));
+					}
+					this.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
@@ -4455,7 +4482,6 @@ export class InteractiveMode {
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 					blockImages: this.settingsManager.getBlockImages(),
-					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
 					steeringMode: this.session.steeringMode,
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
@@ -4509,10 +4535,6 @@ export class InteractiveMode {
 					},
 					onBlockImagesChange: (blocked) => {
 						this.settingsManager.setBlockImages(blocked);
-					},
-					onEnableSkillCommandsChange: (enabled) => {
-						this.settingsManager.setEnableSkillCommands(enabled);
-						this.setupAutocompleteProvider();
 					},
 					onSteeringModeChange: (mode) => {
 						this.session.setSteeringMode(mode);

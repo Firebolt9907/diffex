@@ -166,7 +166,7 @@ Standard editing keybindings for delete word, undo, etc. See [docs/keybindings.m
 
 ### Commands
 
-Type `/` in the editor to trigger commands. [Extensions](#extensions) can register custom commands, [skills](#skills) are available as `/skill:name`, and [prompt templates](#prompt-templates) expand via `/templatename`.
+Type `/` in the editor to trigger commands. [Extensions](#extensions) can register custom commands, [skills](#skills) are referenced through `/skills`, and [prompt templates](#prompt-templates) expand via `/templatename`.
 
 | Command | Description |
 |---------|-------------|
@@ -175,6 +175,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/model` | Switch models |
 | `/scoped-models` | Enable/disable models for Ctrl+P cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |
+| [`/skills`](docs/skills.md#skill-commands) | Search and reference one or more skills in the editor |
 | `/resume` | Pick from previous sessions |
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
@@ -352,7 +353,7 @@ Place in `~/.diffex/agent/prompts/`, `.diffex/prompts/`, or a [Diffex package](#
 
 ### Skills
 
-On-demand capability packages following the [Agent Skills standard](https://agentskills.io). Invoke via `/skill:name` or let the agent load them automatically.
+On-demand capability packages following the [Agent Skills standard](https://agentskills.io). Use `/skills` to choose installed workspace, installed global, or evolved skills and insert one or more versioned references into a task, or let the agent load skills automatically.
 
 ```markdown
 <!-- ~/.diffex/agent/skills/my-skill/SKILL.md -->
@@ -434,7 +435,7 @@ diffex update npm:@foo/diffex-tools         # update one package
 diffex config                               # enable/disable extensions, skills, prompts, themes
 ```
 
-Packages install to `~/.diffex/agent/git/` (git) or `~/.diffex/agent/npm/` (npm). Use `-l` for project-local installs (`.diffex/git/`, `.diffex/npm/`). Git `@ref` values are pinned tags or commits; pinned packages are skipped by `diffex update --extensions` and `diffex update --all`, so use `diffex install git:host/user/repo@new-ref` to move an existing package to a new ref. Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
+Interactive package installs ask whether to use global storage (`~/.diffex/agent/git/`, `~/.diffex/agent/npm/`) or workspace storage (`.diffex/git/`, `.diffex/npm/`) and show the trust implications. Non-interactive installs default to global; use `-l` to select workspace scope explicitly. Git `@ref` values are pinned tags or commits; pinned packages are skipped by `diffex update --extensions` and `diffex update --all`, so use `diffex install git:host/user/repo@new-ref` to move an existing package to a new ref. Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
 
 Create a package by adding the compatibility `diffex` key to `package.json`:
 

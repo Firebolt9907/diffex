@@ -30,8 +30,12 @@
 			"@earendil-works/diffex-protocol": ["./packages/protocol/src/index.ts"],
 			"@earendil-works/diffex-protocol/*": ["./packages/protocol/src/*"],
 			"@earendil-works/diffex-client": ["./packages/client/src/index.ts"],
+			"@earendil-works/diffex-client/websocket": ["./packages/client/src/websocket.ts"],
 			"@earendil-works/diffex-client/*": ["./packages/client/src/*"],
 			"@earendil-works/diffex-server": ["./packages/server/src/index.ts"],
+			"@earendil-works/diffex-server/websocket": [
+				"./packages/server/src/transports/websocket/index.ts"
+			],
 			"@earendil-works/diffex-server/*": ["./packages/server/src/*"],
 			"typebox": ["./node_modules/typebox"],
 			"@earendil-works/diffex-tui": ["./packages/tui/src/index.ts"],

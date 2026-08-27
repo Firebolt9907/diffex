@@ -47,6 +47,10 @@ const ThemeJsonSchema = Type.Object({
 		dim: ColorValueSchema,
 		text: ColorValueSchema,
 		thinkingText: ColorValueSchema,
+		// Footer status (3 required)
+		footerModel: ColorValueSchema,
+		footerContext: ColorValueSchema,
+		footerWindow: ColorValueSchema,
 		startupIntroText: Type.Optional(ColorValueSchema),
 		startupIntroAccent: Type.Optional(ColorValueSchema),
 		selectionAccent: Type.Optional(ColorValueSchema),
@@ -126,6 +130,9 @@ export type ThemeColor =
 	| "dim"
 	| "text"
 	| "thinkingText"
+	| "footerModel"
+	| "footerContext"
+	| "footerWindow"
 	| "startupIntroText"
 	| "startupIntroAccent"
 	| "selectionAccent"

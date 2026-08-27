@@ -47,6 +47,9 @@
 				"dim",
 				"text",
 				"thinkingText",
+				"footerModel",
+				"footerContext",
+				"footerWindow",
 				"selectedBg",
 				"userMessageBg",
 				"userMessageText",
@@ -136,6 +139,18 @@
 				"thinkingText": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Thinking block text color"
+				},
+				"footerModel": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Footer model name color"
+				},
+				"footerContext": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Footer context usage color"
+				},
+				"footerWindow": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Footer context window color"
 				},
 				"startupIntroText": {
 					"$ref": "#/$defs/colorValue",

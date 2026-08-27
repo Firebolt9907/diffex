@@ -7,7 +7,7 @@ import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provide
 import type { EvolutionFooterStatusClient } from "../src/modes/interactive/components/evolution-footer-status.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
 import { formatEvolutionTimestamp } from "../src/modes/interactive/components/harness-version-display.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 type AssistantUsage = {
@@ -206,6 +206,20 @@ describe("FooterComponent width handling", () => {
 		expect(harnessLine).toBe("Harness default");
 		expect(statsLine?.startsWith("gpt-5.5")).toBe(true);
 		expect(harnessLine?.startsWith("Harness")).toBe(true);
+	});
+
+	it("uses dedicated colors for footer model, context usage, and context window", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = footer.render(120)[0];
+		expect(statsLine).toContain(theme.fg("footerModel", "gpt-5.5 medium"));
+		expect(statsLine).toContain(theme.fg("footerContext", "Context 12.3% used"));
+		expect(statsLine).toContain(theme.fg("footerWindow", "200k window"));
 	});
 
 	it("shows the active evolved harness completion time", async () => {

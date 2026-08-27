@@ -70,6 +70,9 @@ vim ~/.diffex/agent/themes/my-theme.json
     "dim": 240,
     "text": "",
     "thinkingText": "secondary",
+    "footerModel": "#F7ED4F",
+    "footerContext": "#F5B427",
+    "footerWindow": "#3A75F2",
     "startupIntroText": "#CDD6F4",
     "startupIntroAccent": "#89B4FA",
     "selectionAccent": "#89B4FA",
@@ -144,18 +147,18 @@ vim ~/.diffex/agent/themes/my-theme.json
 
 - `name` is required, must be unique, and must not contain `/`.
 - `vars` is optional. Define reusable colors here, then reference them in `colors`.
-- `colors` must define all 51 required tokens.
-  `thinkingMax`, `scrollbarThumb`, `startupIntroText`, `startupIntroAccent`, `selectionAccent`, and `autocompleteSelected` are optional compatibility tokens with fallbacks.
+- `colors` must define all 54 required tokens.
+  `editorBorder`, `thinkingMax`, `scrollbarThumb`, `startupIntroText`, `startupIntroAccent`, `selectionAccent`, and `autocompleteSelected` are optional compatibility tokens with fallbacks.
 
 The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 51 required color tokens.
-`thinkingMax`, `scrollbarThumb`, `startupIntroText`, `startupIntroAccent`, `selectionAccent`, and `autocompleteSelected` are optional for compatibility with existing themes.
-When omitted, they use `thinkingXhigh`, `selectedBg`, `text`, `mdLink`, `autocompleteSelected` or `startupIntroAccent`, and `selectionAccent`, respectively.
+Every theme must define all 54 required color tokens.
+`editorBorder`, `thinkingMax`, `scrollbarThumb`, `startupIntroText`, `startupIntroAccent`, `selectionAccent`, and `autocompleteSelected` are optional for compatibility with existing themes.
+Their fallbacks are `borderMuted`, `thinkingXhigh`, `selectedBg`, `text`, `mdLink`, `autocompleteSelected` or `startupIntroAccent`, and `selectionAccent`, respectively.
 
-### Core UI (11 colors)
+### Core UI (11 required, 1 optional)
 
 | Token | Purpose |
 |-------|---------|
@@ -163,6 +166,7 @@ When omitted, they use `thinkingXhigh`, `selectedBg`, `text`, `mdLink`, `autocom
 | `border` | Normal borders |
 | `borderAccent` | Highlighted borders |
 | `borderMuted` | Subtle borders (editor) |
+| `editorBorder` | Editor border; optional, falls back to `borderMuted` |
 | `success` | Success states |
 | `error` | Error states |
 | `warning` | Warning states |
@@ -170,6 +174,14 @@ When omitted, they use `thinkingXhigh`, `selectedBg`, `text`, `mdLink`, `autocom
 | `dim` | Tertiary text |
 | `text` | Default text (usually `""`) |
 | `thinkingText` | Thinking block text |
+
+### Footer Status (3 colors)
+
+| Token | Purpose |
+|-------|---------|
+| `footerModel` | Model name |
+| `footerContext` | Context usage percentage |
+| `footerWindow` | Context window size |
 
 ### Startup Intro And Selection (4 optional)
 

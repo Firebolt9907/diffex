@@ -102,17 +102,7 @@ export class FooterComponent implements Component {
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
-		// Colorize context percentage based on usage
-		let contextPercentStr: string;
 		const contextPercentDisplay = `Context ${contextPercent}% used`;
-		if (contextPercentValue > 90) {
-			contextPercentStr = theme.fg("error", contextPercentDisplay);
-		} else if (contextPercentValue > 70) {
-			contextPercentStr = theme.fg("warning", contextPercentDisplay);
-		} else {
-			contextPercentStr = contextPercentDisplay;
-		}
-
 		const modelName = state.model?.id || "no-model";
 		const thinkingLevel = state.thinkingLevel || "off";
 		const windowDisplay = `${formatTokens(contextWindow)} window`;
@@ -133,7 +123,13 @@ export class FooterComponent implements Component {
 		const evolutionSpinner = evolutionSnapshot?.running
 			? ` ${theme.fg("accent", evolutionSnapshot.spinnerFrame)}`
 			: "";
-		let statsLine = `${modelName} ${thinkingLevel} • ${contextPercentStr} • ${windowDisplay}`;
+		const separator = theme.fg("dim", " • ");
+		const modelDisplay = theme.fg("footerModel", `${modelName} ${thinkingLevel}`);
+		let statsLine = [
+			modelDisplay,
+			theme.fg("footerContext", contextPercentDisplay),
+			theme.fg("footerWindow", windowDisplay),
+		].join(separator);
 		let harnessLine = `Harness ${harnessVersion}${evolutionSpinner}`;
 
 		if (visibleWidth(statsLine) > width) {
@@ -143,7 +139,7 @@ export class FooterComponent implements Component {
 			harnessLine = truncateToWidth(harnessLine, width, "...");
 		}
 
-		const lines = [theme.fg("dim", statsLine), theme.fg("dim", harnessLine)];
+		const lines = [statsLine, theme.fg("dim", harnessLine)];
 
 		// Add extension statuses on a single line, sorted by key alphabetically
 		const extensionStatuses = this.footerData.getExtensionStatuses();

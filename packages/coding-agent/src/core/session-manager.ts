@@ -6,6 +6,7 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -226,6 +227,8 @@ export type ReadonlySessionManager = Pick<
 function createSessionId(): string {
 	return uuidv7();
 }
+
+const PERSIST_SESSION_HEADER = Symbol("persistSessionHeader");
 
 export function assertValidSessionId(id: string): void {
 	if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
@@ -1034,6 +1037,25 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/** Persist a newly created session header before admitting dependent work. */
+	[PERSIST_SESSION_HEADER](): void {
+		if (!this.persist || !this.sessionFile) {
+			throw new Error("Cannot persist an in-memory session header");
+		}
+		if (this.fileEntries.length !== 1 || this.fileEntries[0]?.type !== "session") {
+			throw new Error("Session header must be persisted before appending entries");
+		}
+
+		const fd = openSync(this.sessionFile, "wx");
+		try {
+			writeFileSync(fd, `${JSON.stringify(this.fileEntries[0])}\n`);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		this.flushed = true;
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
@@ -1786,4 +1808,9 @@ export class SessionManager {
 			return [];
 		}
 	}
+}
+
+/** Internal seam for durably admitting a newly created dependent session. */
+export function persistSessionHeader(sessionManager: SessionManager): void {
+	sessionManager[PERSIST_SESSION_HEADER]();
 }

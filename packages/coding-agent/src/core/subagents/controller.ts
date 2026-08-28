@@ -483,6 +483,14 @@ export class SubagentController {
 		let snapshot = this.snapshot();
 		while (true) {
 			if (options.signal?.aborted) throw options.signal.reason;
+			for (const attempt of batch.attempts) {
+				const run = this.#records.get(attempt.name)?.coordinatedRun;
+				if (!run || run.id !== attempt.runId || run.delivery === "consumed") {
+					// Explicit query consumption can release a frozen attempt before AgentSession
+					// resumes this wait, and a same-child retry can then replace its run identity.
+					notified.add(attempt.name);
+				}
+			}
 			const terminal = batch.attempts
 				.flatMap((attempt) => {
 					if (notified.has(attempt.name)) return [];
@@ -1226,6 +1234,9 @@ export class SubagentController {
 		while (record.status === "running" && record.session?.isIdle) {
 			await record.run;
 			this.#assertOpen();
+		}
+		if (wake && isTerminalStatus(record.status) && record.coordinatedRun?.delivery === "frozen") {
+			throw new Error(`Cannot wake subagent while its coordinated result is pending delivery: ${name}`);
 		}
 
 		if (record.status === "queued") {

@@ -1,9 +1,20 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { InMemoryTelemetryContext } from "@earendil-works/diffex-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/diffex-ai";
-import { HarnessStateStore, type HarnessVersion } from "@earendil-works/diffex-harness-state";
+import {
+	computeHarnessVersion,
+	HARNESS_VERSION_SCHEMA_VERSION,
+	HarnessStateStore,
+	type HarnessVersion,
+	type HarnessVersionMetadata,
+	type HarnessWorkspaceIdentity,
+	harnessVersionDirectoryName,
+} from "@earendil-works/diffex-harness-state";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveHarnessWorkspace } from "../../src/core/harness-state-runtime.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 describe("AgentSession harness revisions", () => {
@@ -25,18 +36,70 @@ describe("AgentSession harness revisions", () => {
 		harness: Harness;
 		store: HarnessStateStore;
 		rootVersion: HarnessVersion;
+		telemetry: InMemoryTelemetryContext;
+		agentDir: string;
 	}> {
 		const agentDir = join(tmpdir(), `diffex-harness-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(agentDir, { recursive: true });
 		agentDirs.push(agentDir);
 		const store = new HarnessStateStore(agentDir);
 		const root = await store.initialize();
+		const telemetry = new InMemoryTelemetryContext();
 		const harness = await createHarness({
 			harnessStateStore: store,
 			harnessVersionBundle: root,
+			telemetryContext: telemetry,
 		});
 		harnesses.push(harness);
-		return { harness, store, rootVersion: root.manifest.version };
+		return { harness, store, rootVersion: root.manifest.version, telemetry, agentDir };
+	}
+
+	function contentHash(content: string): HarnessVersion {
+		return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+	}
+
+	function writeHarnessRevision(options: {
+		agentDir: string;
+		base: HarnessVersion;
+		metadata: HarnessVersionMetadata;
+		memory: string;
+		skill: { name: string; content: string; workspace: HarnessWorkspaceIdentity };
+	}): HarnessVersion {
+		const skillPath = `skills/${options.skill.name}/SKILL.md`;
+		const artifacts = [
+			{ kind: "evolution-memory", path: "EVOLVE.md", contentHash: contentHash(options.memory) },
+			{
+				kind: "skill",
+				path: skillPath,
+				contentHash: contentHash(options.skill.content),
+				workspace: options.skill.workspace,
+			},
+		];
+		const version = computeHarnessVersion({
+			schemaVersion: HARNESS_VERSION_SCHEMA_VERSION,
+			base: options.base,
+			metadata: options.metadata,
+			artifacts,
+		});
+		const revisionPath = join(options.agentDir, "harness-state", "versions", harnessVersionDirectoryName(version));
+		mkdirSync(join(revisionPath, "skills", options.skill.name), { recursive: true });
+		writeFileSync(
+			join(revisionPath, "manifest.json"),
+			`${JSON.stringify(
+				{
+					schemaVersion: HARNESS_VERSION_SCHEMA_VERSION,
+					version,
+					base: options.base,
+					metadata: options.metadata,
+					artifacts,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		writeFileSync(join(revisionPath, "EVOLVE.md"), options.memory);
+		writeFileSync(join(revisionPath, ...skillPath.split("/")), options.skill.content);
+		return version;
 	}
 
 	it("applies an advanced EVOLVE revision only to requests after a live switch", async () => {
@@ -70,6 +133,187 @@ describe("AgentSession harness revisions", () => {
 		expect(providerPrompts[1]).toContain(
 			`<evolution_memory version="${advance.bundle.manifest.version}">\nAlways mention the activated revision.\n</evolution_memory>`,
 		);
+	});
+
+	it("refreshes memory and evolved skills from one selected revision", async () => {
+		const { harness, store, rootVersion, telemetry } = await createVersionedHarness();
+		const workspace = await resolveHarnessWorkspace(harness.tempDir);
+		const skillContent =
+			"---\nname: atomic-review\ndescription: Review the active harness atomically.\n---\n\n# Atomic review\n";
+		const revision = await store.saveVersion(
+			{
+				memory: "Use the matching evolved skill revision.",
+				skills: [
+					{
+						path: "skills/atomic-review/SKILL.md",
+						content: skillContent,
+						workspace: workspace.workspace,
+					},
+				],
+			},
+			rootVersion,
+		);
+		await store.selectVersion(revision.manifest.version);
+		let providerPrompt = "";
+		harness.setResponses([
+			(context) => {
+				providerPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("activated");
+			},
+		]);
+
+		await harness.session.prompt("observe the atomic revision");
+
+		expect(harness.session.activeHarnessVersion).toBe(revision.manifest.version);
+		expect(providerPrompt).toContain(
+			`<evolution_memory version="${revision.manifest.version}">\nUse the matching evolved skill revision.\n</evolution_memory>`,
+		);
+		expect(providerPrompt).toContain("<name>atomic-review</name>");
+		expect(providerPrompt).toContain(revision.state.skills[0]?.filePath);
+		expect(harness.session.createSkillReferences()).toEqual([
+			expect.objectContaining({
+				name: "atomic-review",
+				sourceKind: "evolved",
+				harnessRevision: revision.manifest.version,
+				version: revision.state.skills[0]?.contentHash,
+			}),
+		]);
+		const promptOperation = telemetry
+			.getSpans()
+			.find(
+				(span) =>
+					span.name === "diffex.coding_agent.operation" && span.attributes["diffex.operation.kind"] === "prompt",
+			);
+		const availableEvent = promptOperation?.events.find(
+			(event) =>
+				event.name === "diffex.skill.available" && event.attributes["diffex.skill.source_kind"] === "evolved",
+		);
+		expect(availableEvent?.attributes).toMatchObject({
+			"diffex.skill.version": revision.state.skills[0]?.contentHash,
+			"diffex.skill.source_kind": "evolved",
+			"diffex.skill.scope": "workspace",
+			"diffex.skill.harness_revision": revision.manifest.version,
+			"diffex.harness.version": revision.manifest.version,
+			"diffex.workspace.repository_id": workspace.workspace.repositoryId,
+			"diffex.workspace.directory_id": workspace.workspace.directoryId,
+		});
+
+		await harness.session.switchHarnessVersion(rootVersion);
+		expect(harness.session.systemPrompt).not.toContain("Use the matching evolved skill revision.");
+		expect(harness.session.systemPrompt).not.toContain("<name>atomic-review</name>");
+		expect(harness.session.createSkillReferences()).toEqual([]);
+	});
+
+	it("loads a manually assembled skill revision and restores the prior catalog at the next prompt", async () => {
+		const { harness, store, rootVersion, telemetry, agentDir } = await createVersionedHarness();
+		const root = await store.loadVersion(rootVersion);
+		const workspace = await resolveHarnessWorkspace(harness.tempDir);
+		const skillContent =
+			"---\nname: manual-review\ndescription: Trace the manually assembled review workflow.\n---\n\n# Manual review\n";
+		const revision = writeHarnessRevision({
+			agentDir,
+			base: rootVersion,
+			metadata: root.manifest.metadata,
+			memory: "Use the manually assembled harness revision.\n",
+			skill: { name: "manual-review", content: skillContent, workspace: workspace.workspace },
+		});
+		const selected = await store.selectVersionIfCurrent(revision, rootVersion);
+		expect(selected.status).toBe("selected");
+		const providerPrompts: string[] = [];
+		harness.setResponses([
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("manual revision");
+			},
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("restored revision");
+			},
+		]);
+
+		await harness.session.prompt("trace the selected skill");
+
+		expect(harness.session.activeHarnessVersion).toBe(revision);
+		expect(providerPrompts[0]).toContain("Use the manually assembled harness revision.");
+		expect(providerPrompts[0]).toContain("<name>manual-review</name>");
+		const reference = harness.session.createSkillReferences()[0];
+		expect(reference).toMatchObject({
+			name: "manual-review",
+			sourceKind: "evolved",
+			harnessRevision: revision,
+			version: contentHash(skillContent),
+		});
+		const firstPromptOperation = telemetry
+			.getSpans()
+			.find(
+				(span) =>
+					span.name === "diffex.coding_agent.operation" && span.attributes["diffex.operation.kind"] === "prompt",
+			);
+		expect(
+			firstPromptOperation?.events.find(
+				(event) =>
+					event.name === "diffex.skill.available" && event.attributes["diffex.skill.source_kind"] === "evolved",
+			)?.attributes,
+		).toMatchObject({
+			"diffex.skill.version": contentHash(skillContent),
+			"diffex.skill.harness_revision": revision,
+			"diffex.harness.version": revision,
+			"diffex.workspace.repository_id": workspace.workspace.repositoryId,
+			"diffex.workspace.directory_id": workspace.workspace.directoryId,
+		});
+
+		const rolledBack = await store.selectVersionIfCurrent(rootVersion, revision);
+		expect(rolledBack.status).toBe("selected");
+		expect(harness.session.activeHarnessVersion).toBe(revision);
+
+		await harness.session.prompt("observe the restored catalog");
+
+		expect(harness.session.activeHarnessVersion).toBe(rootVersion);
+		expect(providerPrompts[1]).not.toContain("Use the manually assembled harness revision.");
+		expect(providerPrompts[1]).not.toContain("<name>manual-review</name>");
+		expect(harness.session.createSkillReferences()).toEqual([]);
+	});
+
+	it("rejects an evolved reference after the selected harness changes", async () => {
+		const { harness, store, rootVersion } = await createVersionedHarness();
+		const workspace = await resolveHarnessWorkspace(harness.tempDir);
+		const first = await store.saveVersion(
+			{
+				memory: "First revision.",
+				skills: [
+					{
+						path: "skills/versioned-review/SKILL.md",
+						content: "---\nname: versioned-review\ndescription: Use the first review revision.\n---\n\n# First\n",
+						workspace: workspace.workspace,
+					},
+				],
+			},
+			rootVersion,
+		);
+		await harness.session.switchHarnessVersion(first.manifest.version);
+		const reference = harness.session.createSkillReferences()[0];
+		if (reference === undefined) throw new Error("Expected an evolved skill reference");
+		const second = await store.saveVersion(
+			{
+				memory: "Second revision.",
+				skills: [
+					{
+						path: "skills/versioned-review/SKILL.md",
+						content:
+							"---\nname: versioned-review\ndescription: Use the second review revision.\n---\n\n# Second\n",
+						workspace: workspace.workspace,
+					},
+				],
+			},
+			first.manifest.version,
+		);
+		await store.selectVersion(second.manifest.version);
+
+		await expect(harness.session.prompt(`${reference.reference}\n\nreview this`)).rejects.toThrow(
+			"is not part of the active harness revision",
+		);
+		expect(harness.session.activeHarnessVersion).toBe(second.manifest.version);
+		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
 	it("switches repeatedly between valid revisions", async () => {
@@ -136,7 +380,21 @@ describe("AgentSession harness revisions", () => {
 
 		const inFlight = harness.session.prompt("request admitted before activation");
 		await firstStarted;
-		const advance = await store.advance({ memory: "Use memory selected during the request." }, rootVersion);
+		const workspace = await resolveHarnessWorkspace(harness.tempDir);
+		const advance = await store.advance(
+			{
+				memory: "Use memory selected during the request.",
+				skills: [
+					{
+						path: "skills/later-review/SKILL.md",
+						content:
+							"---\nname: later-review\ndescription: Review only after activation.\n---\n\n# Later review\n",
+						workspace: workspace.workspace,
+					},
+				],
+			},
+			rootVersion,
+		);
 		expect(advance.status).toBe("advanced");
 		if (advance.status !== "advanced") throw new Error("Expected harness advance to succeed");
 		expect(harness.session.activeHarnessVersion).toBe(rootVersion);
@@ -146,7 +404,9 @@ describe("AgentSession harness revisions", () => {
 		await harness.session.prompt("request admitted after activation");
 
 		expect(providerPrompts[0]).not.toContain("Use memory selected during the request.");
+		expect(providerPrompts[0]).not.toContain("<name>later-review</name>");
 		expect(providerPrompts[1]).toContain("Use memory selected during the request.");
+		expect(providerPrompts[1]).toContain("<name>later-review</name>");
 		expect(harness.session.activeHarnessVersion).toBe(advance.bundle.manifest.version);
 	});
 

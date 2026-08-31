@@ -548,6 +548,66 @@ describe("evolution memory writer", () => {
 		);
 	});
 
+	it("preserves evolved skill artifacts while activating a memory mutation", async () => {
+		const root = await mkdtemp(join(tmpdir(), "diffex-evolution-writer-skills-"));
+		temporaryDirectories.push(root);
+		const harnessState = new HarnessStateStore(join(root, "agent"));
+		const empty = await harnessState.initialize();
+		const skillContent =
+			"---\nname: review-workflow\ndescription: Review changes with focused checks.\n---\n\n# Review workflow\n";
+		const initial = await harnessState.advance(
+			{
+				memory: "Baseline memory.\n",
+				skills: [
+					{
+						path: "skills/review-workflow/SKILL.md",
+						content: skillContent,
+						workspace: { repositoryId: "global", directoryId: "directory-1" },
+					},
+				],
+			},
+			empty.manifest.version,
+		);
+		if (initial.status !== "advanced") throw new Error("Expected skill harness advance");
+		const writer = new EvolutionMemoryWriter({
+			version: "1.0.0",
+			harnessState,
+			statePath: join(root, "writer-state"),
+		});
+		const snapshot = await writer.captureSnapshot();
+		const selectedBatch = batch(snapshot, [
+			{
+				mutationId: "mutation-preserve-skill",
+				proposalId: "proposal-preserve-skill",
+				target: { kind: "evolution-memory", expectedHarnessVersion: snapshot.harnessVersion },
+				payload: {
+					operation: "ADD",
+					destination: { section: null, anchor: null },
+					content: "Keep skill and memory activation atomic.",
+					intendedScope: ["repository"],
+				},
+			},
+		]);
+
+		const writeResult = await writer.write(selectedBatch, {
+			idempotencyKey: "write-preserve-skill",
+			lease: writerLease,
+		});
+		const activation = await writer.activate(selectedBatch, writeResult, {
+			idempotencyKey: "activate-preserve-skill",
+			lease: writerLease,
+		});
+		const activated = await harnessState.loadCurrent();
+
+		expect(activated.manifest.version).toBe(activation.resultingHarnessVersion);
+		expect(activated.state.memory).toContain("Keep skill and memory activation atomic.");
+		expect(activated.state.skills).toHaveLength(1);
+		expect(activated.state.skills[0]?.content).toBe(skillContent);
+		expect(activated.manifest.artifacts.filter((artifact) => artifact.kind === "skill")).toEqual(
+			initial.bundle.manifest.artifacts.filter((artifact) => artifact.kind === "skill"),
+		);
+	});
+
 	it("rejects a partial batch without publishing any mutation", async () => {
 		const { harnessState, initial, initialMemory, snapshot, writer } = await fixture();
 		const selectedBatch = batch(snapshot, [
@@ -710,7 +770,7 @@ describe("evolution memory writer", () => {
 		expect((await harnessState.loadCurrent()).state.memory).toBe(initialMemory);
 	});
 
-	it("branches from the frozen base when another harness is selected before writing", async () => {
+	it("stages from the frozen base but rejects activation after the selected revision changes", async () => {
 		const { harnessState, snapshot, writer } = await fixture();
 		const selectedBatch = batch(snapshot, [
 			{
@@ -735,14 +795,25 @@ describe("evolution memory writer", () => {
 			idempotencyKey: "write-frozen-base",
 			lease: writerLease,
 		});
-		const activation = await writer.activate(selectedBatch, writeResult, {
-			idempotencyKey: "activate-frozen-base",
-			lease: writerLease,
+		await expect(
+			writer.activate(selectedBatch, writeResult, {
+				idempotencyKey: "activate-frozen-base",
+				lease: writerLease,
+			}),
+		).rejects.toMatchObject({
+			message: "Harness revision changed before evolution activation",
+			reasonCode: "harness-base-conflict",
+			retryable: false,
+			diagnostics: {
+				expectedHarnessVersion: snapshot.harnessVersion,
+				actualHarnessVersion: competing.bundle.manifest.version,
+			},
 		});
 
 		expect(await harnessState.loadCurrent()).toEqual(competing.bundle);
-		if (activation.resultingHarnessVersion === null) throw new Error("Expected an evolved harness version");
-		const evolved = await harnessState.loadVersion(activation.resultingHarnessVersion);
+		const evolvedVersion = writeResult.output?.resultingHarnessVersion;
+		if (typeof evolvedVersion !== "string") throw new Error("Expected a staged evolved harness version");
+		const evolved = await harnessState.loadVersion(evolvedVersion);
 		expect(evolved.manifest.base).toBe(snapshot.harnessVersion);
 		expect(evolved.state.memory).toContain("Keep this evolution on its frozen harness base.");
 		expect(evolved.state.memory).not.toContain("Competing selected memory.");

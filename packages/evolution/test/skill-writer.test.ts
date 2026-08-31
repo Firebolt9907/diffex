@@ -27,6 +27,7 @@ import {
 	type SkillEvaluationReport,
 	SkillWriter,
 } from "../src/index.ts";
+import { synthesisRequestFixture } from "./synthesis-request-fixture.ts";
 
 const now = "2026-08-29T12:00:00.000Z";
 const scope: EvolutionScope = { repositoryId: "diffex", scopeId: "repository" };
@@ -141,7 +142,31 @@ async function writerFixture(options: WriterFixtureOptions) {
 		proposedName: options.proposedName,
 		existingSkillIds,
 		sourceLessonIds: ["lesson-1"],
-		sourceProceduralObservationIds: [],
+		provenanceBindings: [
+			{
+				sourceLessonId: "lesson-1",
+				supportingEvidenceIds: ["evidence-1"],
+				contradictingEvidenceIds: [],
+				materialFields: [
+					"operation",
+					"proposedName",
+					"existingSkillIds",
+					"skillability",
+					"trigger.description",
+					"trigger.positiveExamples",
+					"trigger.negativeExamples",
+					"preconditions",
+					"procedure.steps",
+					"procedure.requiredTools",
+					"procedure.environment",
+					"failureHandling",
+					"applicabilityBoundaries",
+					"verificationContract.checks",
+					"verificationContract.completionCondition",
+					"memoryRelationship",
+				] as const,
+			},
+		],
 		supportingEvidenceIds: ["evidence-1"],
 		contradictingEvidenceIds: [],
 		supportingTraceIds: ["trace-1"],
@@ -163,6 +188,13 @@ async function writerFixture(options: WriterFixtureOptions) {
 		applicabilityBoundaries: ["Fixture repositories only."],
 		verificationContract: { checks: ["The fixture passes."], completionCondition: "The fixture is complete." },
 		memoryRelationship,
+		capsuleSize: {
+			serialization: "canonical-json-utf8-v1" as const,
+			serializedBytes: 2_048,
+			estimatedTokens: 512,
+			maxSerializedBytes: 65_536,
+			maxEstimatedTokens: 16_384,
+		},
 	};
 	const candidate: SkillCandidate = {
 		metadata: metadata(candidateBody.candidateId, candidateBody.sourceLessonIds, candidateBody),
@@ -185,6 +217,7 @@ async function writerFixture(options: WriterFixtureOptions) {
 			contentDigest: existingSkills[index]?.contentHash ?? `sha256:${"9".repeat(64)}`,
 		})),
 		repositoryInstructionDigests: [],
+		synthesisRequest: synthesisRequestFixture,
 		operation: options.operation,
 		proposedName: options.proposedName,
 		existingSkillIds,
@@ -283,6 +316,10 @@ async function writerFixture(options: WriterFixtureOptions) {
 	};
 	const group: SkillCandidateGroup = {
 		groupId: draft.groupId,
+		canonicalCapsule: {
+			artifactId: "skill-candidate-group-capsule-1",
+			contentDigest: `sha256:${"9".repeat(64)}`,
+		},
 		profile: {
 			workspace: { repositoryId: workspace.repositoryId, directoryId: workspace.directoryId, evolutionScope: scope },
 			existingSkillIds,

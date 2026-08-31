@@ -19,6 +19,7 @@ import {
 	type SkillEvaluationSelectionInput,
 	type SkillEvaluationVerifier,
 } from "../src/index.ts";
+import { synthesisRequestFixture } from "./synthesis-request-fixture.ts";
 
 const createdAt = "2026-08-25T12:00:00.000Z";
 const scope: EvolutionScope = { repositoryId: "diffex", scopeId: "repository" };
@@ -63,7 +64,31 @@ function candidate(candidateId: string, lineageId: string, traceId: string): Ski
 		proposedName: "focused-verification",
 		existingSkillIds: [],
 		sourceLessonIds: [`lesson-${candidateId}`],
-		sourceProceduralObservationIds: [],
+		provenanceBindings: [
+			{
+				sourceLessonId: `lesson-${candidateId}`,
+				supportingEvidenceIds: [`evidence-${candidateId}`],
+				contradictingEvidenceIds: [],
+				materialFields: [
+					"operation",
+					"proposedName",
+					"existingSkillIds",
+					"skillability",
+					"trigger.description",
+					"trigger.positiveExamples",
+					"trigger.negativeExamples",
+					"preconditions",
+					"procedure.steps",
+					"procedure.requiredTools",
+					"procedure.environment",
+					"failureHandling",
+					"applicabilityBoundaries",
+					"verificationContract.checks",
+					"verificationContract.completionCondition",
+					"memoryRelationship",
+				] as const,
+			},
+		],
 		supportingEvidenceIds: [`evidence-${candidateId}`],
 		contradictingEvidenceIds: [],
 		supportingTraceIds: [traceId],
@@ -91,6 +116,13 @@ function candidate(candidateId: string, lineageId: string, traceId: string): Ski
 			classification: "independent" as const,
 			memoryProposalIds: [],
 			rationale: "The procedure is independent.",
+		},
+		capsuleSize: {
+			serialization: "canonical-json-utf8-v1" as const,
+			serializedBytes: 2_048,
+			estimatedTokens: 512,
+			maxSerializedBytes: 65_536,
+			maxEstimatedTokens: 16_384,
 		},
 	};
 	return { metadata: metadata(candidateId, content.sourceLessonIds, content), ...content };
@@ -153,6 +185,7 @@ function fixture(
 		sourceTraceIds: ["trace-a", "trace-b"],
 		sourceSkillVersions: [],
 		repositoryInstructionDigests: [],
+		synthesisRequest: synthesisRequestFixture,
 		operation: "CREATE" as const,
 		proposedName: "focused-verification",
 		existingSkillIds: [],
@@ -187,6 +220,10 @@ function fixture(
 	const validationReference = reference(validation);
 	const group: SkillCandidateGroup = {
 		groupId: "group-1",
+		canonicalCapsule: {
+			artifactId: "skill-candidate-group-capsule-1",
+			contentDigest: `sha256:${"9".repeat(64)}`,
+		},
 		profile: {
 			workspace: { repositoryId: "diffex", directoryId: "directory-1", evolutionScope: scope },
 			existingSkillIds: [],

@@ -6,6 +6,7 @@ import { computeHarnessSkillId, HarnessStateStore } from "@earendil-works/diffex
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type EvolutionControlService,
+	type EvolutionModelLimits,
 	type EvolutionModelRequest,
 	type EvolutionScope,
 	EvolutionToolDeniedError,
@@ -27,6 +28,28 @@ import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createSkill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
+
+function synthesisRequestBudget(limits: EvolutionModelLimits) {
+	return {
+		maxOutputTokens: limits.maxOutputTokens,
+		requestDiagnostics: {
+			serialization: "canonical-json-utf8-v1" as const,
+			serializedBytes: 1,
+			estimatedTokens: 1,
+			inputSerializedBytes: 1,
+			inputEstimatedTokens: 1,
+			contextWindow: limits.contextWindow,
+			maxOutputTokens: limits.maxOutputTokens,
+			schemaEstimatedTokens: 1,
+			protocolOverheadTokens: 1,
+			safetyMarginTokens: 1,
+			inputBudgetTokens: 1,
+			schemaDigest: `sha256:${"1".repeat(64)}`,
+			capsuleDigest: `sha256:${"2".repeat(64)}`,
+			requestDigest: `sha256:${"3".repeat(64)}`,
+		},
+	};
+}
 
 function materializedInvocation(traceId: string, sessionPath: string): MaterializedInvocation {
 	return {
@@ -672,6 +695,12 @@ describe("coding-agent evolution runtime", () => {
 			async waitUntilBackgroundAllowed() {},
 		});
 		const model = harness.getModel();
+		const limits = executor.getModelLimits({
+			provider: model.provider,
+			model: model.id,
+			configurationDigest: `sha256:${"1".repeat(64)}`,
+		});
+		expect(limits).toEqual({ contextWindow: model.contextWindow, maxOutputTokens: model.maxTokens });
 
 		await expect(
 			executor.execute({
@@ -686,6 +715,7 @@ describe("coding-agent evolution runtime", () => {
 				input: {},
 				outputSchema: { type: "object" },
 				tools: [],
+				...synthesisRequestBudget(limits),
 			}),
 		).rejects.toMatchObject({
 			name: "EvolutionExecutionError",
@@ -697,6 +727,54 @@ describe("coding-agent evolution runtime", () => {
 				providerError: "Provider returned error: 503 service unavailable",
 			},
 		});
+	});
+
+	it("uses the resolved runtime model output limit for synthesis", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const model = harness.getModel();
+		let maxTokens: number | undefined;
+		const response = fauxAssistantMessage(fauxToolCall("submit_evolution_response", { complete: true }), {
+			stopReason: "toolUse",
+		});
+		const modelRuntime = {
+			getModel() {
+				return model;
+			},
+			streamSimple(_model: unknown, _context: unknown, options?: { maxTokens?: number }) {
+				maxTokens = options?.maxTokens;
+				return {
+					[Symbol.asyncIterator]() {
+						return {
+							next: async () => ({ done: false as const, value: { type: "done" as const, message: response } }),
+						};
+					},
+				};
+			},
+		} as unknown as ModelRuntime;
+		const executor = new CodingAgentEvolutionModelExecutor(harness.session, modelRuntime, {
+			async waitUntilBackgroundAllowed() {},
+		});
+		const modelIdentity = {
+			provider: model.provider,
+			model: model.id,
+			configurationDigest: `sha256:${"1".repeat(64)}`,
+		};
+		const limits = executor.getModelLimits(modelIdentity);
+
+		await expect(
+			executor.execute({
+				stage: "skill-synthesizer",
+				model: modelIdentity,
+				promptVersion: "skill-synthesizer-v1",
+				idempotencyKey: "bounded-synthesis-output",
+				input: {},
+				outputSchema: { type: "object" },
+				tools: [],
+				...synthesisRequestBudget(limits),
+			}),
+		).resolves.toMatchObject({ output: { complete: true } });
+		expect(maxTokens).toBe(model.maxTokens);
 	});
 
 	it("classifies deterministic provider stops as non-retryable", async () => {
@@ -712,6 +790,11 @@ describe("coding-agent evolution runtime", () => {
 			async waitUntilBackgroundAllowed() {},
 		});
 		const model = harness.getModel();
+		const limits = executor.getModelLimits({
+			provider: model.provider,
+			model: model.id,
+			configurationDigest: `sha256:${"1".repeat(64)}`,
+		});
 
 		await expect(
 			executor.execute({
@@ -726,6 +809,7 @@ describe("coding-agent evolution runtime", () => {
 				input: {},
 				outputSchema: { type: "object" },
 				tools: [],
+				...synthesisRequestBudget(limits),
 			}),
 		).rejects.toMatchObject({
 			name: "EvolutionExecutionError",
@@ -750,6 +834,11 @@ describe("coding-agent evolution runtime", () => {
 			async waitUntilBackgroundAllowed() {},
 		});
 		const model = harness.getModel();
+		const limits = executor.getModelLimits({
+			provider: model.provider,
+			model: model.id,
+			configurationDigest: `sha256:${"1".repeat(64)}`,
+		});
 
 		await expect(
 			executor.execute({
@@ -764,6 +853,7 @@ describe("coding-agent evolution runtime", () => {
 				input: {},
 				outputSchema: { type: "object" },
 				tools: [],
+				...synthesisRequestBudget(limits),
 			}),
 		).rejects.toMatchObject({
 			name: "EvolutionExecutionError",

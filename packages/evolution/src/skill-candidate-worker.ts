@@ -24,12 +24,12 @@ import type {
 	EvolutionClock,
 	EvolutionJobStore,
 	EvolutionLeaseStore,
-	EvolutionModelExecutor,
 	InteractivePriorityGate,
 	SkillCandidateRegistry,
 	SkillCandidateRegistryStore,
 	SkillDraftValidator,
 	SkillEvaluator,
+	SkillSynthesisModelExecutor,
 	SkillSynthesizer,
 } from "./ports.ts";
 import { computeEvolutionContentDigest, createEvolutionArtifactMetadata } from "./provenance.ts";
@@ -47,8 +47,6 @@ export interface PollingSkillCandidateWorkSourceDependencies {
 	readonly clock: EvolutionClock;
 	readonly jobs: EvolutionJobStore;
 	readonly store: SkillCandidateRegistryStore;
-	readonly registry: SkillCandidateRegistry;
-	readonly evaluatorAvailable: boolean;
 }
 
 export interface PollingSkillCandidateWorkSourceOptions {
@@ -71,7 +69,7 @@ export interface SkillCandidateRegistryWorkerDependencies {
 	readonly synthesizer: SkillSynthesizer;
 	readonly validator: SkillDraftValidator;
 	readonly evaluator?: SkillEvaluator;
-	readonly model: EvolutionModelExecutor;
+	readonly model: SkillSynthesisModelExecutor;
 }
 
 export interface SkillCandidateRegistryWorkerOptions {
@@ -181,66 +179,8 @@ function latestWorkEvent(events: readonly SkillCandidateWorkEvent[]): SkillCandi
 	);
 }
 
-function latestLegacySynthesisFailure(
-	events: readonly SkillCandidateWorkEvent[],
-): SkillCandidateWorkFailedEvent | null {
-	const latestCompletedSequence = events.reduce(
-		(latest, event) =>
-			event.type === "skill-candidate-work-checkpointed" && event.stage === "completed"
-				? Math.max(latest, event.registrySequence)
-				: latest,
-		0,
-	);
-	return events.reduce<SkillCandidateWorkFailedEvent | null>((latest, event) => {
-		if (
-			event.type !== "skill-candidate-work-failed" ||
-			event.retryNotBefore !== null ||
-			event.diagnostics !== undefined ||
-			event.registrySequence < latestCompletedSequence
-		) {
-			return latest;
-		}
-		return latest === null || event.registrySequence > latest.registrySequence ? event : latest;
-	}, null);
-}
-
-function legacySynthesisGroupIds(events: readonly SkillCandidateWorkEvent[]): ReadonlySet<string> | null {
-	const failure = latestLegacySynthesisFailure(events);
-	if (failure === null) return null;
-	const checkpoint = events.reduce<SkillCandidateWorkCheckpointedEvent | null>((latest, event) => {
-		if (
-			event.type !== "skill-candidate-work-checkpointed" ||
-			event.stage !== "synthesizing" ||
-			event.registrySequence >= failure.registrySequence
-		) {
-			return latest;
-		}
-		return latest === null || event.registrySequence > latest.registrySequence ? event : latest;
-	}, null);
-	return checkpoint === null ? null : new Set(checkpoint.groupIds);
-}
-
-function evaluationGroupIds(events: readonly SkillCandidateWorkEvent[]): ReadonlySet<string> {
-	return new Set(
-		events.flatMap((event) =>
-			event.type === "skill-candidate-work-checkpointed" && event.stage === "evaluating" ? event.groupIds : [],
-		),
-	);
-}
-
-function hasAwaitingEvaluation(
-	events: readonly SkillCandidateWorkEvent[],
-	groups: readonly SkillCandidateGroup[],
-): boolean {
-	const groupIds = evaluationGroupIds(events);
-	return (
-		groupIds.size > 0 &&
-		groups.some(
-			(group) =>
-				groupIds.has(group.groupId) &&
-				(group.state === "structurally-valid" || group.state === "evaluation-pending"),
-		)
-	);
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isInputSnapshot(artifact: EvolutionArtifact): artifact is EvolutionInputSnapshot {
@@ -283,6 +223,33 @@ function errorDiagnostic(error: unknown): SkillCandidateWorkErrorDiagnostic {
 	};
 }
 
+function knownOversizedModelLimits(
+	events: readonly SkillCandidateRegistryEvent[],
+	synthesisIdempotencyKey: string,
+): { readonly contextWindow: number; readonly maxOutputTokens: number } | null {
+	for (const event of [...events].reverse()) {
+		if (event.type !== "skill-candidate-work-failed") continue;
+		const diagnostic = event.diagnostics?.find(
+			(item) =>
+				item.synthesisIdempotencyKey === synthesisIdempotencyKey &&
+				item.error.reasonCode === "skill-synthesis-request-too-large",
+		);
+		if (diagnostic === undefined || !isRecord(diagnostic.error.diagnostics)) continue;
+		const request = diagnostic.error.diagnostics.request;
+		if (
+			!isRecord(request) ||
+			typeof request.contextWindow !== "number" ||
+			!Number.isSafeInteger(request.contextWindow) ||
+			typeof request.maxOutputTokens !== "number" ||
+			!Number.isSafeInteger(request.maxOutputTokens)
+		) {
+			continue;
+		}
+		return { contextWindow: request.contextWindow, maxOutputTokens: request.maxOutputTokens };
+	}
+	return null;
+}
+
 function synthesisAttemptCount(
 	events: readonly SkillCandidateRegistryEvent[],
 	synthesisIdempotencyKey: string,
@@ -291,7 +258,11 @@ function synthesisAttemptCount(
 		(count, event) =>
 			event.type === "skill-candidate-work-failed" &&
 			event.stage === "synthesizing" &&
-			event.diagnostics?.some((diagnostic) => diagnostic.synthesisIdempotencyKey === synthesisIdempotencyKey)
+			event.diagnostics?.some(
+				(diagnostic) =>
+					diagnostic.synthesisIdempotencyKey === synthesisIdempotencyKey &&
+					diagnostic.error.reasonCode !== "skill-synthesis-request-too-large",
+			)
 				? count + 1
 				: count,
 		0,
@@ -331,8 +302,6 @@ class SkillCandidateWorkStageError extends AggregateError {
 export class PollingSkillCandidateWorkSource {
 	readonly #dependencies: PollingSkillCandidateWorkSourceDependencies;
 	readonly #pollIntervalMs: number;
-	readonly #legacySynthesisJobIds = new Set<string>();
-	readonly #legacyEvaluationJobIds = new Set<string>();
 
 	constructor(
 		dependencies: PollingSkillCandidateWorkSourceDependencies,
@@ -352,53 +321,6 @@ export class PollingSkillCandidateWorkSource {
 			);
 	}
 
-	async reconcileLegacyWork(signal?: AbortSignal): Promise<void> {
-		signal?.throwIfAborted();
-		this.#legacySynthesisJobIds.clear();
-		this.#legacyEvaluationJobIds.clear();
-		const scopeStates = new Map<
-			string,
-			{
-				readonly events: readonly SkillCandidateRegistryEvent[];
-				readonly groups: readonly SkillCandidateGroup[];
-			}
-		>();
-		for (const job of await this.#candidateJobs()) {
-			signal?.throwIfAborted();
-			const scopeKey = `${job.metadata.scope.repositoryId}\u0000${job.metadata.scope.scopeId}`;
-			let scopeState = scopeStates.get(scopeKey);
-			if (scopeState === undefined) {
-				const [snapshot, groups] = await Promise.all([
-					this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope),
-					this.#dependencies.registry.list(job.metadata.scope),
-				]);
-				scopeState = { events: snapshot.events, groups };
-				scopeStates.set(scopeKey, scopeState);
-			}
-			const events = workEvents(scopeState.events, job.jobId);
-			const terminal = latestWorkEvent(events);
-			const recoveryGroupIds = legacySynthesisGroupIds(events);
-			if (
-				terminal?.type === "skill-candidate-work-failed" &&
-				terminal === latestLegacySynthesisFailure(events) &&
-				recoveryGroupIds !== null &&
-				scopeState.groups.some(
-					(group) => recoveryGroupIds.has(group.groupId) && group.state === "evidence-qualified",
-				)
-			) {
-				this.#legacySynthesisJobIds.add(job.jobId);
-			}
-			if (
-				!this.#dependencies.evaluatorAvailable &&
-				terminal?.type === "skill-candidate-work-checkpointed" &&
-				terminal.stage === "completed" &&
-				hasAwaitingEvaluation(events, scopeState.groups)
-			) {
-				this.#legacyEvaluationJobIds.add(job.jobId);
-			}
-		}
-	}
-
 	async nextRunnableJob(now: string, signal?: AbortSignal): Promise<string | null> {
 		signal?.throwIfAborted();
 		const nowMs = Date.parse(now);
@@ -407,25 +329,9 @@ export class PollingSkillCandidateWorkSource {
 			const snapshot = await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope);
 			const events = workEvents(snapshot.events, job.jobId);
 			const terminal = latestWorkEvent(events);
-			if (terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed") {
-				const awaitingEvaluation = hasAwaitingEvaluation(
-					events,
-					await this.#dependencies.registry.list(job.metadata.scope),
-				);
-				if (
-					!awaitingEvaluation ||
-					(!this.#dependencies.evaluatorAvailable && !this.#legacyEvaluationJobIds.has(job.jobId))
-				) {
-					continue;
-				}
-			}
+			if (terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed") continue;
 			if (terminal?.type === "skill-candidate-work-failed") {
-				if (
-					terminal.retryNotBefore === null &&
-					!(terminal.diagnostics === undefined && this.#legacySynthesisJobIds.has(job.jobId))
-				) {
-					continue;
-				}
+				if (terminal.retryNotBefore === null) continue;
 				if (terminal.retryNotBefore !== null && Date.parse(terminal.retryNotBefore) > nowMs) continue;
 			}
 			signal?.throwIfAborted();
@@ -668,6 +574,25 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		}
 	}
 
+	async #isKnownOversizedRequest(
+		group: SkillCandidateGroup,
+		events: readonly SkillCandidateRegistryEvent[],
+	): Promise<boolean> {
+		const knownLimits = knownOversizedModelLimits(events, group.synthesisIdempotencyKey);
+		if (knownLimits === null) return false;
+		const latestRevision = group.proposalRevisions.at(-1);
+		if (latestRevision === undefined) return false;
+		const sourceJob = await this.#dependencies.jobs.load(latestRevision.sourceEvolutionJobId);
+		if (sourceJob === null) return false;
+		const sourceInput = await this.#dependencies.artifacts.get(sourceJob.inputSnapshot);
+		if (!isInputSnapshot(sourceInput)) return false;
+		const currentLimits = this.#dependencies.model.getModelLimits(sourceInput.modelConfiguration);
+		return (
+			currentLimits.contextWindow === knownLimits.contextWindow &&
+			currentLimits.maxOutputTokens === knownLimits.maxOutputTokens
+		);
+	}
+
 	async #processClaimed(
 		sourceEvolutionJobId: string,
 		claim: () => EvolutionLeaseToken,
@@ -685,31 +610,12 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		const registryEvents = (await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope)).events;
 		const history = workEvents(registryEvents, job.jobId);
 		const terminal = latestWorkEvent(history);
-		if (
-			terminal?.type === "skill-candidate-work-checkpointed" &&
-			terminal.stage === "completed" &&
-			this.#dependencies.evaluator === undefined &&
-			!hasAwaitingEvaluation(history, await this.#dependencies.registry.list(job.metadata.scope))
-		) {
-			return;
-		}
+		if (terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed") return;
 		const failures = history.filter(
 			(event): event is SkillCandidateWorkFailedEvent => event.type === "skill-candidate-work-failed",
 		);
-		const latestLegacyFailure = failures.reduce<SkillCandidateWorkFailedEvent | null>(
-			(latest, failure) =>
-				failure.diagnostics === undefined && (latest === null || failure.registrySequence > latest.registrySequence)
-					? failure
-					: latest,
-			null,
-		);
-		const retryAttempt =
-			failures.filter(
-				(failure) =>
-					latestLegacyFailure === null || failure.registrySequence > latestLegacyFailure.registrySequence,
-			).length + 1;
+		const retryAttempt = failures.length + 1;
 		const attempt = failures.reduce((highest, failure) => Math.max(highest, failure.attempt), 0) + 1;
-		const recoveryGroupIds = legacySynthesisGroupIds(history);
 
 		let activeStage: SkillCandidateWorkStage = "consolidating";
 		let activeGroupId: string | null = null;
@@ -759,11 +665,12 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			];
 			activeStage = "scoring";
 			await this.#appendCheckpoint(job, activeStage, attempt, processedGroupIds, claim());
-			const synthesisTargets = result.groups.filter(
-				(group) =>
-					group.state === "evidence-qualified" &&
-					(recoveryGroupIds === null || recoveryGroupIds.has(group.groupId)),
-			);
+			const synthesisTargets: SkillCandidateGroup[] = [];
+			for (const group of result.groups) {
+				if (group.state === "evidence-qualified" && !(await this.#isKnownOversizedRequest(group, registryEvents))) {
+					synthesisTargets.push(group);
+				}
+			}
 			activeStage = "synthesizing";
 			await this.#appendCheckpoint(
 				job,
@@ -780,6 +687,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				readonly error: unknown;
 				readonly attempt: number;
 				readonly retryPending: boolean;
+				readonly parked: boolean;
 				readonly reasonCode: "skill-synthesis-attempts-exhausted" | "skill-synthesis-non-retryable";
 			}[] = [];
 			for (const group of synthesisTargets) {
@@ -799,6 +707,9 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					} catch (error) {
 						signal.throwIfAborted();
 						const synthesisAttempt = synthesisAttemptCount(registryEvents, group.synthesisIdempotencyKey) + 1;
+						const parked =
+							error instanceof EvolutionExecutionError &&
+							error.reasonCode === "skill-synthesis-request-too-large";
 						const retryable = error instanceof EvolutionExecutionError && error.retryable;
 						synthesisFailures.push({
 							groupId: group.groupId,
@@ -806,7 +717,8 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 							idempotencyKey: group.synthesisIdempotencyKey,
 							error,
 							attempt: synthesisAttempt,
-							retryPending: retryable && synthesisAttempt < this.#maxAttempts,
+							retryPending: !parked && retryable && synthesisAttempt < this.#maxAttempts,
+							parked,
 							reasonCode: retryable ? "skill-synthesis-attempts-exhausted" : "skill-synthesis-non-retryable",
 						});
 						continue;
@@ -826,7 +738,9 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				);
 			}
 			activeGroupId = null;
-			const terminalSynthesisFailures = synthesisFailures.filter((failure) => !failure.retryPending);
+			const terminalSynthesisFailures = synthesisFailures.filter(
+				(failure) => !failure.parked && !failure.retryPending,
+			);
 			if (terminalSynthesisFailures.length > 0) {
 				await this.#dependencies.registry.recordSynthesisFailures({
 					scope: job.metadata.scope,
@@ -962,8 +876,9 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				}
 			}
 			activeGroupId = null;
-			if (synthesisFailures.length > 0) {
-				const retryableFailures = synthesisFailures.filter((failure) => failure.retryPending);
+			const activeSynthesisFailures = synthesisFailures.filter((failure) => !failure.parked);
+			if (activeSynthesisFailures.length > 0) {
+				const retryableFailures = activeSynthesisFailures.filter((failure) => failure.retryPending);
 				throw new SkillCandidateWorkStageError(
 					"synthesizing",
 					synthesisFailures.map((failure) => ({
@@ -971,11 +886,44 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 						synthesisIdempotencyKey: failure.idempotencyKey,
 						error: failure.error,
 					})),
-					`Skill synthesis failed for candidate groups: ${synthesisFailures.map((failure) => failure.groupId).join(", ")}`,
+					`Skill synthesis failed for candidate groups: ${activeSynthesisFailures
+						.map((failure) => failure.groupId)
+						.join(", ")}`,
 					{
 						retryable: retryableFailures.length > 0,
 						retryAttempt: Math.max(1, ...retryableFailures.map((failure) => failure.attempt)),
 					},
+				);
+			}
+			const parkedSynthesisFailures = synthesisFailures.filter((failure) => failure.parked);
+			if (parkedSynthesisFailures.length > 0) {
+				const parkedError = new SkillCandidateWorkStageError(
+					"synthesizing",
+					parkedSynthesisFailures.map((failure) => ({
+						groupId: failure.groupId,
+						synthesisIdempotencyKey: failure.idempotencyKey,
+						error: failure.error,
+					})),
+					`Skill synthesis deferred for oversized candidate groups: ${parkedSynthesisFailures
+						.map((failure) => failure.groupId)
+						.join(", ")}`,
+					{ retryable: false, retryAttempt: 1 },
+				);
+				await this.#appendFailure(
+					job,
+					attempt,
+					1,
+					false,
+					"synthesizing",
+					parkedError.failures.map((failure) => ({
+						groupId: failure.groupId,
+						...(failure.synthesisIdempotencyKey === undefined
+							? {}
+							: { synthesisIdempotencyKey: failure.synthesisIdempotencyKey }),
+						error: errorDiagnostic(failure.error),
+					})),
+					parkedError,
+					claim(),
 				);
 			}
 			activeStage = "completed";

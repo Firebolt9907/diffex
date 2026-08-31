@@ -41,6 +41,7 @@ import {
 	type SkillEvaluatorInput,
 	type SkillSynthesizerInput,
 } from "../src/index.ts";
+import { synthesisRequestFixture } from "./synthesis-request-fixture.ts";
 
 const now = "2026-08-25T12:00:00.000Z";
 const harnessVersion = `sha256:${"2".repeat(64)}`;
@@ -163,6 +164,10 @@ function transientSynthesisError(message = "temporary provider failure"): Evolut
 function qualifiedGroup(candidateReference: EvolutionArtifactReference): SkillCandidateGroup {
 	return {
 		groupId: "group-qualified",
+		canonicalCapsule: {
+			artifactId: "skill-candidate-group-capsule-qualified",
+			contentDigest: `sha256:${"9".repeat(64)}`,
+		},
 		profile: {
 			workspace: { repositoryId: "diffex", directoryId: "directory-1", evolutionScope: scope },
 			existingSkillIds: [],
@@ -267,43 +272,6 @@ class MemoryRegistryStore implements SkillCandidateRegistryStore {
 		this.events.push(...events);
 		return "committed";
 	}
-}
-
-function workCheckpoint(
-	registrySequence: number,
-	stage: "synthesizing" | "evaluating" | "completed",
-	groupIds: readonly string[],
-	attempt = 3,
-): SkillCandidateRegistryEvent {
-	const content = {
-		schemaVersion: 1 as const,
-		eventId: `work-checkpoint-${registrySequence}`,
-		registrySequence,
-		type: "skill-candidate-work-checkpointed" as const,
-		workId: "work-job-1",
-		sourceEvolutionJobId: "job-1",
-		stage,
-		idempotencyKey: `work-checkpoint-${stage}`,
-		attempt,
-		groupIds,
-	};
-	return { metadata: metadata(content.eventId, [content.sourceEvolutionJobId, ...groupIds], content), ...content };
-}
-
-function legacyWorkFailure(registrySequence: number, attempt = 3): SkillCandidateRegistryEvent {
-	const content = {
-		schemaVersion: 1 as const,
-		eventId: `legacy-work-failure-${registrySequence}`,
-		registrySequence,
-		type: "skill-candidate-work-failed" as const,
-		workId: "work-job-1",
-		sourceEvolutionJobId: "job-1",
-		idempotencyKey: `legacy-work-failure-${attempt}`,
-		attempt,
-		message: "legacy synthesis failed",
-		retryNotBefore: null,
-	};
-	return { metadata: metadata(content.eventId, [content.sourceEvolutionJobId], content), ...content };
 }
 
 class CompletionAcknowledgementLostStore extends MemoryRegistryStore {
@@ -512,6 +480,7 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 	const validationRequests: SkillDraftValidatorInput[] = [];
 	const evaluationRequests: SkillEvaluatorInput[] = [];
 	let clockTime = now;
+	let modelLimits = { contextWindow: 128_000, maxOutputTokens: 16_384 };
 	const clock = { now: () => clockTime };
 	return {
 		job,
@@ -525,6 +494,9 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 		clock,
 		setClock(value: string) {
 			clockTime = value;
+		},
+		setModelLimits(value: typeof modelLimits) {
+			modelLimits = value;
 		},
 		worker: new SkillCandidateRegistryWorker({
 			version: "1",
@@ -551,6 +523,7 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 						sourceTraceIds: [],
 						sourceSkillVersions: [],
 						repositoryInstructionDigests: [],
+						synthesisRequest: synthesisRequestFixture,
 						operation: "CREATE" as const,
 						proposedName: "fixture-skill",
 						existingSkillIds: [],
@@ -663,6 +636,7 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 				: {}),
 			model: {
 				maxProviderCallsPerExecution: 20,
+				getModelLimits: () => modelLimits,
 				execute: () => Promise.reject(new Error("Fixture synthesizer does not call the model")),
 			},
 		}),
@@ -676,8 +650,6 @@ describe("skill candidate registry worker", () => {
 			clock: data.clock,
 			jobs: data.jobs,
 			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: false,
 		});
 
 		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
@@ -750,8 +722,6 @@ describe("skill candidate registry worker", () => {
 			clock: data.clock,
 			jobs: data.jobs,
 			store,
-			registry: data.registry,
-			evaluatorAvailable: false,
 		});
 		expect(await source.nextRunnableJob(now)).toBeNull();
 	});
@@ -792,7 +762,7 @@ describe("skill candidate registry worker", () => {
 		]);
 	});
 
-	it("continues processing later candidates when one synthesis fails", async () => {
+	it("isolates three synthesis inputs while parking an oversized group", async () => {
 		const data = fixture(true);
 		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
 		if (candidateReference === undefined) throw new Error("Expected candidate reference");
@@ -812,38 +782,49 @@ describe("skill candidate registry worker", () => {
 				validationIdempotencyKey: "skill-validation-succeeding",
 				evaluationIdempotencyKey: "skill-evaluation-succeeding",
 			},
+			{
+				...group,
+				groupId: "group-third",
+				synthesisIdempotencyKey: "skill-synthesis-third",
+				validationIdempotencyKey: "skill-validation-third",
+				evaluationIdempotencyKey: "skill-evaluation-third",
+			},
 		);
-		const providerError = new Error("Provider rejected the structured response");
-		providerError.name = "ProviderError";
 		data.synthesisFailures.set(
 			"group-failing",
-			new EvolutionExecutionError("Skill synthesizer failed to produce a draft", {
-				reasonCode: "skill-synthesis-invalid-response",
+			new EvolutionExecutionError("Skill synthesis request exceeds the selected model context", {
+				reasonCode: "skill-synthesis-request-too-large",
 				retryable: false,
-				cause: providerError,
-				diagnostics: { lastCorrection: "files must be an array" },
+				diagnostics: { request: { ...synthesisRequestFixture } },
 			}),
 		);
 
-		await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
-			"Skill synthesis failed for candidate groups: group-failing",
-		);
+		await expect(data.worker.process(data.job.jobId)).resolves.toBe("processed");
 
 		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
 			"group-failing",
 			"group-succeeding",
+			"group-third",
 		]);
-		expect(data.validationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
-		expect(data.evaluationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
+		expect(data.validationRequests.map((request) => request.group.groupId)).toEqual([
+			"group-succeeding",
+			"group-third",
+		]);
+		expect(data.evaluationRequests.map((request) => request.group.groupId)).toEqual([
+			"group-succeeding",
+			"group-third",
+		]);
 		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-failing")).toMatchObject({
-			state: "synthesis-failed",
-			dispositionHistory: [expect.objectContaining({ reasonCodes: ["skill-synthesis-non-retryable"] })],
+			state: "evidence-qualified",
+			dispositionHistory: [],
 		});
-		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-succeeding")?.state).toBe(
-			"accepted",
-		);
+		for (const groupId of ["group-succeeding", "group-third"]) {
+			expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === groupId)?.state).toBe(
+				"accepted",
+			);
+		}
 		expect(data.store.events.find((event) => event.type === "skill-candidate-work-failed")).toMatchObject({
-			message: "Skill synthesis failed for candidate groups: group-failing",
+			message: "Skill synthesis deferred for oversized candidate groups: group-failing",
 			stage: "synthesizing",
 			diagnostics: [
 				{
@@ -851,11 +832,11 @@ describe("skill candidate registry worker", () => {
 					synthesisIdempotencyKey: "skill-synthesis-failing",
 					error: {
 						name: "EvolutionExecutionError",
-						message: "Skill synthesizer failed to produce a draft",
-						reasonCode: "skill-synthesis-invalid-response",
+						message: "Skill synthesis request exceeds the selected model context",
+						reasonCode: "skill-synthesis-request-too-large",
 						retryable: false,
-						diagnostics: { lastCorrection: "files must be an array" },
-						cause: { name: "ProviderError", message: "Provider rejected the structured response" },
+						diagnostics: { request: synthesisRequestFixture },
+						cause: null,
 					},
 				},
 			],
@@ -865,107 +846,31 @@ describe("skill candidate registry worker", () => {
 			data.store.events.some(
 				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
 			),
-		).toBe(false);
-	});
+		).toBe(true);
 
-	it("reconciles legacy exhausted synthesis by identity under fresh bounded retries", async () => {
-		const store = new MemoryRegistryStore([
-			workCheckpoint(1, "synthesizing", ["group-failing", "group-succeeding"]),
-			legacyWorkFailure(2),
-		]);
-		const data = fixture(true, store);
-		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
-		if (candidateReference === undefined) throw new Error("Expected candidate reference");
-		const group = qualifiedGroup(candidateReference);
-		data.registry.groups.push(
-			{
-				...group,
-				groupId: "group-failing",
-				synthesisIdempotencyKey: "skill-synthesis-failing",
-				validationIdempotencyKey: "skill-validation-failing",
-				evaluationIdempotencyKey: "skill-evaluation-failing",
-			},
-			{
-				...group,
-				groupId: "group-succeeding",
-				synthesisIdempotencyKey: "skill-synthesis-succeeding",
-				validationIdempotencyKey: "skill-validation-succeeding",
-				evaluationIdempotencyKey: "skill-evaluation-succeeding",
-			},
-			{
-				...group,
-				groupId: "group-unrelated",
-				synthesisIdempotencyKey: "skill-synthesis-unrelated",
-				validationIdempotencyKey: "skill-validation-unrelated",
-				evaluationIdempotencyKey: "skill-evaluation-unrelated",
-			},
-		);
-		data.synthesisFailures.set("group-failing", transientSynthesisError());
-		const source = new PollingSkillCandidateWorkSource({
-			clock: data.clock,
-			jobs: data.jobs,
-			store,
-			registry: data.registry,
-			evaluatorAvailable: true,
-		});
-
-		expect(await source.nextRunnableJob(now)).toBeNull();
-		await source.reconcileLegacyWork();
-		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
-
-		for (let retryAttempt = 1; retryAttempt <= 3; retryAttempt += 1) {
-			await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
-				"Skill synthesis failed for candidate groups: group-failing",
-			);
-			const failure = store.events.find(
-				(event) => event.type === "skill-candidate-work-failed" && event.attempt === retryAttempt + 3,
-			);
-			expect(failure).toMatchObject({ retryNotBefore: retryAttempt === 3 ? null : expect.any(String) });
-		}
-
+		const nextJob = { ...data.job, jobId: "job-oversized-retry" };
+		data.jobs.jobs.push(nextJob);
+		await data.worker.process(nextJob.jobId);
 		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
 			"group-failing",
 			"group-succeeding",
+			"group-third",
+		]);
+
+		data.setModelLimits({ contextWindow: 256_000, maxOutputTokens: 16_384 });
+		data.synthesisFailures.delete("group-failing");
+		const resumedJob = { ...data.job, jobId: "job-oversized-capability-resumed" };
+		data.jobs.jobs.push(resumedJob);
+		await data.worker.process(resumedJob.jobId);
+		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
 			"group-failing",
+			"group-succeeding",
+			"group-third",
 			"group-failing",
 		]);
-		expect(data.registry.groups).toEqual([
-			expect.objectContaining({ groupId: "group-failing", state: "synthesis-failed" }),
-			expect.objectContaining({ groupId: "group-succeeding", state: "accepted" }),
-			expect.objectContaining({ groupId: "group-unrelated", state: "evidence-qualified" }),
-		]);
-		expect(await source.nextRunnableJob(now)).toBeNull();
-	});
-
-	it("reconciles a completed checkpoint followed by a legacy synthesis failure", async () => {
-		const store = new MemoryRegistryStore([
-			workCheckpoint(1, "synthesizing", ["group-qualified"]),
-			workCheckpoint(2, "completed", ["group-qualified"]),
-			legacyWorkFailure(3),
-		]);
-		const data = fixture(false, store);
-		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
-		if (candidateReference === undefined) throw new Error("Expected candidate reference");
-		data.registry.groups.push(qualifiedGroup(candidateReference));
-		const source = new PollingSkillCandidateWorkSource({
-			clock: data.clock,
-			jobs: data.jobs,
-			store,
-			registry: data.registry,
-			evaluatorAvailable: false,
-		});
-
-		await source.reconcileLegacyWork();
-		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
-		await data.worker.process(data.job.jobId);
-
-		const completions = store.events.filter(
-			(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-failing")?.state).toBe(
+			"accepted",
 		);
-		expect(completions).toHaveLength(2);
-		expect(completions[1]?.registrySequence).toBeGreaterThan(legacyWorkFailure(3).registrySequence);
-		expect(data.registry.groups[0]?.state).toBe("accepted");
-		expect(await source.nextRunnableJob(now)).toBeNull();
 	});
 
 	it("tracks transient synthesis attempts by identity across source evolution jobs", async () => {
@@ -1061,8 +966,6 @@ describe("skill candidate registry worker", () => {
 				clock: data.clock,
 				jobs: data.jobs,
 				store: reloadedStore,
-				registry: data.registry,
-				evaluatorAvailable: true,
 			});
 			expect(await source.nextRunnableJob(now)).toBeNull();
 			const control = new EvolutionControlService({
@@ -1130,67 +1033,7 @@ describe("skill candidate registry worker", () => {
 			clock: data.clock,
 			jobs: data.jobs,
 			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: false,
 		});
-		expect(await source.nextRunnableJob(now)).toBeNull();
-	});
-
-	it("reopens legacy completed work to record skipped evaluation when no evaluator is available", async () => {
-		const data = fixture();
-		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
-		if (candidateReference === undefined) throw new Error("Expected candidate reference");
-		data.registry.groups.push(qualifiedGroup(candidateReference));
-		await data.worker.process(data.job.jobId);
-		const accepted = data.registry.groups[0];
-		if (accepted === undefined) throw new Error("Expected accepted group");
-		data.registry.groups[0] = { ...accepted, state: "structurally-valid", evaluation: null };
-		const source = new PollingSkillCandidateWorkSource({
-			clock: data.clock,
-			jobs: data.jobs,
-			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: false,
-		});
-
-		expect(await source.nextRunnableJob(now)).toBeNull();
-		await source.reconcileLegacyWork();
-		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
-		await data.worker.process(data.job.jobId);
-
-		expect(data.registry.evaluationSkipRequests).toHaveLength(2);
-		expect(data.registry.groups[0]).toMatchObject({
-			state: "accepted",
-			evaluation: null,
-			dispositionHistory: expect.arrayContaining([
-				expect.objectContaining({ reasonCodes: ["retrieval-and-behavior-evaluation-skipped"] }),
-			]),
-		});
-		expect(await source.nextRunnableJob(now)).toBeNull();
-	});
-
-	it("reopens legacy completed work when its evaluator becomes available", async () => {
-		const data = fixture(true);
-		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
-		if (candidateReference === undefined) throw new Error("Expected candidate reference");
-		data.registry.groups.push(qualifiedGroup(candidateReference));
-		await data.worker.process(data.job.jobId);
-		const accepted = data.registry.groups[0];
-		if (accepted === undefined) throw new Error("Expected accepted group");
-		data.registry.groups[0] = { ...accepted, state: "structurally-valid", evaluation: null };
-		const source = new PollingSkillCandidateWorkSource({
-			clock: data.clock,
-			jobs: data.jobs,
-			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: true,
-		});
-
-		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
-		await data.worker.process(data.job.jobId);
-
-		expect(data.evaluationRequests).toHaveLength(2);
-		expect(data.registry.groups[0]?.state).toBe("accepted");
 		expect(await source.nextRunnableJob(now)).toBeNull();
 	});
 
@@ -1230,8 +1073,6 @@ describe("skill candidate registry worker", () => {
 			clock: data.clock,
 			jobs: data.jobs,
 			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: false,
 		});
 
 		await expect(data.worker.process(data.job.jobId)).rejects.toThrow("registry unavailable");

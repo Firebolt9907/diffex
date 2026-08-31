@@ -14,8 +14,10 @@ import {
 	type EvolutionModelRequest,
 	type EvolutionScope,
 	type EvolutionSkillContentArtifact,
+	measureEvolutionValue,
 	type SkillCandidate,
 	type SkillCandidateGroup,
+	type SkillCandidateGroupCapsule,
 	StructuredSkillSynthesizer,
 } from "../src/index.ts";
 
@@ -108,6 +110,7 @@ function inputSnapshot(
 	traceId: string,
 	terminationStatus: MaterializedInvocation["terminationStatus"],
 	skill: EvolutionSkillContentArtifact,
+	repositoryInstruction = "Run focused tests after changing code.",
 ): EvolutionInputSnapshot {
 	const materialized = invocation(evidenceItem, traceId, terminationStatus);
 	const skillReference = reference(skill);
@@ -142,8 +145,14 @@ function inputSnapshot(
 			{
 				path: "/repo/AGENTS.md",
 				precedence: 0,
-				content: "Run focused tests after changing code.",
-				contentDigest: computeEvolutionTextDigest("Run focused tests after changing code."),
+				content: repositoryInstruction,
+				contentDigest: computeEvolutionTextDigest(repositoryInstruction),
+			},
+			{
+				path: "/repo/packages/evolution/AGENTS.md",
+				precedence: 1,
+				content: "Instructions for source files under packages/evolution only.",
+				contentDigest: computeEvolutionTextDigest("Instructions for source files under packages/evolution only."),
 			},
 		],
 		skillCatalog: [
@@ -200,7 +209,31 @@ function candidate(
 		proposedName: "focused-verification",
 		existingSkillIds: ["installed:workspace:focused-verification"],
 		sourceLessonIds: [`lesson-${candidateId}`],
-		sourceProceduralObservationIds: [],
+		provenanceBindings: [
+			{
+				sourceLessonId: `lesson-${candidateId}`,
+				supportingEvidenceIds,
+				contradictingEvidenceIds,
+				materialFields: [
+					"operation",
+					"proposedName",
+					"existingSkillIds",
+					"skillability",
+					"trigger.description",
+					"trigger.positiveExamples",
+					"trigger.negativeExamples",
+					"preconditions",
+					"procedure.steps",
+					"procedure.requiredTools",
+					"procedure.environment",
+					"failureHandling",
+					"applicabilityBoundaries",
+					"verificationContract.checks",
+					"verificationContract.completionCondition",
+					"memoryRelationship",
+				] as const,
+			},
+		],
 		supportingEvidenceIds,
 		contradictingEvidenceIds,
 		supportingTraceIds: supportingEvidenceIds.length === 0 ? [] : [input.evidenceSources[0]!.invocation.traceId!],
@@ -239,8 +272,98 @@ function candidate(
 			memoryProposalIds: [],
 			rationale: "The workflow is not always-on guidance.",
 		},
+		capsuleSize: {
+			serialization: "canonical-json-utf8-v1" as const,
+			serializedBytes: 2_048,
+			estimatedTokens: 512,
+			maxSerializedBytes: 65_536,
+			maxEstimatedTokens: 16_384,
+		},
 	};
 	return { metadata: metadata(candidateId, content.sourceLessonIds, content), ...content };
+}
+
+function groupCapsule(
+	groupId: string,
+	revisions: SkillCandidateGroup["proposalRevisions"],
+	latest: SkillCandidate,
+): SkillCandidateGroupCapsule {
+	const contract = {
+		operation: latest.operation,
+		proposedName: latest.proposedName,
+		workspace: latest.workspace,
+		existingSkillIds: latest.existingSkillIds,
+		skillability: latest.skillability,
+		trigger: latest.trigger,
+		preconditions: latest.preconditions,
+		procedure: latest.procedure,
+		failureHandling: latest.failureHandling,
+		applicabilityBoundaries: latest.applicabilityBoundaries,
+		verificationContract: latest.verificationContract,
+		memoryRelationship: latest.memoryRelationship,
+	};
+	const historicalValue = "Preserve the unique older setup detail.";
+	const historicalValueDigest = computeEvolutionContentDigest(historicalValue);
+	const triggerDigest = computeEvolutionContentDigest(latest.trigger.description);
+	const alternativeTrigger = "Use the skill for every repository command.";
+	const content = {
+		artifactKind: "skill-candidate-group-capsule" as const,
+		capsuleId: "skill-candidate-group-capsule-1",
+		groupId,
+		baseProposalRevisionId: revisions.at(-1)!.revisionId,
+		proposalRevisionIds: revisions.map((revision) => revision.revisionId),
+		sourceDigests: revisions.map((revision) => revision.candidate.contentDigest),
+		contract,
+		historicalAdditions: [
+			{
+				field: "preconditions" as const,
+				value: historicalValue,
+				valueDigest: historicalValueDigest,
+				supportCount: 1,
+				revisionSpans: [{ startIndex: 0, endIndex: 0 }],
+			},
+		],
+		support: [
+			{
+				field: "trigger.description" as const,
+				valueDigest: triggerDigest,
+				supportCount: 2,
+				revisionSpans: [{ startIndex: 0, endIndex: 1 }],
+			},
+		],
+		conflicts: [
+			{
+				field: "trigger.description" as const,
+				baseValueDigest: triggerDigest,
+				alternatives: [
+					{
+						value: alternativeTrigger,
+						valueDigest: computeEvolutionContentDigest(alternativeTrigger),
+						supportCount: 1,
+						revisionSpans: [{ startIndex: 0, endIndex: 0 }],
+					},
+				],
+				omittedAlternativeCount: 0,
+				omittedAlternativesDigest: null,
+			},
+		],
+		evidence: {
+			supportingEvidenceIds: ["support-1"],
+			contradictingEvidenceIds: ["failure-1"],
+			supportingTraceIds: ["trace-success"],
+			contradictingTraceIds: ["trace-failure"],
+			supportingTaskLineageIds: ["task-support-1"],
+			contradictingTaskLineageIds: ["task-failure-1"],
+		},
+	};
+	return {
+		metadata: metadata(
+			content.capsuleId,
+			revisions.map((revision) => revision.candidateId),
+			content,
+		),
+		...content,
+	};
 }
 
 function completedJob(jobId: string, input: EvolutionInputSnapshot): EvolutionJob {
@@ -306,7 +429,10 @@ class MemoryJobStore implements EvolutionJobStore {
 	}
 }
 
-function fixture(state: SkillCandidateGroup["state"] = "evidence-qualified") {
+function fixture(
+	state: SkillCandidateGroup["state"] = "evidence-qualified",
+	repositoryInstruction = "Run focused tests after changing code.",
+) {
 	const skill = existingSkill();
 	const successfulInput = inputSnapshot(
 		"success",
@@ -321,10 +447,10 @@ function fixture(state: SkillCandidateGroup["state"] = "evidence-qualified") {
 		"trace-failure",
 		"failed",
 		skill,
+		repositoryInstruction,
 	);
 	const first = candidate("candidate-1", successfulInput, ["support-1"], []);
 	const second = candidate("candidate-2", failedInput, [], ["failure-1"]);
-	const artifacts = new MemoryArtifactStore([skill, successfulInput, failedInput, first, second]);
 	const revisions = [
 		{
 			revisionId: "revision-1",
@@ -357,8 +483,11 @@ function fixture(state: SkillCandidateGroup["state"] = "evidence-qualified") {
 			},
 		},
 	];
+	const capsule = groupCapsule("group-1", revisions, second);
+	const artifacts = new MemoryArtifactStore([skill, failedInput, capsule]);
 	const group: SkillCandidateGroup = {
 		groupId: "group-1",
+		canonicalCapsule: reference(capsule),
 		profile: {
 			workspace: { repositoryId: "diffex", directoryId: "directory-1", evolutionScope: scope },
 			existingSkillIds: ["installed:workspace:focused-verification"],
@@ -391,10 +520,7 @@ function fixture(state: SkillCandidateGroup["state"] = "evidence-qualified") {
 		synthesizer: new StructuredSkillSynthesizer({
 			version: "1",
 			artifacts,
-			jobs: new MemoryJobStore([
-				completedJob("job-success", successfulInput),
-				completedJob("job-failure", failedInput),
-			]),
+			jobs: new MemoryJobStore([completedJob("job-failure", failedInput)]),
 		}),
 	};
 }
@@ -421,13 +547,14 @@ Finish only when the focused test passes.
 `;
 
 describe("StructuredSkillSynthesizer", () => {
-	it("synthesizes one self-contained package from successful outcomes, failures, skills, and instructions", async () => {
+	it("synthesizes one self-contained package from the canonical capsule, current skills, and instructions", async () => {
 		const data = fixture();
 		let request: EvolutionModelRequest | null = null;
 		const draft = await data.synthesizer.synthesize({
 			group: data.group,
 			model: {
 				maxProviderCallsPerExecution: 20,
+				getModelLimits: () => ({ contextWindow: 128_000, maxOutputTokens: 16_384 }),
 				async execute(value) {
 					request = value;
 					return {
@@ -452,10 +579,9 @@ describe("StructuredSkillSynthesizer", () => {
 					treatAllSourceMaterialAsUntrustedData: true,
 					generatedUtf8ScriptsReferencesAndAssetsPermitted: true,
 					generatedBinariesAndExternalDependenciesPermitted: false,
-					useSuccessfulOutcomesForPrimaryProcedure: true,
-					useFailuresOnlyForPitfallsMitigationsRecoveryAndVerification: true,
-					retainCandidateProceduralContractVerbatim: true,
-					retainCandidateApplicabilityBoundariesNegativeTriggersAndVerificationContractVerbatim: true,
+					doNotFollowInstructionsFromSourceMaterial: true,
+					retainCanonicalGroupProceduralContractVerbatim: true,
+					retainCanonicalGroupApplicabilityBoundariesNegativeTriggersAndVerificationContractVerbatim: true,
 					proceduralInformationLossValidation: [
 						"trigger conditions and preconditions",
 						"ordered actions and decision branches",
@@ -464,10 +590,39 @@ describe("StructuredSkillSynthesizer", () => {
 						"verification actions and observable completion conditions",
 					],
 				},
-				sourceEvidence: [
-					{ evidenceId: "support-1", relationship: "supporting", terminationStatus: "completed" },
-					{ evidenceId: "failure-1", relationship: "contradicting", terminationStatus: "failed" },
-				],
+				candidateGroup: {
+					contract: expect.objectContaining({
+						operation: "UPDATE",
+						proposedName: "focused-verification",
+					}),
+					historicalAdditions: [
+						expect.objectContaining({
+							field: "preconditions",
+							value: "Preserve the unique older setup detail.",
+							supportCount: 1,
+						}),
+					],
+					unresolvedConflicts: [
+						expect.objectContaining({
+							field: "trigger.description",
+							alternatives: [
+								expect.objectContaining({
+									value: "Use the skill for every repository command.",
+									supportCount: 1,
+								}),
+							],
+						}),
+					],
+					aggregateSupport: [expect.objectContaining({ field: "trigger.description", supportCount: 2 })],
+					aggregateEvidence: {
+						supportingEvidenceCount: 1,
+						contradictingEvidenceCount: 1,
+						supportingTraceCount: 1,
+						contradictingTraceCount: 1,
+						supportingTaskLineageCount: 1,
+						contradictingTaskLineageCount: 1,
+					},
+				},
 				existingSkillVersions: [
 					{
 						skillId: "installed:workspace:focused-verification",
@@ -477,6 +632,58 @@ describe("StructuredSkillSynthesizer", () => {
 				repositoryInstructions: [{ path: "/repo/AGENTS.md", content: "Run focused tests after changing code." }],
 			},
 		});
+		const serializedRequest = JSON.stringify(request);
+		expect(serializedRequest).not.toContain("sourceEvidence");
+		expect(serializedRequest).not.toContain("candidateRevisions");
+		expect(serializedRequest).not.toContain("candidate-1");
+		expect(serializedRequest).not.toContain("revision-1");
+		expect(serializedRequest).not.toContain("job-failure");
+		expect(serializedRequest).not.toContain("source-failure");
+		expect(serializedRequest).not.toContain("materialization-failure");
+		expect(serializedRequest).not.toContain("support-1");
+		expect(serializedRequest).not.toContain("trace-success");
+		expect(serializedRequest).not.toContain("task-failure-1");
+		expect(serializedRequest).not.toContain("focused test passed");
+		expect(serializedRequest).not.toContain("Instructions for source files under packages/evolution only.");
+		expect(serializedRequest).not.toContain('"sourceKind"');
+		expect(serializedRequest).not.toContain('"scope"');
+		expect(request).toMatchObject({
+			maxOutputTokens: 16_384,
+			requestDiagnostics: {
+				serialization: "canonical-json-utf8-v1",
+				serializedBytes: expect.any(Number),
+				estimatedTokens: expect.any(Number),
+				inputSerializedBytes: expect.any(Number),
+				inputEstimatedTokens: expect.any(Number),
+				contextWindow: 128_000,
+				maxOutputTokens: 16_384,
+				schemaEstimatedTokens: expect.any(Number),
+				protocolOverheadTokens: 1_024,
+				safetyMarginTokens: 8_960,
+				inputBudgetTokens: expect.any(Number),
+				schemaDigest: expect.stringMatching(/^sha256:/),
+				capsuleDigest: data.group.canonicalCapsule.contentDigest,
+				requestDigest: expect.stringMatching(/^sha256:/),
+			},
+		});
+		const submittedRequest = request as Extract<
+			EvolutionModelRequest,
+			{ readonly stage: "skill-synthesizer" }
+		> | null;
+		if (submittedRequest === null) throw new Error("Expected a synthesis request");
+		const {
+			requestDiagnostics,
+			validateOutput: _validateOutput,
+			signal: _signal,
+			...requestPayload
+		} = submittedRequest;
+		expect(requestDiagnostics.serializedBytes).toBe(measureEvolutionValue(requestPayload).serializedBytes);
+		expect(requestDiagnostics.estimatedTokens).toBe(measureEvolutionValue(requestPayload).estimatedTokens);
+		expect(requestDiagnostics.inputSerializedBytes).toBe(measureEvolutionValue(requestPayload.input).serializedBytes);
+		expect(requestDiagnostics.inputEstimatedTokens).toBe(measureEvolutionValue(requestPayload.input).estimatedTokens);
+		expect(requestDiagnostics.schemaDigest).toBe(computeEvolutionContentDigest(requestPayload.outputSchema));
+		expect(requestDiagnostics.requestDigest).toBe(computeEvolutionContentDigest(requestPayload));
+		expect(draft.synthesisRequest).toEqual(requestDiagnostics);
 		expect(draft).toMatchObject({
 			artifactKind: "skill-draft",
 			groupId: "group-1",
@@ -487,6 +694,10 @@ describe("StructuredSkillSynthesizer", () => {
 			sourceTraceIds: ["trace-failure", "trace-success"],
 			operation: "UPDATE",
 			proposedName: "focused-verification",
+			synthesisRequest: expect.objectContaining({
+				capsuleDigest: data.group.canonicalCapsule.contentDigest,
+				requestDigest: expect.stringMatching(/^sha256:/),
+			}),
 			content: draftMarkdown,
 			files: [{ path: "scripts/verify.sh", content: "#!/bin/sh\nexec npm run test:focused\n" }],
 		});
@@ -494,11 +705,12 @@ describe("StructuredSkillSynthesizer", () => {
 
 	it("binds the immutable draft ID to synthesized content", async () => {
 		const data = fixture();
-		const synthesize = (skillMarkdown: string) =>
+		const synthesize = (skillMarkdown: string, contextWindow = 128_000) =>
 			data.synthesizer.synthesize({
 				group: data.group,
 				model: {
 					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow, maxOutputTokens: 16_384 }),
 					async execute() {
 						return { output: { skillMarkdown, files: [] }, model: { provider: "faux", model: "fixture" } };
 					},
@@ -510,9 +722,108 @@ describe("StructuredSkillSynthesizer", () => {
 		const first = await synthesize(draftMarkdown);
 		const repeated = await synthesize(draftMarkdown);
 		const changed = await synthesize(`${draftMarkdown}\nAdditional verification detail.\n`);
+		const changedBudget = await synthesize(draftMarkdown, 127_000);
 
 		expect(repeated.draftId).toBe(first.draftId);
 		expect(changed.draftId).not.toBe(first.draftId);
+		expect(changedBudget.draftId).not.toBe(first.draftId);
+	});
+
+	it("rejects an oversized request before provider invocation and persists its diagnostics on the error", async () => {
+		const data = fixture();
+		let called = false;
+
+		await expect(
+			data.synthesizer.synthesize({
+				group: data.group,
+				model: {
+					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow: 2_000, maxOutputTokens: 1_000 }),
+					async execute(): Promise<never> {
+						called = true;
+						throw new Error("unexpected model call");
+					},
+				},
+				idempotencyKey: data.group.synthesisIdempotencyKey,
+				createdAt,
+			}),
+		).rejects.toMatchObject({
+			name: "EvolutionExecutionError",
+			reasonCode: "skill-synthesis-request-too-large",
+			retryable: false,
+			diagnostics: {
+				request: {
+					contextWindow: 2_000,
+					maxOutputTokens: 1_000,
+					inputBudgetTokens: 0,
+					schemaDigest: expect.stringMatching(/^sha256:/),
+					capsuleDigest: data.group.canonicalCapsule.contentDigest,
+					requestDigest: expect.stringMatching(/^sha256:/),
+				},
+			},
+		});
+		expect(called).toBe(false);
+	});
+
+	it("persists request diagnostics when provider execution fails", async () => {
+		const data = fixture();
+
+		await expect(
+			data.synthesizer.synthesize({
+				group: data.group,
+				model: {
+					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow: 128_000, maxOutputTokens: 16_384 }),
+					async execute(): Promise<never> {
+						throw new Error("provider unavailable");
+					},
+				},
+				idempotencyKey: data.group.synthesisIdempotencyKey,
+				createdAt,
+			}),
+		).rejects.toMatchObject({
+			name: "EvolutionExecutionError",
+			diagnostics: {
+				request: {
+					capsuleDigest: data.group.canonicalCapsule.contentDigest,
+					requestDigest: expect.stringMatching(/^sha256:/),
+				},
+			},
+		});
+	});
+
+	it("rejects multi-megabyte frozen instructions before provider invocation", async () => {
+		const repositoryInstruction = "Required repository instruction.\n".repeat(80_000);
+		expect(Buffer.byteLength(repositoryInstruction)).toBeGreaterThan(2_000_000);
+		const data = fixture("evidence-qualified", repositoryInstruction);
+		let called = false;
+
+		await expect(
+			data.synthesizer.synthesize({
+				group: data.group,
+				model: {
+					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow: 128_000, maxOutputTokens: 16_384 }),
+					async execute(): Promise<never> {
+						called = true;
+						throw new Error("unexpected model call");
+					},
+				},
+				idempotencyKey: data.group.synthesisIdempotencyKey,
+				createdAt,
+			}),
+		).rejects.toMatchObject({
+			reasonCode: "skill-synthesis-request-too-large",
+			diagnostics: {
+				request: {
+					inputSerializedBytes: expect.any(Number),
+					contextWindow: 128_000,
+					capsuleDigest: data.group.canonicalCapsule.contentDigest,
+					requestDigest: expect.stringMatching(/^sha256:/),
+				},
+			},
+		});
+		expect(called).toBe(false);
 	});
 
 	it("classifies invalid structured output as a synthesis failure", async () => {
@@ -523,6 +834,7 @@ describe("StructuredSkillSynthesizer", () => {
 				group: data.group,
 				model: {
 					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow: 128_000, maxOutputTokens: 16_384 }),
 					async execute() {
 						return { output: { unexpected: true }, model: { provider: "faux", model: "fixture" } };
 					},
@@ -546,6 +858,7 @@ describe("StructuredSkillSynthesizer", () => {
 				group: data.group,
 				model: {
 					maxProviderCallsPerExecution: 20,
+					getModelLimits: () => ({ contextWindow: 128_000, maxOutputTokens: 16_384 }),
 					async execute(): Promise<never> {
 						called = true;
 						throw new Error("unexpected model call");

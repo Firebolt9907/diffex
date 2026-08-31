@@ -6,6 +6,7 @@ import type { MaterializedInvocation } from "@earendil-works/diffex-harness-trac
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	computeEvolutionContentDigest,
+	computeEvolutionTextDigest,
 	type EvolutionArtifactReference,
 	EvolutionBackgroundWorker,
 	EvolutionControlPlane,
@@ -22,6 +23,11 @@ import {
 	estimateEvolutionTokens,
 	FileEvolutionPersistence,
 	PollingEvolutionWorkSource,
+	type SkillCandidate,
+	type SkillCandidateGroup,
+	type SkillDraft,
+	type SkillDraftValidationReport,
+	type SkillEvaluationReport,
 	type SuccessfulMaterialization,
 } from "../src/index.ts";
 
@@ -535,6 +541,199 @@ describe("evolution control service", () => {
 			expect(second.job.jobId).not.toBe(first.job.jobId);
 			await fixture.service.cancelJob(second.job.jobId);
 		}
+	});
+
+	it("exposes candidate provenance and gates manual activation on accepted evaluation", async () => {
+		const inputReference = { artifactId: "input-1", contentDigest: `sha256:${"1".repeat(64)}` };
+		const candidateReference = { artifactId: "candidate-1", contentDigest: `sha256:${"2".repeat(64)}` };
+		const draftReference = { artifactId: "draft-1", contentDigest: `sha256:${"3".repeat(64)}` };
+		const validationReference = { artifactId: "validation-1", contentDigest: `sha256:${"4".repeat(64)}` };
+		const evaluationReference = { artifactId: "evaluation-1", contentDigest: `sha256:${"5".repeat(64)}` };
+		const candidate = {
+			artifactKind: "skill-candidate",
+			candidateId: "candidate-1",
+			operation: "CREATE",
+			proposedName: "focused-verification",
+			existingSkillIds: [],
+			sourceLessonIds: ["lesson-1"],
+			sourceProceduralObservationIds: [],
+			supportingEvidenceIds: ["evidence-1"],
+			contradictingEvidenceIds: [],
+			supportingTraceIds: ["trace-1"],
+			contradictingTraceIds: [],
+			taskLineageIds: ["task-1"],
+		} as unknown as SkillCandidate;
+		const draft = {
+			artifactKind: "skill-draft",
+			draftId: "draft-1",
+			groupId: "group-1",
+			operation: "CREATE",
+			proposedName: "focused-verification",
+			content: "---\nname: focused-verification\ndescription: Verify focused changes.\n---\n\nRun checks.\n",
+		} as unknown as SkillDraft;
+		const validation = {
+			artifactKind: "skill-draft-validation",
+			validationId: "validation-1",
+			disposition: "accepted",
+			issues: [],
+		} as unknown as SkillDraftValidationReport;
+		const evaluation = {
+			artifactKind: "skill-evaluation",
+			evaluationId: "evaluation-1",
+			disposition: "accepted",
+			gates: {
+				suite: { passed: true, reasonCodes: [] },
+				retrieval: { passed: true, reasonCodes: [] },
+				behavior: { passed: true, reasonCodes: [] },
+			},
+		} as unknown as SkillEvaluationReport;
+		const group = {
+			groupId: "group-1",
+			state: "accepted",
+			proposalRevisions: [
+				{
+					revisionId: "revision-1",
+					candidateId: candidate.candidateId,
+					sourceEvolutionJobId: "job-1",
+				},
+			],
+			draft: draftReference,
+			validation: validationReference,
+			evaluation: evaluationReference,
+		} as unknown as SkillCandidateGroup;
+		const input = {
+			ingestionHighWaterCursor: 1,
+			evidenceSources: [],
+			harness: { baseVersion: null },
+			expectedHarnessBaseVersion: `sha256:${"a".repeat(64)}`,
+			skillCatalog: [],
+			tokenMeasurement: { estimatedTokens: 10 },
+		} as unknown as EvolutionInputSnapshot;
+		const job = {
+			metadata: { scope },
+			jobId: "job-1",
+			inputSnapshot: inputReference,
+			trigger: "manual",
+			stage: "completed",
+			outcome: "completed",
+			reasonCode: null,
+			failureMessage: null,
+			completion: null,
+			resolution: null,
+			checkpoints: [
+				{
+					stage: "skill-curating",
+					outputArtifacts: [candidateReference],
+					state: { candidateIds: [candidate.candidateId] },
+					completedAt: "2026-08-20T00:00:01.000Z",
+				},
+			],
+			attempt: 0,
+			revision: 1,
+			createdAt: "2026-08-20T00:00:00.000Z",
+			updatedAt: "2026-08-20T00:00:01.000Z",
+			terminalAt: "2026-08-20T00:00:01.000Z",
+		} as unknown as EvolutionJob;
+		const artifacts = new Map<string, unknown>([
+			[inputReference.artifactId, input],
+			[candidateReference.artifactId, candidate],
+			[draftReference.artifactId, draft],
+			[validationReference.artifactId, validation],
+			[evaluationReference.artifactId, evaluation],
+		]);
+		const targetHarnessVersion = `sha256:${"b".repeat(64)}`;
+		let selectedHarnessVersion = input.expectedHarnessBaseVersion;
+		const activate = vi.fn().mockImplementation(async () => {
+			selectedHarnessVersion = targetHarnessVersion;
+			return {
+				groupId: group.groupId,
+				batchId: "batch-1",
+				targetHarnessVersion,
+				receipt: {},
+			};
+		});
+		const selectVersionIfCurrent = vi.fn(async (version: string, expectedCurrent: string) => {
+			expect(selectedHarnessVersion).toBe(expectedCurrent);
+			selectedHarnessVersion = version;
+			return { status: "selected" as const, version };
+		});
+		const service = new EvolutionControlService({
+			scope,
+			jobs: { load: async () => job },
+			artifacts: {
+				get: async (reference: EvolutionArtifactReference) => artifacts.get(reference.artifactId),
+			},
+			harnesses: {
+				listVersions: async () => ({
+					currentVersion: selectedHarnessVersion,
+					versions: [
+						{
+							manifest: { version: input.expectedHarnessBaseVersion, base: null },
+							state: { memory: "", skills: [] },
+						},
+						{
+							manifest: { version: targetHarnessVersion, base: input.expectedHarnessBaseVersion },
+							state: {
+								memory: "",
+								skills: [
+									{
+										path: "skills/focused-verification/SKILL.md",
+										workspace: { repositoryId: "diffex" },
+										contentHash: computeEvolutionTextDigest(draft.content),
+									},
+								],
+							},
+						},
+					],
+					diagnostics: [],
+				}),
+				selectVersionIfCurrent,
+			},
+			ledger: { read: async () => [] },
+			skillCandidates: { list: async () => [group] },
+			skillActivation: { activate },
+			observedHarnessVersion: () => input.expectedHarnessBaseVersion,
+		} as unknown as EvolutionControlServiceDependencies);
+
+		expect(await service.getJob(job.jobId)).toMatchObject({
+			skillCandidates: [
+				{
+					candidateId: candidate.candidateId,
+					groupId: group.groupId,
+					proposedName: candidate.proposedName,
+					operation: "CREATE",
+					state: "accepted",
+				},
+			],
+		});
+		const detail = await service.getSkillCandidate(job.jobId, candidate.candidateId);
+		expect(detail).toMatchObject({
+			summary: { groupId: group.groupId, state: "accepted" },
+			sourceEvolutionJobIds: [job.jobId],
+			proposalRevisionIds: ["revision-1"],
+			draft: { draftId: "draft-1" },
+			validation: { disposition: "accepted" },
+			evaluation: { disposition: "accepted" },
+			targetHarnessVersion: null,
+			rollbackAvailable: false,
+			activationAvailable: true,
+		});
+
+		await expect(service.activateSkillCandidate(job.jobId, candidate.candidateId)).resolves.toMatchObject({
+			batchId: "batch-1",
+		});
+		expect(activate).toHaveBeenCalledWith(scope, group.groupId);
+		expect(await service.getSkillCandidate(job.jobId, candidate.candidateId)).toMatchObject({
+			targetHarnessVersion,
+			rollbackTargetHarnessVersion: input.expectedHarnessBaseVersion,
+			rollbackAvailable: true,
+			activationAvailable: false,
+		});
+		await expect(service.rollbackSkillCandidate(job.jobId, candidate.candidateId)).resolves.toMatchObject({
+			fromHarnessVersion: targetHarnessVersion,
+			toHarnessVersion: input.expectedHarnessBaseVersion,
+		});
+		expect(selectVersionIfCurrent).toHaveBeenCalledWith(input.expectedHarnessBaseVersion, targetHarnessVersion);
 	});
 
 	it("reports durable latency, budget, coverage, conflict, and recovery observability", async () => {

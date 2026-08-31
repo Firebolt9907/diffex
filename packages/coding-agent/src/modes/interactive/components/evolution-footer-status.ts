@@ -106,27 +106,32 @@ export class EvolutionFooterStatus {
 			const versionInfoGeneration = this.#versionInfoGeneration;
 			const shouldLoadVersionInfo =
 				versionInfoGeneration !== this.#loadedVersionInfoGeneration || !this.#versionInfoLoaded;
-			const [overview, versionInfo] = await Promise.all([
+			const [overviewResult, versionInfoResult] = await Promise.allSettled([
 				this.#client.overview(),
 				shouldLoadVersionInfo ? this.#client.listHarnessVersionInfo() : Promise.resolve(this.#versionInfo),
 			]);
 			if (this.#disposed) return;
 
-			this.#versionInfo = versionInfo;
-			this.#versionInfoLoaded = true;
-			if (shouldLoadVersionInfo) this.#loadedVersionInfoGeneration = versionInfoGeneration;
-			this.#setRunning(this.#client.getEnabled() && overview.activeJob !== null);
+			if (versionInfoResult.status === "fulfilled") {
+				this.#versionInfo = versionInfoResult.value;
+				this.#versionInfoLoaded = true;
+				if (shouldLoadVersionInfo) this.#loadedVersionInfoGeneration = versionInfoGeneration;
+			}
+			if (overviewResult.status === "fulfilled") {
+				const overview = overviewResult.value;
+				this.#setRunning(this.#client.getEnabled() && overview.activeJob !== null);
 
-			const selectedVersion = overview.currentHarnessVersion;
-			const selectionChanged =
-				this.#selectedHarnessVersionLoaded &&
-				selectedVersion !== null &&
-				selectedVersion !== this.#selectedHarnessVersion;
-			this.#selectedHarnessVersion = selectedVersion;
-			this.#selectedHarnessVersionLoaded = true;
-			if ((selectionChanged || this.#activateSelectedHarness) && selectedVersion !== null) {
-				this.#activateSelectedHarness = false;
-				await this.#onSelectedHarnessChange?.(selectedVersion);
+				const selectedVersion = overview.currentHarnessVersion;
+				const selectionChanged =
+					this.#selectedHarnessVersionLoaded &&
+					selectedVersion !== null &&
+					selectedVersion !== this.#selectedHarnessVersion;
+				this.#selectedHarnessVersion = selectedVersion;
+				this.#selectedHarnessVersionLoaded = true;
+				if ((selectionChanged || this.#activateSelectedHarness) && selectedVersion !== null) {
+					this.#activateSelectedHarness = false;
+					await this.#onSelectedHarnessChange?.(selectedVersion);
+				}
 			}
 		} catch {
 			// Footer status is best-effort. Prompt-boundary harness refresh remains authoritative.

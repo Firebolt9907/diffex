@@ -129,6 +129,33 @@ describe("EvolutionFooterStatus", () => {
 		expect(fixture.unsubscribed).toHaveBeenCalledOnce();
 	});
 
+	it("hydrates harness metadata when the evolution overview is unavailable", async () => {
+		const fixture = client(overview(evolvedVersion), [
+			{
+				version: evolvedVersion,
+				kind: "evolved",
+				evolvedAt: "2026-08-20T12:48:00.000Z",
+				evolvedIn: "/projects/diffex",
+			},
+		]);
+		const status = new EvolutionFooterStatus({
+			client: {
+				...fixture.client,
+				overview: vi.fn().mockRejectedValue(new Error("candidate registry unavailable")),
+			},
+			getActiveHarnessVersion: () => evolvedVersion,
+			requestRender: () => {},
+		});
+
+		await status.refresh();
+
+		expect(status.getSnapshot()).toMatchObject({
+			loaded: true,
+			activeVersionInfo: { version: evolvedVersion, kind: "evolved" },
+		});
+		status.dispose();
+	});
+
 	it("animates the inline spinner while an evolution job is active", async () => {
 		vi.useFakeTimers();
 		const fixture = client(overview(rootVersion), [

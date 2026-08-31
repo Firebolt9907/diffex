@@ -485,7 +485,7 @@ function fixture(
 	];
 	const capsule = groupCapsule("group-1", revisions, second);
 	const artifacts = new MemoryArtifactStore([skill, failedInput, capsule]);
-	const group: SkillCandidateGroup = {
+	const group: SkillCandidateGroup & { readonly canonicalCapsule: EvolutionArtifactReference } = {
 		groupId: "group-1",
 		canonicalCapsule: reference(capsule),
 		profile: {

@@ -385,14 +385,45 @@ describe("filesystem evolution persistence", () => {
 		).rejects.toThrow("contiguous sequence");
 	});
 
-	it("rejects candidate work failures without stage diagnostics", async () => {
-		const { store } = await storeFixture();
+	it("loads legacy candidate work failures without allowing new legacy appends", async () => {
+		const { root, store } = await storeFixture();
 		const complete = candidateWorkFailureEvent("candidate-event-1", 1);
 		if (complete.type !== "skill-candidate-work-failed") throw new Error("Expected candidate work failure");
-		const { stage: _stage, diagnostics: _diagnostics, ...incompleteContent } = complete;
-		const incomplete = incompleteContent as unknown as SkillCandidateRegistryEvent;
+		const { metadata: _metadata, stage: _stage, diagnostics: _diagnostics, ...legacyContent } = complete;
+		const legacy: SkillCandidateRegistryEvent = {
+			metadata: createEvolutionArtifactMetadata({
+				artifactId: legacyContent.eventId,
+				producer,
+				sourceIds: ["job-1"],
+				scope,
+				createdAt: "2026-08-19T12:00:00.000Z",
+				content: legacyContent,
+			}),
+			...legacyContent,
+		};
+		expect(await store.appendSkillCandidateRegistryEvents(scope, 0, [complete])).toBe("committed");
+		const scopeDirectory = computeEvolutionContentDigest(scope).replace("sha256:", "sha256-");
+		await writeFile(
+			join(root, "skill-candidates", scopeDirectory, legacy.eventId, "event.json"),
+			`${JSON.stringify(legacy)}\n`,
+			"utf8",
+		);
 
-		await expect(store.appendSkillCandidateRegistryEvents(scope, 0, [incomplete])).rejects.toThrow(
+		expect(await store.loadSkillCandidateRegistry(scope)).toEqual({ revision: 1, events: [legacy] });
+
+		const nextLegacyContent = { ...legacyContent, eventId: "candidate-event-2", registrySequence: 2 };
+		const nextLegacy: SkillCandidateRegistryEvent = {
+			metadata: createEvolutionArtifactMetadata({
+				artifactId: nextLegacyContent.eventId,
+				producer,
+				sourceIds: ["job-1"],
+				scope,
+				createdAt: "2026-08-19T12:00:00.000Z",
+				content: nextLegacyContent,
+			}),
+			...nextLegacyContent,
+		};
+		await expect(store.appendSkillCandidateRegistryEvents(scope, 1, [nextLegacy])).rejects.toThrow(
 			"skill candidate registry event is invalid",
 		);
 	});

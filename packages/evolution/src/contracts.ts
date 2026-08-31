@@ -1027,7 +1027,8 @@ export interface SkillCandidateGroup {
 	readonly groupId: string;
 	readonly profile: SkillCandidateGroupingProfile;
 	readonly proposalRevisions: readonly SkillCandidateProposalRevision[];
-	readonly canonicalCapsule: EvolutionArtifactReference;
+	/** Null only for groups persisted before canonical capsules were introduced. */
+	readonly canonicalCapsule: EvolutionArtifactReference | null;
 	readonly state: SkillCandidateState;
 	readonly dispositionHistory: readonly SkillCandidateDispositionRecord[];
 	readonly evidence: SkillCandidateEvidenceContribution;
@@ -1150,8 +1151,10 @@ export interface SkillCandidateWorkFailedEvent extends SkillCandidateRegistryEve
 	readonly attempt: number;
 	readonly message: string;
 	readonly retryNotBefore: string | null;
-	readonly stage: SkillCandidateWorkStage;
-	readonly diagnostics: readonly SkillCandidateGroupFailureDiagnostic[];
+	/** Absent only on records written before structured candidate-work failure diagnostics were introduced. */
+	readonly stage?: SkillCandidateWorkStage;
+	/** Absent only on records written before structured candidate-work failure diagnostics were introduced. */
+	readonly diagnostics?: readonly SkillCandidateGroupFailureDiagnostic[];
 }
 
 export type SkillCandidateRegistryEvent =

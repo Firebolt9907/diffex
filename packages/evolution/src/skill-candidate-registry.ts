@@ -649,17 +649,14 @@ function materializeGroups(events: readonly SkillCandidateRegistryEvent[]): Map<
 function immutableGroup(group: MutableGroup): SkillCandidateGroup {
 	const proposalRevisions = orderedRevisions(group.proposalRevisions);
 	const proposalRevisionIds = proposalRevisions.map((revision) => revision.revisionId);
-	if (
-		group.canonicalCapsule === null ||
-		!sameOrderedValues(group.canonicalCapsuleProposalRevisionIds, proposalRevisionIds)
-	) {
-		throw new Error(`Candidate group "${group.groupId}" does not have a current canonical capsule`);
-	}
+	const canonicalCapsule = sameOrderedValues(group.canonicalCapsuleProposalRevisionIds, proposalRevisionIds)
+		? group.canonicalCapsule
+		: null;
 	return {
 		groupId: group.groupId,
 		profile: group.profile,
 		proposalRevisions,
-		canonicalCapsule: group.canonicalCapsule,
+		canonicalCapsule,
 		state: group.state,
 		dispositionHistory: [...group.dispositionHistory],
 		evidence: mergeEvidence(proposalRevisions),
@@ -684,16 +681,16 @@ function immutableGroup(group: MutableGroup): SkillCandidateGroup {
 			: null,
 		synthesisIdempotencyKey: stableId("skill-synthesis", {
 			groupId: group.groupId,
-			canonicalCapsule: group.canonicalCapsule.artifactId,
+			canonicalCapsule: canonicalCapsule?.artifactId ?? null,
 		}),
 		validationIdempotencyKey: stableId("skill-validation", {
 			groupId: group.groupId,
-			canonicalCapsule: group.canonicalCapsule.artifactId,
+			canonicalCapsule: canonicalCapsule?.artifactId ?? null,
 			draft: group.draft,
 		}),
 		evaluationIdempotencyKey: stableId("skill-evaluation", {
 			groupId: group.groupId,
-			canonicalCapsule: group.canonicalCapsule.artifactId,
+			canonicalCapsule: canonicalCapsule?.artifactId ?? null,
 		}),
 	};
 }

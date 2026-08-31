@@ -421,7 +421,9 @@ describe("persistent skill candidate registry", () => {
 			createdAt: "2026-08-27T12:00:00.000Z",
 		});
 		const group = third.groups[0];
-		if (group === undefined) throw new Error("Expected a canonical candidate group");
+		if (group?.canonicalCapsule === null || group === undefined) {
+			throw new Error("Expected a canonical candidate group");
+		}
 		const artifact = await fixture.artifacts.get(group.canonicalCapsule);
 		if (!("artifactKind" in artifact) || artifact.artifactKind !== "skill-candidate-group-capsule") {
 			throw new Error("Expected a canonical group capsule artifact");
@@ -485,6 +487,36 @@ describe("persistent skill candidate registry", () => {
 		expect(retried.groups[0]?.canonicalCapsule).toEqual(group.canonicalCapsule);
 	});
 
+	it("materializes groups persisted before canonical capsules without treating storage as corrupt", async () => {
+		const fixture = registryFixture();
+		const sourceInput = input([evidence("support-a", "task-a", 0)], "trace-a");
+		await fixture.registry.consolidate({
+			sourceEvolutionJobId: "job-a",
+			input: sourceInput,
+			candidates: [
+				candidate({
+					candidateId: "candidate-a",
+					input: sourceInput,
+					proposedName: "focused-check",
+					supportingEvidenceIds: ["support-a"],
+					taskLineageIds: ["task-a"],
+				}),
+			],
+			idempotencyKey: "job-a:registry",
+			createdAt,
+		});
+		const capsuleEventIndex = fixture.store.events.findIndex(
+			(event) => event.type === "skill-candidate-group-capsule-recorded",
+		);
+		if (capsuleEventIndex < 0) throw new Error("Expected a canonical capsule event");
+		fixture.store.events.splice(capsuleEventIndex, 1);
+
+		const [group] = await fixture.registry.list(scope);
+
+		expect(group).toMatchObject({ state: "proposed", canonicalCapsule: null });
+		expect(group?.proposalRevisions.map((revision) => revision.candidateId)).toEqual(["candidate-a"]);
+	});
+
 	it("compacts hundreds of repeated revisions without repeating procedural prose", async () => {
 		const fixture = registryFixture();
 		const sourceInput = input([evidence("support-a", "task-a", 0)], "trace-a");
@@ -505,7 +537,9 @@ describe("persistent skill candidate registry", () => {
 			createdAt,
 		});
 		const group = result.groups[0];
-		if (group === undefined) throw new Error("Expected a repeated candidate group");
+		if (group?.canonicalCapsule === null || group === undefined) {
+			throw new Error("Expected a repeated candidate group");
+		}
 		const artifact = await fixture.artifacts.get(group.canonicalCapsule);
 		if (!("artifactKind" in artifact) || artifact.artifactKind !== "skill-candidate-group-capsule") {
 			throw new Error("Expected a canonical group capsule artifact");
@@ -556,7 +590,9 @@ describe("persistent skill candidate registry", () => {
 			createdAt,
 		});
 		const group = result.groups[0];
-		if (group === undefined) throw new Error("Expected a conflicting candidate group");
+		if (group?.canonicalCapsule === null || group === undefined) {
+			throw new Error("Expected a conflicting candidate group");
+		}
 		const artifact = await fixture.artifacts.get(group.canonicalCapsule);
 		if (!("artifactKind" in artifact) || artifact.artifactKind !== "skill-candidate-group-capsule") {
 			throw new Error("Expected a canonical group capsule artifact");

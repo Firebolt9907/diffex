@@ -269,6 +269,12 @@ export class StructuredSkillSynthesizer implements SkillSynthesizer {
 		if (input.idempotencyKey !== input.group.synthesisIdempotencyKey) {
 			throw new Error(`Candidate group "${input.group.groupId}" synthesis key is stale`);
 		}
+		if (input.group.canonicalCapsule === null) {
+			throw new EvolutionExecutionError(
+				`Candidate group "${input.group.groupId}" predates canonical capsule synthesis`,
+				{ reasonCode: "artifact-corrupt", retryable: false },
+			);
+		}
 		const capsuleArtifact = await this.#dependencies.artifacts.get(input.group.canonicalCapsule);
 		if (!isCanonicalGroupCapsule(capsuleArtifact, input.group.canonicalCapsule, input.group)) {
 			throw new EvolutionExecutionError(

@@ -352,7 +352,10 @@ function isCandidateEvidenceContribution(value: unknown): boolean {
 	);
 }
 
-function isCandidateRegistryEventContent(value: Readonly<Record<string, unknown>>): boolean {
+function isCandidateRegistryEventContent(
+	value: Readonly<Record<string, unknown>>,
+	allowLegacyWorkFailure: boolean,
+): boolean {
 	if (value.type === "skill-candidate-group-capsule-recorded") {
 		return (
 			typeof value.groupId === "string" &&
@@ -453,6 +456,10 @@ function isCandidateRegistryEventContent(value: Readonly<Record<string, unknown>
 	) {
 		return false;
 	}
+	const hasStage = value.stage !== undefined;
+	const hasDiagnostics = value.diagnostics !== undefined;
+	if (hasStage !== hasDiagnostics) return false;
+	if (!hasStage) return allowLegacyWorkFailure;
 	return (
 		typeof value.stage === "string" &&
 		SKILL_CANDIDATE_WORK_STAGES.has(value.stage) &&
@@ -462,7 +469,11 @@ function isCandidateRegistryEventContent(value: Readonly<Record<string, unknown>
 	);
 }
 
-function parseSkillCandidateRegistryEvent(contents: string, path: string): SkillCandidateRegistryEvent {
+function parseSkillCandidateRegistryEvent(
+	contents: string,
+	path: string,
+	allowLegacyWorkFailure = false,
+): SkillCandidateRegistryEvent {
 	const parsed = parseJson(contents, path);
 	if (
 		!isRecord(parsed) ||
@@ -473,7 +484,7 @@ function parseSkillCandidateRegistryEvent(contents: string, path: string): Skill
 		(parsed.registrySequence as number) < 1 ||
 		typeof parsed.type !== "string" ||
 		!SKILL_CANDIDATE_REGISTRY_EVENT_TYPES.has(parsed.type) ||
-		!isCandidateRegistryEventContent(parsed)
+		!isCandidateRegistryEventContent(parsed, allowLegacyWorkFailure)
 	) {
 		throw new EvolutionStorageCorruptionError(path, "skill candidate registry event is invalid");
 	}
@@ -759,7 +770,7 @@ export class FileEvolutionPersistence
 			if (contents === null) {
 				throw new EvolutionStorageCorruptionError(path, "skill candidate registry event is missing");
 			}
-			const event = parseSkillCandidateRegistryEvent(contents, path);
+			const event = parseSkillCandidateRegistryEvent(contents, path, true);
 			if (event.eventId !== entry.name) {
 				throw new EvolutionStorageCorruptionError(
 					path,

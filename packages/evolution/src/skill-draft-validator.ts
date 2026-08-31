@@ -307,6 +307,9 @@ export class DeterministicSkillDraftValidator implements SkillDraftValidator {
 			artifactId: input.draft.metadata.artifactId,
 			contentDigest: computeEvolutionContentDigest(input.draft),
 		};
+		if (input.group.canonicalCapsule === null) {
+			throw new Error(`Candidate group "${input.group.groupId}" predates canonical capsule validation`);
+		}
 		const capsuleArtifact = await this.#dependencies.artifacts.get(input.group.canonicalCapsule);
 		const capsule: SkillCandidateGroupCapsule | null = isCanonicalGroupCapsule(
 			capsuleArtifact,

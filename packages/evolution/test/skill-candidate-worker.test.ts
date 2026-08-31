@@ -153,6 +153,13 @@ function completedJob(
 	};
 }
 
+function transientSynthesisError(message = "temporary provider failure"): EvolutionExecutionError {
+	return new EvolutionExecutionError(message, {
+		reasonCode: "model-call-failed",
+		retryable: true,
+	});
+}
+
 function qualifiedGroup(candidateReference: EvolutionArtifactReference): SkillCandidateGroup {
 	return {
 		groupId: "group-qualified",
@@ -262,6 +269,43 @@ class MemoryRegistryStore implements SkillCandidateRegistryStore {
 	}
 }
 
+function workCheckpoint(
+	registrySequence: number,
+	stage: "synthesizing" | "evaluating" | "completed",
+	groupIds: readonly string[],
+	attempt = 3,
+): SkillCandidateRegistryEvent {
+	const content = {
+		schemaVersion: 1 as const,
+		eventId: `work-checkpoint-${registrySequence}`,
+		registrySequence,
+		type: "skill-candidate-work-checkpointed" as const,
+		workId: "work-job-1",
+		sourceEvolutionJobId: "job-1",
+		stage,
+		idempotencyKey: `work-checkpoint-${stage}`,
+		attempt,
+		groupIds,
+	};
+	return { metadata: metadata(content.eventId, [content.sourceEvolutionJobId, ...groupIds], content), ...content };
+}
+
+function legacyWorkFailure(registrySequence: number, attempt = 3): SkillCandidateRegistryEvent {
+	const content = {
+		schemaVersion: 1 as const,
+		eventId: `legacy-work-failure-${registrySequence}`,
+		registrySequence,
+		type: "skill-candidate-work-failed" as const,
+		workId: "work-job-1",
+		sourceEvolutionJobId: "job-1",
+		idempotencyKey: `legacy-work-failure-${attempt}`,
+		attempt,
+		message: "legacy synthesis failed",
+		retryNotBefore: null,
+	};
+	return { metadata: metadata(content.eventId, [content.sourceEvolutionJobId], content), ...content };
+}
+
 class CompletionAcknowledgementLostStore extends MemoryRegistryStore {
 	interrupted = false;
 
@@ -364,7 +408,7 @@ class FixtureRegistry implements SkillCandidateRegistry {
 						eventId: `synthesis-failed-${failure.groupId}`,
 						from: group.state,
 						to: "synthesis-failed" as const,
-						reasonCodes: ["skill-synthesis-attempts-exhausted"],
+						reasonCodes: [failure.reasonCode],
 						createdAt: input.createdAt,
 					},
 				],
@@ -791,9 +835,10 @@ describe("skill candidate registry worker", () => {
 		]);
 		expect(data.validationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
 		expect(data.evaluationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
-		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-failing")?.state).toBe(
-			"evidence-qualified",
-		);
+		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-failing")).toMatchObject({
+			state: "synthesis-failed",
+			dispositionHistory: [expect.objectContaining({ reasonCodes: ["skill-synthesis-non-retryable"] })],
+		});
 		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-succeeding")?.state).toBe(
 			"accepted",
 		);
@@ -803,6 +848,7 @@ describe("skill candidate registry worker", () => {
 			diagnostics: [
 				{
 					groupId: "group-failing",
+					synthesisIdempotencyKey: "skill-synthesis-failing",
 					error: {
 						name: "EvolutionExecutionError",
 						message: "Skill synthesizer failed to produce a draft",
@@ -813,27 +859,142 @@ describe("skill candidate registry worker", () => {
 					},
 				},
 			],
+			retryNotBefore: null,
 		});
 		expect(
 			data.store.events.some(
 				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
 			),
 		).toBe(false);
+	});
 
-		data.synthesisFailures.clear();
-		await data.worker.process(data.job.jobId);
+	it("reconciles legacy exhausted synthesis by identity under fresh bounded retries", async () => {
+		const store = new MemoryRegistryStore([
+			workCheckpoint(1, "synthesizing", ["group-failing", "group-succeeding"]),
+			legacyWorkFailure(2),
+		]);
+		const data = fixture(true, store);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		const group = qualifiedGroup(candidateReference);
+		data.registry.groups.push(
+			{
+				...group,
+				groupId: "group-failing",
+				synthesisIdempotencyKey: "skill-synthesis-failing",
+				validationIdempotencyKey: "skill-validation-failing",
+				evaluationIdempotencyKey: "skill-evaluation-failing",
+			},
+			{
+				...group,
+				groupId: "group-succeeding",
+				synthesisIdempotencyKey: "skill-synthesis-succeeding",
+				validationIdempotencyKey: "skill-validation-succeeding",
+				evaluationIdempotencyKey: "skill-evaluation-succeeding",
+			},
+			{
+				...group,
+				groupId: "group-unrelated",
+				synthesisIdempotencyKey: "skill-synthesis-unrelated",
+				validationIdempotencyKey: "skill-validation-unrelated",
+				evaluationIdempotencyKey: "skill-evaluation-unrelated",
+			},
+		);
+		data.synthesisFailures.set("group-failing", transientSynthesisError());
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store,
+			registry: data.registry,
+			evaluatorAvailable: true,
+		});
+
+		expect(await source.nextRunnableJob(now)).toBeNull();
+		await source.reconcileLegacyWork();
+		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
+
+		for (let retryAttempt = 1; retryAttempt <= 3; retryAttempt += 1) {
+			await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
+				"Skill synthesis failed for candidate groups: group-failing",
+			);
+			const failure = store.events.find(
+				(event) => event.type === "skill-candidate-work-failed" && event.attempt === retryAttempt + 3,
+			);
+			expect(failure).toMatchObject({ retryNotBefore: retryAttempt === 3 ? null : expect.any(String) });
+		}
 
 		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
 			"group-failing",
 			"group-succeeding",
 			"group-failing",
+			"group-failing",
 		]);
-		expect(data.registry.groups.map((candidateGroup) => candidateGroup.state)).toEqual(["accepted", "accepted"]);
-		expect(
-			data.store.events.some(
-				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
-			),
-		).toBe(true);
+		expect(data.registry.groups).toEqual([
+			expect.objectContaining({ groupId: "group-failing", state: "synthesis-failed" }),
+			expect.objectContaining({ groupId: "group-succeeding", state: "accepted" }),
+			expect.objectContaining({ groupId: "group-unrelated", state: "evidence-qualified" }),
+		]);
+		expect(await source.nextRunnableJob(now)).toBeNull();
+	});
+
+	it("reconciles a completed checkpoint followed by a legacy synthesis failure", async () => {
+		const store = new MemoryRegistryStore([
+			workCheckpoint(1, "synthesizing", ["group-qualified"]),
+			workCheckpoint(2, "completed", ["group-qualified"]),
+			legacyWorkFailure(3),
+		]);
+		const data = fixture(false, store);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
+
+		await source.reconcileLegacyWork();
+		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
+		await data.worker.process(data.job.jobId);
+
+		const completions = store.events.filter(
+			(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+		);
+		expect(completions).toHaveLength(2);
+		expect(completions[1]?.registrySequence).toBeGreaterThan(legacyWorkFailure(3).registrySequence);
+		expect(data.registry.groups[0]?.state).toBe("accepted");
+		expect(await source.nextRunnableJob(now)).toBeNull();
+	});
+
+	it("tracks transient synthesis attempts by identity across source evolution jobs", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+		data.synthesisFailures.set("group-qualified", transientSynthesisError());
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			const job = attempt === 1 ? data.job : { ...data.job, jobId: `job-${attempt}` };
+			if (attempt > 1) data.jobs.jobs.push(job);
+			await expect(data.worker.process(job.jobId)).rejects.toThrow(
+				"Skill synthesis failed for candidate groups: group-qualified",
+			);
+			const failure = data.store.events.find(
+				(event) => event.type === "skill-candidate-work-failed" && event.sourceEvolutionJobId === job.jobId,
+			);
+			expect(failure).toMatchObject({
+				retryNotBefore: attempt === 3 ? null : expect.any(String),
+				diagnostics: [expect.objectContaining({ synthesisIdempotencyKey: "skill-synthesis-qualified" })],
+			});
+		}
+
+		expect(data.synthesisRequests).toHaveLength(3);
+		expect(data.registry.groups[0]).toMatchObject({
+			state: "synthesis-failed",
+			dispositionHistory: [expect.objectContaining({ reasonCodes: ["skill-synthesis-attempts-exhausted"] })],
+		});
 	});
 
 	it("durably exposes exhausted synthesis without blocking a later candidate in the same batch", async () => {
@@ -857,7 +1018,7 @@ describe("skill candidate registry worker", () => {
 				evaluationIdempotencyKey: "skill-evaluation-succeeding",
 			},
 		);
-		data.synthesisFailures.set("group-failing", new Error("synthesis failed"));
+		data.synthesisFailures.set("group-failing", transientSynthesisError());
 
 		for (let attempt = 1; attempt <= 3; attempt += 1) {
 			await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
@@ -971,6 +1132,39 @@ describe("skill candidate registry worker", () => {
 			store: data.store,
 			registry: data.registry,
 			evaluatorAvailable: false,
+		});
+		expect(await source.nextRunnableJob(now)).toBeNull();
+	});
+
+	it("reopens legacy completed work to record skipped evaluation when no evaluator is available", async () => {
+		const data = fixture();
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+		await data.worker.process(data.job.jobId);
+		const accepted = data.registry.groups[0];
+		if (accepted === undefined) throw new Error("Expected accepted group");
+		data.registry.groups[0] = { ...accepted, state: "structurally-valid", evaluation: null };
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
+
+		expect(await source.nextRunnableJob(now)).toBeNull();
+		await source.reconcileLegacyWork();
+		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
+		await data.worker.process(data.job.jobId);
+
+		expect(data.registry.evaluationSkipRequests).toHaveLength(2);
+		expect(data.registry.groups[0]).toMatchObject({
+			state: "accepted",
+			evaluation: null,
+			dispositionHistory: expect.arrayContaining([
+				expect.objectContaining({ reasonCodes: ["retrieval-and-behavior-evaluation-skipped"] }),
+			]),
 		});
 		expect(await source.nextRunnableJob(now)).toBeNull();
 	});

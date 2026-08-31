@@ -23,7 +23,9 @@
 - Fixed an open, idle `/evolve` menu retaining enabled actions after another Diffex process disables evolution.
 - Fixed one failed skill candidate synthesis preventing later qualified candidates from being drafted, validated, and evaluated.
 - Fixed exhausted skill synthesis being retried by unrelated later evolution jobs instead of remaining terminal until new evidence revises the candidate.
+- Fixed skill synthesis retrying deterministic failures and resetting transient retry budgets between source evolution jobs instead of tracking each synthesis identity.
 - Fixed persisted skill candidate failures discarding the affected candidate group, work stage, provider or schema error, stop reason, and structured diagnostics.
+- Fixed startup leaving legacy exhausted skill synthesis and unevaluated structurally valid candidates permanently stranded.
 - Fixed completed evolution analysis hiding asynchronous candidate-generation progress or failure, candidate lifecycle states and reasons, and distinct stage outcomes.
 - Fixed skill candidate review leading with unreadable provenance IDs instead of an `EVOLVE.md`-style summary and materialized supporting and contradicting evidence.
 - Fixed the evolution menu remaining on its loading screen after cancellation and flickering during active-job refreshes.

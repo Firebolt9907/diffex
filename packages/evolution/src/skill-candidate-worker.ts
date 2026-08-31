@@ -6,6 +6,7 @@ import type {
 	EvolutionLeaseToken,
 	EvolutionScope,
 	SkillCandidate,
+	SkillCandidateGroup,
 	SkillCandidateGroupFailureDiagnostic,
 	SkillCandidateRegistryEvent,
 	SkillCandidateWorkCheckpointedEvent,
@@ -160,14 +161,85 @@ function hasSkillCandidates(job: EvolutionJob): boolean {
 	);
 }
 
+type SkillCandidateWorkEvent = SkillCandidateWorkCheckpointedEvent | SkillCandidateWorkFailedEvent;
+
 function workEvents(
 	events: readonly SkillCandidateRegistryEvent[],
 	sourceEvolutionJobId: string,
-): readonly (SkillCandidateWorkCheckpointedEvent | SkillCandidateWorkFailedEvent)[] {
+): readonly SkillCandidateWorkEvent[] {
 	return events.filter(
-		(event): event is SkillCandidateWorkCheckpointedEvent | SkillCandidateWorkFailedEvent =>
+		(event): event is SkillCandidateWorkEvent =>
 			(event.type === "skill-candidate-work-checkpointed" || event.type === "skill-candidate-work-failed") &&
 			event.sourceEvolutionJobId === sourceEvolutionJobId,
+	);
+}
+
+function latestWorkEvent(events: readonly SkillCandidateWorkEvent[]): SkillCandidateWorkEvent | null {
+	return events.reduce<SkillCandidateWorkEvent | null>(
+		(latest, event) => (latest === null || event.registrySequence > latest.registrySequence ? event : latest),
+		null,
+	);
+}
+
+function latestLegacySynthesisFailure(
+	events: readonly SkillCandidateWorkEvent[],
+): SkillCandidateWorkFailedEvent | null {
+	const latestCompletedSequence = events.reduce(
+		(latest, event) =>
+			event.type === "skill-candidate-work-checkpointed" && event.stage === "completed"
+				? Math.max(latest, event.registrySequence)
+				: latest,
+		0,
+	);
+	return events.reduce<SkillCandidateWorkFailedEvent | null>((latest, event) => {
+		if (
+			event.type !== "skill-candidate-work-failed" ||
+			event.retryNotBefore !== null ||
+			event.diagnostics !== undefined ||
+			event.registrySequence < latestCompletedSequence
+		) {
+			return latest;
+		}
+		return latest === null || event.registrySequence > latest.registrySequence ? event : latest;
+	}, null);
+}
+
+function legacySynthesisGroupIds(events: readonly SkillCandidateWorkEvent[]): ReadonlySet<string> | null {
+	const failure = latestLegacySynthesisFailure(events);
+	if (failure === null) return null;
+	const checkpoint = events.reduce<SkillCandidateWorkCheckpointedEvent | null>((latest, event) => {
+		if (
+			event.type !== "skill-candidate-work-checkpointed" ||
+			event.stage !== "synthesizing" ||
+			event.registrySequence >= failure.registrySequence
+		) {
+			return latest;
+		}
+		return latest === null || event.registrySequence > latest.registrySequence ? event : latest;
+	}, null);
+	return checkpoint === null ? null : new Set(checkpoint.groupIds);
+}
+
+function evaluationGroupIds(events: readonly SkillCandidateWorkEvent[]): ReadonlySet<string> {
+	return new Set(
+		events.flatMap((event) =>
+			event.type === "skill-candidate-work-checkpointed" && event.stage === "evaluating" ? event.groupIds : [],
+		),
+	);
+}
+
+function hasAwaitingEvaluation(
+	events: readonly SkillCandidateWorkEvent[],
+	groups: readonly SkillCandidateGroup[],
+): boolean {
+	const groupIds = evaluationGroupIds(events);
+	return (
+		groupIds.size > 0 &&
+		groups.some(
+			(group) =>
+				groupIds.has(group.groupId) &&
+				(group.state === "structurally-valid" || group.state === "evaluation-pending"),
+		)
 	);
 }
 
@@ -211,14 +283,38 @@ function errorDiagnostic(error: unknown): SkillCandidateWorkErrorDiagnostic {
 	};
 }
 
+function synthesisAttemptCount(
+	events: readonly SkillCandidateRegistryEvent[],
+	synthesisIdempotencyKey: string,
+): number {
+	return events.reduce(
+		(count, event) =>
+			event.type === "skill-candidate-work-failed" &&
+			event.stage === "synthesizing" &&
+			event.diagnostics?.some((diagnostic) => diagnostic.synthesisIdempotencyKey === synthesisIdempotencyKey)
+				? count + 1
+				: count,
+		0,
+	);
+}
+
+interface SkillCandidateWorkStageFailure {
+	readonly groupId: string;
+	readonly synthesisIdempotencyKey?: string;
+	readonly error: unknown;
+}
+
 class SkillCandidateWorkStageError extends AggregateError {
 	readonly stage: SkillCandidateWorkStage;
-	readonly failures: readonly { readonly groupId: string; readonly error: unknown }[];
+	readonly failures: readonly SkillCandidateWorkStageFailure[];
+	readonly retryable: boolean;
+	readonly retryAttempt: number;
 
 	constructor(
 		stage: SkillCandidateWorkStage,
-		failures: readonly { readonly groupId: string; readonly error: unknown }[],
+		failures: readonly SkillCandidateWorkStageFailure[],
 		message: string,
+		options: { readonly retryable: boolean; readonly retryAttempt: number },
 	) {
 		super(
 			failures.map((failure) => failure.error),
@@ -227,12 +323,16 @@ class SkillCandidateWorkStageError extends AggregateError {
 		this.name = "SkillCandidateWorkStageError";
 		this.stage = stage;
 		this.failures = failures;
+		this.retryable = options.retryable;
+		this.retryAttempt = options.retryAttempt;
 	}
 }
 
 export class PollingSkillCandidateWorkSource {
 	readonly #dependencies: PollingSkillCandidateWorkSourceDependencies;
 	readonly #pollIntervalMs: number;
+	readonly #legacySynthesisJobIds = new Set<string>();
+	readonly #legacyEvaluationJobIds = new Set<string>();
 
 	constructor(
 		dependencies: PollingSkillCandidateWorkSourceDependencies,
@@ -242,41 +342,92 @@ export class PollingSkillCandidateWorkSource {
 		this.#pollIntervalMs = positiveInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, "pollIntervalMs");
 	}
 
-	async nextRunnableJob(now: string, signal?: AbortSignal): Promise<string | null> {
-		signal?.throwIfAborted();
-		const nowMs = Date.parse(now);
-		if (!Number.isFinite(nowMs)) throw new Error("Skill candidate worker time must be a valid ISO timestamp");
-		const jobs = (await this.#dependencies.jobs.list())
+	async #candidateJobs(): Promise<readonly EvolutionJob[]> {
+		return (await this.#dependencies.jobs.list())
 			.filter((job) => job.outcome === "completed" && job.stage === "completed" && hasSkillCandidates(job))
 			.sort(
 				(left, right) =>
 					(left.terminalAt ?? left.updatedAt).localeCompare(right.terminalAt ?? right.updatedAt) ||
 					left.jobId.localeCompare(right.jobId),
 			);
-		for (const job of jobs) {
+	}
+
+	async reconcileLegacyWork(signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
+		this.#legacySynthesisJobIds.clear();
+		this.#legacyEvaluationJobIds.clear();
+		const scopeStates = new Map<
+			string,
+			{
+				readonly events: readonly SkillCandidateRegistryEvent[];
+				readonly groups: readonly SkillCandidateGroup[];
+			}
+		>();
+		for (const job of await this.#candidateJobs()) {
+			signal?.throwIfAborted();
+			const scopeKey = `${job.metadata.scope.repositoryId}\u0000${job.metadata.scope.scopeId}`;
+			let scopeState = scopeStates.get(scopeKey);
+			if (scopeState === undefined) {
+				const [snapshot, groups] = await Promise.all([
+					this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope),
+					this.#dependencies.registry.list(job.metadata.scope),
+				]);
+				scopeState = { events: snapshot.events, groups };
+				scopeStates.set(scopeKey, scopeState);
+			}
+			const events = workEvents(scopeState.events, job.jobId);
+			const terminal = latestWorkEvent(events);
+			const recoveryGroupIds = legacySynthesisGroupIds(events);
+			if (
+				terminal?.type === "skill-candidate-work-failed" &&
+				terminal === latestLegacySynthesisFailure(events) &&
+				recoveryGroupIds !== null &&
+				scopeState.groups.some(
+					(group) => recoveryGroupIds.has(group.groupId) && group.state === "evidence-qualified",
+				)
+			) {
+				this.#legacySynthesisJobIds.add(job.jobId);
+			}
+			if (
+				!this.#dependencies.evaluatorAvailable &&
+				terminal?.type === "skill-candidate-work-checkpointed" &&
+				terminal.stage === "completed" &&
+				hasAwaitingEvaluation(events, scopeState.groups)
+			) {
+				this.#legacyEvaluationJobIds.add(job.jobId);
+			}
+		}
+	}
+
+	async nextRunnableJob(now: string, signal?: AbortSignal): Promise<string | null> {
+		signal?.throwIfAborted();
+		const nowMs = Date.parse(now);
+		if (!Number.isFinite(nowMs)) throw new Error("Skill candidate worker time must be a valid ISO timestamp");
+		for (const job of await this.#candidateJobs()) {
 			const snapshot = await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope);
 			const events = workEvents(snapshot.events, job.jobId);
-			const evaluationGroupIds = new Set(
-				events.flatMap((event) =>
-					event.type === "skill-candidate-work-checkpointed" && event.stage === "evaluating" ? event.groupIds : [],
-				),
-			);
-			const awaitingEvaluation =
-				evaluationGroupIds.size > 0 &&
-				(await this.#dependencies.registry.list(job.metadata.scope)).some(
-					(group) =>
-						evaluationGroupIds.has(group.groupId) &&
-						(group.state === "structurally-valid" || group.state === "evaluation-pending"),
+			const terminal = latestWorkEvent(events);
+			if (terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed") {
+				const awaitingEvaluation = hasAwaitingEvaluation(
+					events,
+					await this.#dependencies.registry.list(job.metadata.scope),
 				);
-			const completed = events.some(
-				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
-			);
-			if (completed && !(this.#dependencies.evaluatorAvailable && awaitingEvaluation)) continue;
-			const latestFailure = events
-				.filter((event): event is SkillCandidateWorkFailedEvent => event.type === "skill-candidate-work-failed")
-				.sort((left, right) => right.attempt - left.attempt)[0];
-			if (latestFailure?.retryNotBefore === null) continue;
-			if (latestFailure !== undefined && Date.parse(latestFailure.retryNotBefore) > nowMs) continue;
+				if (
+					!awaitingEvaluation ||
+					(!this.#dependencies.evaluatorAvailable && !this.#legacyEvaluationJobIds.has(job.jobId))
+				) {
+					continue;
+				}
+			}
+			if (terminal?.type === "skill-candidate-work-failed") {
+				if (
+					terminal.retryNotBefore === null &&
+					!(terminal.diagnostics === undefined && this.#legacySynthesisJobIds.has(job.jobId))
+				) {
+					continue;
+				}
+				if (terminal.retryNotBefore !== null && Date.parse(terminal.retryNotBefore) > nowMs) continue;
+			}
 			signal?.throwIfAborted();
 			return job.jobId;
 		}
@@ -361,13 +512,12 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 	): Promise<void> {
 		const idempotencyKey = stableId("skill-candidate-work-stage", { sourceEvolutionJobId: job.jobId, stage });
 		await this.#appendEvent(job.metadata.scope, lease, (registrySequence, existing) => {
+			const history = workEvents(existing, job.jobId);
+			const terminal = latestWorkEvent(history);
 			if (
-				existing.some(
-					(event) =>
-						event.type === "skill-candidate-work-checkpointed" &&
-						event.sourceEvolutionJobId === job.jobId &&
-						event.stage === stage,
-				)
+				stage === "completed"
+					? terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed"
+					: history.some((event) => event.type === "skill-candidate-work-checkpointed" && event.stage === stage)
 			) {
 				return null;
 			}
@@ -400,6 +550,8 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 	async #appendFailure(
 		job: EvolutionJob,
 		attempt: number,
+		retryAttempt: number,
+		retryable: boolean,
 		stage: SkillCandidateWorkStage,
 		diagnostics: readonly SkillCandidateGroupFailureDiagnostic[],
 		error: unknown,
@@ -410,16 +562,11 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			attempt,
 		});
 		await this.#appendEvent(job.metadata.scope, lease, (registrySequence, existing) => {
+			const history = workEvents(existing, job.jobId);
+			const terminal = latestWorkEvent(history);
 			if (
-				existing.some(
-					(event) =>
-						(event.type === "skill-candidate-work-checkpointed" &&
-							event.sourceEvolutionJobId === job.jobId &&
-							event.stage === "completed") ||
-						(event.type === "skill-candidate-work-failed" &&
-							event.sourceEvolutionJobId === job.jobId &&
-							event.attempt === attempt),
-				)
+				(terminal?.type === "skill-candidate-work-checkpointed" && terminal.stage === "completed") ||
+				history.some((event) => event.type === "skill-candidate-work-failed" && event.attempt === attempt)
 			) {
 				return null;
 			}
@@ -434,12 +581,11 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				idempotencyKey,
 				attempt,
 				message: error instanceof Error ? error.message : String(error),
-				retryNotBefore:
-					attempt >= this.#maxAttempts
-						? null
-						: new Date(
-								Date.parse(now) + retryDelay(attempt, this.#retryBaseDelayMs, this.#retryMaxDelayMs),
-							).toISOString(),
+				retryNotBefore: retryable
+					? new Date(
+							Date.parse(now) + retryDelay(retryAttempt, this.#retryBaseDelayMs, this.#retryMaxDelayMs),
+						).toISOString()
+					: null,
 				stage,
 				diagnostics,
 			};
@@ -536,17 +682,34 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		if (skillCheckpoint === undefined || !hasSkillCandidates(job)) {
 			throw new Error(`Evolution job "${sourceEvolutionJobId}" has no checkpointed skill candidates`);
 		}
-		const history = workEvents(
-			(await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope)).events,
-			job.jobId,
+		const registryEvents = (await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope)).events;
+		const history = workEvents(registryEvents, job.jobId);
+		const terminal = latestWorkEvent(history);
+		if (
+			terminal?.type === "skill-candidate-work-checkpointed" &&
+			terminal.stage === "completed" &&
+			this.#dependencies.evaluator === undefined &&
+			!hasAwaitingEvaluation(history, await this.#dependencies.registry.list(job.metadata.scope))
+		) {
+			return;
+		}
+		const failures = history.filter(
+			(event): event is SkillCandidateWorkFailedEvent => event.type === "skill-candidate-work-failed",
 		);
-		const completedCheckpoint = history.find(
-			(event): event is SkillCandidateWorkCheckpointedEvent =>
-				event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+		const latestLegacyFailure = failures.reduce<SkillCandidateWorkFailedEvent | null>(
+			(latest, failure) =>
+				failure.diagnostics === undefined && (latest === null || failure.registrySequence > latest.registrySequence)
+					? failure
+					: latest,
+			null,
 		);
-		if (completedCheckpoint !== undefined && this.#dependencies.evaluator === undefined) return;
-		const attempt = history.filter((event) => event.type === "skill-candidate-work-failed").length + 1;
-		if (attempt > this.#maxAttempts) throw new Error(`Skill candidate work for "${job.jobId}" exhausted retries`);
+		const retryAttempt =
+			failures.filter(
+				(failure) =>
+					latestLegacyFailure === null || failure.registrySequence > latestLegacyFailure.registrySequence,
+			).length + 1;
+		const attempt = failures.reduce((highest, failure) => Math.max(highest, failure.attempt), 0) + 1;
+		const recoveryGroupIds = legacySynthesisGroupIds(history);
 
 		let activeStage: SkillCandidateWorkStage = "consolidating";
 		let activeGroupId: string | null = null;
@@ -596,7 +759,11 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			];
 			activeStage = "scoring";
 			await this.#appendCheckpoint(job, activeStage, attempt, processedGroupIds, claim());
-			const synthesisTargets = result.groups.filter((group) => group.state === "evidence-qualified");
+			const synthesisTargets = result.groups.filter(
+				(group) =>
+					group.state === "evidence-qualified" &&
+					(recoveryGroupIds === null || recoveryGroupIds.has(group.groupId)),
+			);
 			activeStage = "synthesizing";
 			await this.#appendCheckpoint(
 				job,
@@ -611,6 +778,9 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				readonly proposalRevisionIds: readonly string[];
 				readonly idempotencyKey: string;
 				readonly error: unknown;
+				readonly attempt: number;
+				readonly retryPending: boolean;
+				readonly reasonCode: "skill-synthesis-attempts-exhausted" | "skill-synthesis-non-retryable";
 			}[] = [];
 			for (const group of synthesisTargets) {
 				activeGroupId = group.groupId;
@@ -628,11 +798,16 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 						});
 					} catch (error) {
 						signal.throwIfAborted();
+						const synthesisAttempt = synthesisAttemptCount(registryEvents, group.synthesisIdempotencyKey) + 1;
+						const retryable = error instanceof EvolutionExecutionError && error.retryable;
 						synthesisFailures.push({
 							groupId: group.groupId,
 							proposalRevisionIds: group.proposalRevisions.map((revision) => revision.revisionId),
 							idempotencyKey: group.synthesisIdempotencyKey,
 							error,
+							attempt: synthesisAttempt,
+							retryPending: retryable && synthesisAttempt < this.#maxAttempts,
+							reasonCode: retryable ? "skill-synthesis-attempts-exhausted" : "skill-synthesis-non-retryable",
 						});
 						continue;
 					}
@@ -651,11 +826,17 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				);
 			}
 			activeGroupId = null;
-			if (synthesisFailures.length > 0 && attempt >= this.#maxAttempts) {
+			const terminalSynthesisFailures = synthesisFailures.filter((failure) => !failure.retryPending);
+			if (terminalSynthesisFailures.length > 0) {
 				await this.#dependencies.registry.recordSynthesisFailures({
 					scope: job.metadata.scope,
 					lease: claim(),
-					failures: synthesisFailures.map(({ error: _error, ...failure }) => failure),
+					failures: terminalSynthesisFailures.map((failure) => ({
+						groupId: failure.groupId,
+						proposalRevisionIds: failure.proposalRevisionIds,
+						idempotencyKey: failure.idempotencyKey,
+						reasonCode: failure.reasonCode,
+					})),
 					createdAt: this.#dependencies.clock.now(),
 				});
 			}
@@ -782,10 +963,19 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			}
 			activeGroupId = null;
 			if (synthesisFailures.length > 0) {
+				const retryableFailures = synthesisFailures.filter((failure) => failure.retryPending);
 				throw new SkillCandidateWorkStageError(
 					"synthesizing",
-					synthesisFailures,
+					synthesisFailures.map((failure) => ({
+						groupId: failure.groupId,
+						synthesisIdempotencyKey: failure.idempotencyKey,
+						error: failure.error,
+					})),
 					`Skill synthesis failed for candidate groups: ${synthesisFailures.map((failure) => failure.groupId).join(", ")}`,
+					{
+						retryable: retryableFailures.length > 0,
+						retryAttempt: Math.max(1, ...retryableFailures.map((failure) => failure.attempt)),
+					},
 				);
 			}
 			activeStage = "completed";
@@ -803,10 +993,25 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				error instanceof SkillCandidateWorkStageError
 					? error.failures.map((failure) => ({
 							groupId: failure.groupId,
+							...(failure.synthesisIdempotencyKey === undefined
+								? {}
+								: { synthesisIdempotencyKey: failure.synthesisIdempotencyKey }),
 							error: errorDiagnostic(failure.error),
 						}))
 					: [{ groupId: activeGroupId, error: errorDiagnostic(error) }];
-			await this.#appendFailure(job, attempt, stage, diagnostics, error, claim());
+			const failureRetryAttempt = error instanceof SkillCandidateWorkStageError ? error.retryAttempt : retryAttempt;
+			const failureRetryable =
+				error instanceof SkillCandidateWorkStageError ? error.retryable : retryAttempt < this.#maxAttempts;
+			await this.#appendFailure(
+				job,
+				attempt,
+				failureRetryAttempt,
+				failureRetryable,
+				stage,
+				diagnostics,
+				error,
+				claim(),
+			);
 			throw error;
 		}
 	}

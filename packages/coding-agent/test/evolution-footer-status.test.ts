@@ -1,6 +1,7 @@
 import type { HarnessVersion } from "@earendil-works/diffex-harness-state";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { EvolutionHarnessVersionInfo, EvolutionOverview, EvolutionProgressEvent } from "#evolution";
+import type { EvolutionHarnessVersionInfo, EvolutionOverview } from "#evolution";
+import type { EvolutionRuntimeEvent } from "../src/core/evolution-runtime.ts";
 import {
 	EvolutionFooterStatus,
 	type EvolutionFooterStatusClient,
@@ -53,17 +54,20 @@ function client(
 	initialVersionInfo: readonly EvolutionHarnessVersionInfo[],
 ): {
 	client: EvolutionFooterStatusClient;
-	emit: (event: EvolutionProgressEvent) => void;
+	emit: (event: EvolutionRuntimeEvent) => void;
+	setEnabled: (value: boolean) => void;
 	setOverview: (value: EvolutionOverview) => void;
 	setVersionInfo: (value: readonly EvolutionHarnessVersionInfo[]) => void;
 	unsubscribed: ReturnType<typeof vi.fn>;
 } {
+	let enabled = true;
 	let currentOverview = initialOverview;
 	let currentVersionInfo = initialVersionInfo;
-	let listener: ((event: EvolutionProgressEvent) => void) | undefined;
+	let listener: ((event: EvolutionRuntimeEvent) => void) | undefined;
 	const unsubscribed = vi.fn();
 	return {
 		client: {
+			getEnabled: () => enabled,
 			subscribe: (next) => {
 				listener = next;
 				return unsubscribed;
@@ -72,6 +76,9 @@ function client(
 			listHarnessVersionInfo: async () => currentVersionInfo,
 		},
 		emit: (event) => listener?.(event),
+		setEnabled: (value) => {
+			enabled = value;
+		},
 		setOverview: (value) => {
 			currentOverview = value;
 		},
@@ -143,6 +150,34 @@ describe("EvolutionFooterStatus", () => {
 		status.dispose();
 	});
 
+	it("stops animating an active evolution job when evolution is disabled", async () => {
+		vi.useFakeTimers();
+		const fixture = client(overview(rootVersion, activeJob()), [
+			{ version: rootVersion, kind: "default", evolvedAt: null, evolvedIn: null },
+		]);
+		const requestRender = vi.fn();
+		const status = new EvolutionFooterStatus({
+			client: fixture.client,
+			getActiveHarnessVersion: () => rootVersion,
+			requestRender,
+			spinnerIntervalMs: 80,
+		});
+
+		await status.refresh();
+		vi.advanceTimersByTime(80);
+		expect(status.getSnapshot().running).toBe(true);
+		const activeFrame = status.getSnapshot().spinnerFrame;
+
+		fixture.setEnabled(false);
+		fixture.emit({ type: "enabled-changed", enabled: false });
+		vi.advanceTimersByTime(160);
+
+		expect(status.getSnapshot().running).toBe(false);
+		expect(status.getSnapshot().spinnerFrame).toBe(activeFrame);
+		expect(requestRender).toHaveBeenCalled();
+		status.dispose();
+	});
+
 	it("activates a newly selected evolved harness after completion", async () => {
 		let activeVersion: HarnessVersion = rootVersion;
 		const fixture = client(overview(rootVersion), [
@@ -182,7 +217,7 @@ describe("EvolutionFooterStatus", () => {
 	});
 
 	it("reloads harness metadata when completion races with an in-flight refresh", async () => {
-		let listener: ((event: EvolutionProgressEvent) => void) | undefined;
+		let listener: ((event: EvolutionRuntimeEvent) => void) | undefined;
 		let resolveOverview: ((value: EvolutionOverview) => void) | undefined;
 		let activeVersion: HarnessVersion = rootVersion;
 		const evolvedOverview = overview(evolvedVersion);
@@ -211,6 +246,7 @@ describe("EvolutionFooterStatus", () => {
 		});
 		const status = new EvolutionFooterStatus({
 			client: {
+				getEnabled: () => true,
 				subscribe: (next) => {
 					listener = next;
 					return () => {};

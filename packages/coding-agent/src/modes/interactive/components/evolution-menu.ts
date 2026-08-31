@@ -14,13 +14,13 @@ import type {
 	EvolutionJobDetail,
 	EvolutionJobSummary,
 	EvolutionOverview,
-	EvolutionProgressEvent,
 	EvolutionProposalDetail,
 	EvolutionRollbackAction,
 	EvolutionSkillActivationResult,
 	EvolutionSkillCandidateDetail,
 	EvolutionStartResult,
 } from "#evolution";
+import type { EvolutionRuntimeEvent } from "../../../core/evolution-runtime.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import {
@@ -35,7 +35,7 @@ export { formatEvolutionTimestamp } from "./harness-version-display.ts";
 export interface EvolutionMenuClient {
 	getEnabled(): boolean;
 	setEnabled(enabled: boolean): Promise<void>;
-	subscribe(listener: (event: EvolutionProgressEvent) => void): () => void;
+	subscribe(listener: (event: EvolutionRuntimeEvent) => void): () => void;
 	overview(): Promise<EvolutionOverview>;
 	listHarnessVersionInfo(): Promise<readonly EvolutionHarnessVersionInfo[]>;
 	listCurrentDirectoryHarnessVersionInfo(): Promise<readonly EvolutionHarnessVersionInfo[]>;
@@ -155,7 +155,13 @@ export function formatEvolutionSkillDraftDiff(detail: EvolutionSkillCandidateDet
 	const before = detail.existingContents
 		.map((skill) => `# Existing skill: ${skill.name} (${skill.version})\n${skill.content}`)
 		.join("\n\n");
-	const after = detail.draft.operation === "RETIRE" ? "" : detail.draft.content;
+	const after =
+		detail.draft.operation === "RETIRE"
+			? ""
+			: [
+					detail.draft.content,
+					...detail.draft.files.map((file) => `# Supporting file: ${file.path}\n${file.content}`),
+				].join("\n\n");
 	const changes = diffLines(before, after, { maxEditLength: 20_000 });
 	if (changes === undefined) return ["Draft diff is too large to render"];
 	return changes.flatMap((change) => {
@@ -215,7 +221,12 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		this.#requestRender = requestRender;
 		this.#pollIntervalMs = pollIntervalMs;
 		this.#unsubscribe = client.subscribe((event) => {
-			if (event.type === "completed") this.#harnessVersionInfoLoaded = false;
+			if (event.type === "enabled-changed") {
+				this.rebuild();
+				this.#requestRender();
+			} else if (event.type === "completed") {
+				this.#harnessVersionInfoLoaded = false;
+			}
 			void this.refresh();
 		});
 		this.rebuild();
@@ -445,7 +456,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		if (action === "rollback-skill") {
 			return [
 				`Roll back ${this.#skillCandidate?.summary.proposedName ?? "the selected evolved skill"}?`,
-				`The selected harness will return to ${this.#skillCandidate?.rollbackTargetHarnessVersion ?? "its immutable parent"}. The next fresh prompt will observe it.`,
+				`The selected harness will return to ${this.#skillCandidate?.rollbackTargetHarnessVersion ?? "its pre-activation revision"}. The next fresh prompt will observe it.`,
 			];
 		}
 		if (action === "cancel") {
@@ -465,6 +476,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 
 	#confirmEntries(view: Extract<MenuView, { kind: "confirm" }>): readonly MenuEntry[] {
 		const { action } = view;
+		const evolutionEnabled = this.#client.getEnabled();
 		const run = () => {
 			if (action === "start") {
 				this.#run(
@@ -502,8 +514,8 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		return [
 			{
 				label: `Confirm ${action}`,
-				enabled: !this.#actionPending,
-				disabledStatus: "Working",
+				enabled: evolutionEnabled && !this.#actionPending,
+				disabledStatus: this.#actionPending ? "Working" : undefined,
 				select: run,
 			},
 			{
@@ -622,10 +634,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 
 	#renderSkillCandidate(detail: EvolutionSkillCandidateDetail): void {
 		this.#addLine(`Skill candidate: ${detail.summary.proposedName}`, "accent");
-		this.#addLine(`Operation: ${detail.summary.operation}`);
-		this.#addLine(`State: ${detail.summary.state}`);
 		this.#addLine(`Target harness: ${detail.targetHarnessVersion ?? "pending activation"}`);
-		this.#addLine(`Rollback available: ${detail.rollbackAvailable ? "yes" : "no"}`);
 	}
 
 	#renderSkillCandidateReview(

@@ -9,6 +9,8 @@ import {
 	type EvolutionInputSnapshot,
 	type EvolutionJob,
 	type EvolutionJobStore,
+	type EvolutionLeaseStore,
+	type EvolutionLeaseToken,
 	type EvolutionScope,
 	PollingSkillCandidateWorkSource,
 	type SkillCandidate,
@@ -248,6 +250,70 @@ class MemoryRegistryStore implements SkillCandidateRegistryStore {
 	}
 }
 
+class CompletionAcknowledgementLostStore extends MemoryRegistryStore {
+	interrupted = false;
+
+	override async appendSkillCandidateRegistryEvents(
+		scope: EvolutionScope,
+		expectedRevision: number,
+		events: readonly SkillCandidateRegistryEvent[],
+	): Promise<SkillCandidateRegistryAppendResult> {
+		if (
+			!this.interrupted &&
+			events.some((event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed")
+		) {
+			this.interrupted = true;
+			if (this.events.length !== expectedRevision) return "conflict";
+			this.events.push(...events);
+			throw new Error("completion acknowledgement lost");
+		}
+		return super.appendSkillCandidateRegistryEvents(scope, expectedRevision, events);
+	}
+}
+
+class MemoryLeaseStore implements EvolutionLeaseStore {
+	readonly leases = new Map<string, EvolutionLeaseToken>();
+
+	async assertHeld(lease: EvolutionLeaseToken): Promise<void> {
+		const current = this.leases.get(`${lease.kind}\0${lease.key}`);
+		if (current?.ownerId !== lease.ownerId || current.fence !== lease.fence) throw new Error("lease was lost");
+	}
+
+	async acquire(
+		kind: EvolutionLeaseToken["kind"],
+		key: string,
+		ownerId: string,
+		acquiredAt: string,
+		ttlMs: number,
+	): Promise<EvolutionLeaseToken | null> {
+		const leaseKey = `${kind}\0${key}`;
+		const current = this.leases.get(leaseKey);
+		if (current !== undefined && Date.parse(current.expiresAt) > Date.parse(acquiredAt)) return null;
+		const lease = {
+			kind,
+			key,
+			ownerId,
+			fence: (current?.fence ?? 0) + 1,
+			expiresAt: new Date(Date.parse(acquiredAt) + ttlMs).toISOString(),
+		};
+		this.leases.set(leaseKey, lease);
+		return lease;
+	}
+
+	async renew(lease: EvolutionLeaseToken, renewedAt: string, ttlMs: number): Promise<EvolutionLeaseToken | null> {
+		await this.assertHeld(lease);
+		const renewed = { ...lease, expiresAt: new Date(Date.parse(renewedAt) + ttlMs).toISOString() };
+		this.leases.set(`${lease.kind}\0${lease.key}`, renewed);
+		return renewed;
+	}
+
+	async release(lease: EvolutionLeaseToken): Promise<void> {
+		const leaseKey = `${lease.kind}\0${lease.key}`;
+		const current = this.leases.get(leaseKey);
+		if (current?.ownerId === lease.ownerId && current.fence === lease.fence) this.leases.delete(leaseKey);
+	}
+}
+
 class FixtureRegistry implements SkillCandidateRegistry {
 	readonly requests: SkillCandidateRegistryConsolidationInput[] = [];
 	readonly draftRequests: SkillCandidateDraftRecordingInput[] = [];
@@ -270,35 +336,52 @@ class FixtureRegistry implements SkillCandidateRegistry {
 
 	async recordDraft(input: SkillCandidateDraftRecordingInput): Promise<SkillCandidateGroup> {
 		this.draftRequests.push(input);
-		const group = this.groups.find((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const group = this.groups[index];
 		if (group === undefined) throw new Error("Unknown group");
-		return { ...group, state: "drafted", draft: input.draft };
+		const drafted = { ...group, state: "drafted" as const, draft: input.draft };
+		this.groups[index] = drafted;
+		return drafted;
 	}
 
 	async recordValidation(input: SkillCandidateValidationRecordingInput): Promise<SkillCandidateGroup> {
 		this.validationRequests.push(input);
-		const group = this.groups.find((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const group = this.groups[index];
 		if (group === undefined) throw new Error("Unknown group");
-		return { ...group, state: "structurally-valid", draft: input.draft, validation: input.validation };
+		const validated = {
+			...group,
+			state: "structurally-valid" as const,
+			draft: input.draft,
+			validation: input.validation,
+		};
+		this.groups[index] = validated;
+		return validated;
 	}
 
 	async startEvaluation(input: SkillCandidateEvaluationStartInput): Promise<SkillCandidateGroup> {
 		this.evaluationStartRequests.push(input);
-		const group = this.groups.find((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const group = this.groups[index];
 		if (group === undefined) throw new Error("Unknown group");
-		return {
+		const pending = {
 			...group,
-			state: "evaluation-pending",
+			state: "evaluation-pending" as const,
 			draft: input.draft,
 			validation: input.validation,
 		};
+		this.groups[index] = pending;
+		return pending;
 	}
 
 	async recordEvaluation(input: SkillCandidateEvaluationRecordingInput): Promise<SkillCandidateGroup> {
 		this.evaluationRequests.push(input);
-		const group = this.groups.find((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const group = this.groups[index];
 		if (group === undefined) throw new Error("Unknown group");
-		return { ...group, state: "accepted", evaluation: input.evaluation };
+		const accepted = { ...group, state: "accepted" as const, evaluation: input.evaluation };
+		this.groups[index] = accepted;
+		return accepted;
 	}
 
 	async list(): Promise<readonly SkillCandidateGroup[]> {
@@ -306,14 +389,14 @@ class FixtureRegistry implements SkillCandidateRegistry {
 	}
 }
 
-function fixture(withEvaluator = false) {
+function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryRegistryStore()) {
 	const input = inputSnapshot();
 	const skillCandidate = candidate();
 	const inputReference = reference(input);
 	const candidateReference = reference(skillCandidate);
 	const job = completedJob(inputReference, candidateReference);
 	const jobs = new MemoryJobStore([job]);
-	const store = new MemoryRegistryStore();
+	const leases = new MemoryLeaseStore();
 	const registry = new FixtureRegistry();
 	const synthesisRequests: SkillSynthesizerInput[] = [];
 	const validationRequests: SkillDraftValidatorInput[] = [];
@@ -338,6 +421,8 @@ function fixture(withEvaluator = false) {
 			jobs,
 			artifacts: new MemoryArtifactStore([input, skillCandidate]),
 			store,
+			leases,
+			ownerId: "worker-1",
 			registry,
 			synthesizer: {
 				async synthesize(request): Promise<SkillDraft> {
@@ -364,6 +449,7 @@ function fixture(withEvaluator = false) {
 							evolutionScope: scope,
 						},
 						content: "---\nname: fixture-skill\ndescription: Fixture skill.\n---\n",
+						files: [],
 					};
 					return { metadata: metadata(content.draftId, content.sourceCandidateIds, content), ...content };
 				},
@@ -473,7 +559,13 @@ function fixture(withEvaluator = false) {
 describe("skill candidate registry worker", () => {
 	it("discovers only completed evolution jobs with unfinished candidate work", async () => {
 		const data = fixture();
-		const source = new PollingSkillCandidateWorkSource({ clock: data.clock, jobs: data.jobs, store: data.store });
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
 
 		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
 		await data.worker.process(data.job.jobId);
@@ -508,6 +600,47 @@ describe("skill candidate registry worker", () => {
 			expect.stringMatching(/^skill-candidate-work-stage-/),
 			expect.stringMatching(/^skill-candidate-work-stage-/),
 		]);
+	});
+
+	it("claims candidate work before concurrent processors can synthesize it", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+
+		const results = await Promise.all([data.worker.process(data.job.jobId), data.worker.process(data.job.jobId)]);
+
+		expect(results).toEqual(["processed", "busy"]);
+		expect(data.registry.requests).toHaveLength(1);
+		expect(data.synthesisRequests).toHaveLength(1);
+		expect(
+			data.store.events.filter(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toHaveLength(1);
+		expect(data.store.events.some((event) => event.type === "skill-candidate-work-failed")).toBe(false);
+	});
+
+	it("does not append failure after a committed completion loses its acknowledgement", async () => {
+		const store = new CompletionAcknowledgementLostStore();
+		const data = fixture(false, store);
+
+		await expect(data.worker.process(data.job.jobId)).rejects.toThrow("completion acknowledgement lost");
+
+		expect(
+			store.events.filter(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toHaveLength(1);
+		expect(store.events.some((event) => event.type === "skill-candidate-work-failed")).toBe(false);
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
+		expect(await source.nextRunnableJob(now)).toBeNull();
 	});
 
 	it("synthesizes and records drafts only for evidence-qualified groups", async () => {
@@ -546,6 +679,63 @@ describe("skill candidate registry worker", () => {
 		]);
 	});
 
+	it("parks structurally valid drafts until an evaluator becomes available", async () => {
+		const data = fixture();
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+
+		await data.worker.process(data.job.jobId);
+
+		expect(data.registry.groups[0]?.state).toBe("structurally-valid");
+		expect(
+			data.store.events.some(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toBe(false);
+		const unavailableSource = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
+		const availableSource = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: true,
+		});
+		expect(await unavailableSource.nextRunnableJob(now)).toBeNull();
+		expect(await availableSource.nextRunnableJob(now)).toBe(data.job.jobId);
+	});
+
+	it("reopens legacy completed work when its evaluator becomes available", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+		await data.worker.process(data.job.jobId);
+		const accepted = data.registry.groups[0];
+		if (accepted === undefined) throw new Error("Expected accepted group");
+		data.registry.groups[0] = { ...accepted, state: "structurally-valid", evaluation: null };
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: true,
+		});
+
+		expect(await source.nextRunnableJob(now)).toBe(data.job.jobId);
+		await data.worker.process(data.job.jobId);
+
+		expect(data.evaluationRequests).toHaveLength(2);
+		expect(data.registry.groups[0]?.state).toBe("accepted");
+		expect(await source.nextRunnableJob(now)).toBeNull();
+	});
+
 	it("evaluates structurally valid drafts and records the gated disposition", async () => {
 		const data = fixture(true);
 		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
@@ -578,7 +768,13 @@ describe("skill candidate registry worker", () => {
 	it("persists bounded retry timing without marking failed work complete", async () => {
 		const data = fixture();
 		data.registry.failuresRemaining = 1;
-		const source = new PollingSkillCandidateWorkSource({ clock: data.clock, jobs: data.jobs, store: data.store });
+		const source = new PollingSkillCandidateWorkSource({
+			clock: data.clock,
+			jobs: data.jobs,
+			store: data.store,
+			registry: data.registry,
+			evaluatorAvailable: false,
+		});
 
 		await expect(data.worker.process(data.job.jobId)).rejects.toThrow("registry unavailable");
 		const failure = data.store.events.find((event) => event.type === "skill-candidate-work-failed");

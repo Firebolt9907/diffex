@@ -48,6 +48,8 @@ import {
 	RecursiveReflector,
 	SkillCandidateBackgroundWorker,
 	SkillCandidateRegistryWorker,
+	type SkillDraftValidationEnvironmentSource,
+	type SkillEvaluator,
 	SkillWriter,
 	StructuredDeltaCurator,
 	StructuredSkillCurator,
@@ -64,7 +66,7 @@ import { resolveHarnessWorkspace } from "./harness-state-runtime.ts";
 import { INVOCATION_TRACE_LOCK_STALE_MS, type InvocationTrace } from "./invocation-trace.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
-import type { Skill } from "./skills.ts";
+import { createEvolvedSkillCatalog, type Skill } from "./skills.ts";
 
 const execFileAsync = promisify(execFile);
 const EVOLUTION_DIRECTORY_NAME = "evolution";
@@ -698,6 +700,55 @@ export function createEvolutionSkillSnapshots(skills: readonly Skill[]): readonl
 	}));
 }
 
+export class SelectedHarnessSkillDraftValidationEnvironmentSource implements SkillDraftValidationEnvironmentSource {
+	readonly #workspace: { readonly repositoryId: string; readonly directoryId: string };
+	readonly #harnessState: HarnessStateStore;
+	readonly #resourceLoader: ResourceLoader;
+
+	constructor(options: {
+		workspace: { readonly repositoryId: string; readonly directoryId: string };
+		harnessState: HarnessStateStore;
+		resourceLoader: ResourceLoader;
+	}) {
+		this.#workspace = options.workspace;
+		this.#harnessState = options.harnessState;
+		this.#resourceLoader = options.resourceLoader;
+	}
+
+	async capture(workspace: Parameters<SkillDraftValidationEnvironmentSource["capture"]>[0], signal?: AbortSignal) {
+		signal?.throwIfAborted();
+		if (
+			workspace.repositoryId !== this.#workspace.repositoryId ||
+			workspace.directoryId !== this.#workspace.directoryId
+		) {
+			throw new Error("Skill validation workspace does not match the repository runtime");
+		}
+		const selected = await this.#harnessState.loadCurrent();
+		signal?.throwIfAborted();
+		const installedSkills = this.#resourceLoader
+			.getSkills()
+			.skills.filter((skill) => skill.sourceKind === "installed");
+		const evolvedSkills = createEvolvedSkillCatalog(selected, this.#workspace).skills;
+		const skillVersions = [...installedSkills, ...evolvedSkills]
+			.map((skill) => ({
+				skillId: skill.skillId,
+				version: skill.version,
+				contentDigest: skill.contentDigest,
+			}))
+			.sort(
+				(left, right) =>
+					left.skillId.localeCompare(right.skillId) ||
+					left.version.localeCompare(right.version) ||
+					left.contentDigest.localeCompare(right.contentDigest),
+			);
+		return {
+			workspace: this.#workspace,
+			harnessVersion: selected.manifest.version,
+			skillVersions,
+		};
+	}
+}
+
 class CodingAgentSnapshotSource implements EvolutionSnapshotSource {
 	readonly #cwd: string;
 	readonly #directoryId: string;
@@ -788,6 +839,13 @@ export interface CodingAgentEvolutionRuntime {
 	stop(): Promise<void>;
 }
 
+export type EvolutionRuntimeEvent =
+	| EvolutionProgressEvent
+	| {
+			readonly type: "enabled-changed";
+			readonly enabled: boolean;
+	  };
+
 export interface CreateCodingAgentEvolutionRuntimeOptions {
 	readonly agentDir: string;
 	readonly cwd: string;
@@ -795,6 +853,8 @@ export interface CreateCodingAgentEvolutionRuntimeOptions {
 	readonly harnessState: HarnessStateStore;
 	readonly modelRuntime: ModelRuntime;
 	readonly resourceLoader: ResourceLoader;
+	/** Optional retrieval and behavior evaluation capability for synthesized skill candidates. */
+	readonly skillEvaluator?: SkillEvaluator;
 }
 
 export async function createCodingAgentEvolutionRuntime(
@@ -896,41 +956,33 @@ export async function createCodingAgentEvolutionRuntime(
 		version: VERSION,
 		artifacts: persistence,
 		jobs: persistence,
-		environment: {
-			async capture(workspace, signal) {
-				signal?.throwIfAborted();
-				if (
-					workspace.repositoryId !== scope.repositoryId ||
-					workspace.directoryId !== currentDirectory.directoryId
-				) {
-					throw new Error("Skill validation workspace does not match the repository runtime");
-				}
-				const harnessVersion = options.session.activeHarnessVersion;
-				if (harnessVersion === undefined) throw new Error("Skill validation requires an active session harness");
-				return {
-					workspace: { repositoryId: scope.repositoryId, directoryId: currentDirectory.directoryId },
-					harnessVersion,
-					skillVersions: options.resourceLoader.getSkills().skills.map((skill) => ({
-						skillId: skill.skillId,
-						version: skill.version,
-						contentDigest: skill.contentDigest,
-					})),
-				};
-			},
-		},
+		environment: new SelectedHarnessSkillDraftValidationEnvironmentSource({
+			workspace: { repositoryId: scope.repositoryId, directoryId: currentDirectory.directoryId },
+			harnessState: options.harnessState,
+			resourceLoader: options.resourceLoader,
+		}),
 	});
 	const candidateWorker = new SkillCandidateBackgroundWorker({
 		clock,
-		source: new PollingSkillCandidateWorkSource({ clock, jobs: persistence, store: persistence }),
+		source: new PollingSkillCandidateWorkSource({
+			clock,
+			jobs: persistence,
+			store: persistence,
+			registry: candidateRegistry,
+			evaluatorAvailable: options.skillEvaluator !== undefined,
+		}),
 		processor: new SkillCandidateRegistryWorker({
 			version: VERSION,
 			clock,
 			jobs: persistence,
 			artifacts: persistence,
 			store: persistence,
+			leases: persistence,
+			ownerId: `skill-candidate-worker-${randomUUID()}`,
 			registry: candidateRegistry,
 			synthesizer: skillSynthesizer,
 			validator: skillValidator,
+			evaluator: options.skillEvaluator,
 			model,
 		}),
 		priority,
@@ -1012,9 +1064,11 @@ export class EvolutionRuntimeCoordinator implements AgentSessionLifecycleObserve
 	readonly #trace: InvocationTrace;
 	readonly #getEnabled: () => boolean;
 	readonly #setEnabled: (enabled: boolean) => void | Promise<void>;
-	readonly #listeners = new Set<(event: EvolutionProgressEvent) => void>();
+	readonly #listeners = new Set<(event: EvolutionRuntimeEvent) => void>();
 	#runtime: CodingAgentEvolutionRuntime | null = null;
 	#unsubscribe: (() => void) | null = null;
+	#enabled: boolean;
+	#toggleQueue: Promise<void> = Promise.resolve();
 
 	constructor(
 		trace: InvocationTrace,
@@ -1029,15 +1083,17 @@ export class EvolutionRuntimeCoordinator implements AgentSessionLifecycleObserve
 		this.#trace = trace;
 		this.#getEnabled = toggle.getEnabled;
 		this.#setEnabled = toggle.setEnabled;
+		this.#enabled = toggle.getEnabled();
 	}
 
 	async replace(runtime: CodingAgentEvolutionRuntime): Promise<void> {
+		await this.#toggleQueue;
 		const previous = this.#runtime;
 		this.#unsubscribe?.();
 		this.#unsubscribe = null;
 		this.#runtime = null;
 		await previous?.stop();
-		if (this.#getEnabled()) await runtime.start();
+		if (this.#enabled && this.#getEnabled()) await runtime.start();
 		this.#runtime = runtime;
 		this.#unsubscribe = runtime.control.subscribe((event) => {
 			for (const listener of this.#listeners) listener(event);
@@ -1046,28 +1102,31 @@ export class EvolutionRuntimeCoordinator implements AgentSessionLifecycleObserve
 
 	async operationSettled(settlement: AgentSessionOperationSettlement): Promise<void> {
 		await this.#trace.operationSettled(settlement);
-		if (this.#getEnabled()) this.#runtime?.evaluateAutomatic();
+		if (this.#enabled && this.#getEnabled()) this.#runtime?.evaluateAutomatic();
 	}
 
 	getEnabled(): boolean {
-		return this.#getEnabled();
+		return this.#enabled;
 	}
 
-	async setEnabled(enabled: boolean): Promise<void> {
-		if (this.#getEnabled() === enabled) return;
-		await Promise.all([
-			this.#setEnabled(enabled),
-			this.#trace.setEnabled(enabled),
-			enabled ? Promise.resolve() : this.#runtime?.stop(),
-		]);
-		if (enabled) await this.#runtime?.start();
+	setEnabled(enabled: boolean): Promise<void> {
+		const update = this.#toggleQueue.then(async () => {
+			if (this.#getEnabled() !== enabled) await this.#setEnabled(enabled);
+			if (this.#enabled === enabled) return;
+			this.#enabled = enabled;
+			await Promise.all([this.#trace.setEnabled(enabled), enabled ? Promise.resolve() : this.#runtime?.stop()]);
+			if (enabled) await this.#runtime?.start();
+			for (const listener of this.#listeners) listener({ type: "enabled-changed", enabled });
+		});
+		this.#toggleQueue = update.catch(() => {});
+		return update;
 	}
 
 	harnessActivated(version: HarnessVersion): Promise<void> {
 		return this.#trace.harnessActivated(version);
 	}
 
-	subscribe(listener: (event: EvolutionProgressEvent) => void): () => void {
+	subscribe(listener: (event: EvolutionRuntimeEvent) => void): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
 	}
@@ -1077,12 +1136,17 @@ export class EvolutionRuntimeCoordinator implements AgentSessionLifecycleObserve
 		return this.#runtime.control;
 	}
 
+	#enabledControl(): EvolutionControlService {
+		if (!this.#enabled || !this.#getEnabled()) throw new Error("Self-evolution is disabled");
+		return this.#control();
+	}
+
 	overview(): Promise<EvolutionOverview> {
 		return this.#control().overview();
 	}
 
 	listJobs(): Promise<readonly EvolutionJobSummary[]> {
-		return this.#control().listJobs();
+		return this.#enabledControl().listJobs();
 	}
 
 	listHarnessVersionInfo(): Promise<readonly EvolutionHarnessVersionInfo[]> {
@@ -1094,42 +1158,43 @@ export class EvolutionRuntimeCoordinator implements AgentSessionLifecycleObserve
 	}
 
 	jobDetail(jobId: string): Promise<EvolutionJobDetail> {
-		return this.#control().getJob(jobId);
+		return this.#enabledControl().getJob(jobId);
 	}
 
 	proposalDetail(jobId: string, proposalId: string): Promise<EvolutionProposalDetail> {
-		return this.#control().getProposal(jobId, proposalId);
+		return this.#enabledControl().getProposal(jobId, proposalId);
 	}
 
 	skillCandidateDetail(jobId: string, candidateId: string) {
-		return this.#control().getSkillCandidate(jobId, candidateId);
+		return this.#enabledControl().getSkillCandidate(jobId, candidateId);
 	}
 
 	activateSkillCandidate(jobId: string, candidateId: string) {
-		return this.#control().activateSkillCandidate(jobId, candidateId);
+		return this.#enabledControl().activateSkillCandidate(jobId, candidateId);
 	}
 
 	rollbackSkillCandidate(jobId: string, candidateId: string) {
-		return this.#control().rollbackSkillCandidate(jobId, candidateId);
+		return this.#enabledControl().rollbackSkillCandidate(jobId, candidateId);
 	}
 
 	startManual(): Promise<EvolutionStartResult> {
-		return this.#control().startManual();
+		return this.#enabledControl().startManual();
 	}
 
 	resumeNewest(): Promise<EvolutionJobSummary> {
-		return this.#control().resumeNewest();
+		return this.#enabledControl().resumeNewest();
 	}
 
 	cancelJob(jobId: string): Promise<void> {
-		return this.#control().cancelJob(jobId);
+		return this.#enabledControl().cancelJob(jobId);
 	}
 
 	rollback(): Promise<EvolutionRollbackAction> {
-		return this.#control().rollback();
+		return this.#enabledControl().rollback();
 	}
 
 	async stop(): Promise<void> {
+		await this.#toggleQueue;
 		this.#unsubscribe?.();
 		this.#unsubscribe = null;
 		const runtime = this.#runtime;

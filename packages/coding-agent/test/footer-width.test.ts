@@ -1,8 +1,9 @@
 import type { HarnessVersion } from "@earendil-works/diffex-harness-state";
 import { visibleWidth } from "@earendil-works/diffex-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import type { EvolutionHarnessVersionInfo, EvolutionOverview, EvolutionProgressEvent } from "#evolution";
+import type { EvolutionHarnessVersionInfo, EvolutionOverview } from "#evolution";
 import type { AgentSession } from "../src/core/agent-session.ts";
+import type { EvolutionRuntimeEvent } from "../src/core/evolution-runtime.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
 import type { EvolutionFooterStatusClient } from "../src/modes/interactive/components/evolution-footer-status.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
@@ -96,9 +97,11 @@ function createSession(options: {
 function createEvolutionClient(
 	currentOverview: EvolutionOverview,
 	versionInfo: readonly EvolutionHarnessVersionInfo[],
+	enabled = true,
 ): EvolutionFooterStatusClient {
 	return {
-		subscribe: (_listener: (event: EvolutionProgressEvent) => void) => () => {},
+		getEnabled: () => enabled,
+		subscribe: (_listener: (event: EvolutionRuntimeEvent) => void) => () => {},
 		overview: async () => currentOverview,
 		listHarnessVersionInfo: async () => versionInfo,
 	};
@@ -269,6 +272,36 @@ describe("FooterComponent width handling", () => {
 		await vi.waitFor(() => {
 			const harnessLine = stripAnsi(footer.render(200)[1]);
 			expect(harnessLine).toMatch(new RegExp(`Harness ${formatEvolutionTimestamp(evolvedAt)} [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`));
+		});
+		footer.dispose();
+	});
+
+	it("hides the evolution spinner while evolution is disabled", async () => {
+		const version = `sha256:${"b".repeat(64)}` as HarnessVersion;
+		const evolvedAt = new Date().toISOString();
+		const activeJob = {
+			jobId: "job-active",
+			trigger: "automatic",
+			stage: "reflecting",
+			outcome: "active",
+			reasonCode: null,
+			createdAt: evolvedAt,
+			updatedAt: evolvedAt,
+			terminalAt: null,
+			resumable: false,
+			cancellable: true,
+		} satisfies NonNullable<EvolutionOverview["activeJob"]>;
+		const session = createSession({ sessionName: "", activeHarnessVersion: version });
+		const footer = new FooterComponent(session, createFooterData(1), {
+			evolution: createEvolutionClient(
+				evolutionOverview(version, activeJob),
+				[{ version, kind: "evolved", evolvedAt, evolvedIn: "/projects/diffex" }],
+				false,
+			),
+		});
+
+		await vi.waitFor(() => {
+			expect(stripAnsi(footer.render(200)[1])).toBe(`Harness ${formatEvolutionTimestamp(evolvedAt)}`);
 		});
 		footer.dispose();
 	});

@@ -3,6 +3,7 @@ import type {
 	EvolutionArtifactProducer,
 	EvolutionInputSnapshot,
 	EvolutionJob,
+	EvolutionLeaseToken,
 	EvolutionScope,
 	SkillCandidate,
 	SkillCandidateRegistryEvent,
@@ -17,6 +18,7 @@ import type {
 	EvolutionArtifactStore,
 	EvolutionClock,
 	EvolutionJobStore,
+	EvolutionLeaseStore,
 	EvolutionModelExecutor,
 	InteractivePriorityGate,
 	SkillCandidateRegistry,
@@ -32,12 +34,16 @@ const DEFAULT_FAILURE_BACKOFF_MS = 5_000;
 const DEFAULT_RETRY_BASE_DELAY_MS = 5_000;
 const DEFAULT_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_LEASE_TTL_MS = 5 * 60_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
 const MAX_APPEND_ATTEMPTS = 5;
 
 export interface PollingSkillCandidateWorkSourceDependencies {
 	readonly clock: EvolutionClock;
 	readonly jobs: EvolutionJobStore;
 	readonly store: SkillCandidateRegistryStore;
+	readonly registry: SkillCandidateRegistry;
+	readonly evaluatorAvailable: boolean;
 }
 
 export interface PollingSkillCandidateWorkSourceOptions {
@@ -45,7 +51,7 @@ export interface PollingSkillCandidateWorkSourceOptions {
 }
 
 export interface SkillCandidateWorkProcessor {
-	process(sourceEvolutionJobId: string, signal?: AbortSignal): Promise<void>;
+	process(sourceEvolutionJobId: string, signal?: AbortSignal): Promise<"busy" | "processed">;
 }
 
 export interface SkillCandidateRegistryWorkerDependencies {
@@ -54,6 +60,8 @@ export interface SkillCandidateRegistryWorkerDependencies {
 	readonly jobs: EvolutionJobStore;
 	readonly artifacts: EvolutionArtifactStore;
 	readonly store: SkillCandidateRegistryStore;
+	readonly leases: EvolutionLeaseStore;
+	readonly ownerId: string;
 	readonly registry: SkillCandidateRegistry;
 	readonly synthesizer: SkillSynthesizer;
 	readonly validator: SkillDraftValidator;
@@ -65,6 +73,8 @@ export interface SkillCandidateRegistryWorkerOptions {
 	readonly maxAttempts?: number;
 	readonly retryBaseDelayMs?: number;
 	readonly retryMaxDelayMs?: number;
+	readonly leaseTtlMs?: number;
+	readonly heartbeatIntervalMs?: number;
 }
 
 export interface SkillCandidateBackgroundWorkerDependencies {
@@ -111,6 +121,30 @@ function wait(delayMs: number, signal: AbortSignal): Promise<void> {
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
 	});
+}
+
+function combineSignals(signals: readonly (AbortSignal | undefined)[]): {
+	readonly signal: AbortSignal;
+	readonly dispose: () => void;
+} {
+	const controller = new AbortController();
+	const listeners = new Map<AbortSignal, () => void>();
+	for (const signal of signals) {
+		if (signal === undefined) continue;
+		if (signal.aborted) {
+			controller.abort(signal.reason);
+			break;
+		}
+		const listener = () => controller.abort(signal.reason);
+		listeners.set(signal, listener);
+		signal.addEventListener("abort", listener, { once: true });
+	}
+	return {
+		signal: controller.signal,
+		dispose() {
+			for (const [signal, listener] of listeners) signal.removeEventListener("abort", listener);
+		},
+	};
 }
 
 function hasSkillCandidates(job: EvolutionJob): boolean {
@@ -181,11 +215,23 @@ export class PollingSkillCandidateWorkSource {
 		for (const job of jobs) {
 			const snapshot = await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope);
 			const events = workEvents(snapshot.events, job.jobId);
-			if (
-				events.some((event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed")
-			) {
-				continue;
-			}
+			const evaluationGroupIds = new Set(
+				events.flatMap((event) =>
+					event.type === "skill-candidate-work-checkpointed" && event.stage === "evaluating" ? event.groupIds : [],
+				),
+			);
+			const awaitingEvaluation =
+				evaluationGroupIds.size > 0 &&
+				(await this.#dependencies.registry.list(job.metadata.scope)).some(
+					(group) =>
+						evaluationGroupIds.has(group.groupId) &&
+						(group.state === "structurally-valid" || group.state === "evaluation-pending"),
+				);
+			const completed = events.some(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			);
+			if (completed && !(this.#dependencies.evaluatorAvailable && awaitingEvaluation)) continue;
+			if (awaitingEvaluation && !this.#dependencies.evaluatorAvailable) continue;
 			const latestFailure = events
 				.filter((event): event is SkillCandidateWorkFailedEvent => event.type === "skill-candidate-work-failed")
 				.sort((left, right) => right.attempt - left.attempt)[0];
@@ -208,12 +254,15 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 	readonly #maxAttempts: number;
 	readonly #retryBaseDelayMs: number;
 	readonly #retryMaxDelayMs: number;
+	readonly #leaseTtlMs: number;
+	readonly #heartbeatIntervalMs: number;
 
 	constructor(
 		dependencies: SkillCandidateRegistryWorkerDependencies,
 		options: SkillCandidateRegistryWorkerOptions = {},
 	) {
 		this.#dependencies = dependencies;
+		if (dependencies.ownerId.trim() === "") throw new Error("ownerId must be non-empty");
 		this.#producer = {
 			name: "diffex-skill-candidate-worker",
 			version: dependencies.version,
@@ -233,6 +282,16 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		);
 		if (this.#retryMaxDelayMs < this.#retryBaseDelayMs) {
 			throw new Error("retryMaxDelayMs must be at least retryBaseDelayMs");
+		}
+		this.#leaseTtlMs = positiveInteger(options.leaseTtlMs, DEFAULT_LEASE_TTL_MS, "leaseTtlMs");
+		this.#heartbeatIntervalMs = positiveInteger(
+			options.heartbeatIntervalMs,
+			DEFAULT_HEARTBEAT_INTERVAL_MS,
+			"heartbeatIntervalMs",
+		);
+		if (this.#leaseTtlMs < 2_000) throw new Error("leaseTtlMs must be at least 2000");
+		if (this.#heartbeatIntervalMs >= this.#leaseTtlMs) {
+			throw new Error("heartbeatIntervalMs must be less than leaseTtlMs");
 		}
 	}
 
@@ -258,9 +317,10 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		stage: SkillCandidateWorkStage,
 		attempt: number,
 		groupIds: readonly string[],
+		lease: EvolutionLeaseToken,
 	): Promise<void> {
 		const idempotencyKey = stableId("skill-candidate-work-stage", { sourceEvolutionJobId: job.jobId, stage });
-		await this.#appendEvent(job.metadata.scope, (registrySequence, existing) => {
+		await this.#appendEvent(job.metadata.scope, lease, (registrySequence, existing) => {
 			if (
 				existing.some(
 					(event) =>
@@ -297,18 +357,21 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		});
 	}
 
-	async #appendFailure(job: EvolutionJob, attempt: number, error: unknown): Promise<void> {
+	async #appendFailure(job: EvolutionJob, attempt: number, error: unknown, lease: EvolutionLeaseToken): Promise<void> {
 		const idempotencyKey = stableId("skill-candidate-work-failure", {
 			sourceEvolutionJobId: job.jobId,
 			attempt,
 		});
-		await this.#appendEvent(job.metadata.scope, (registrySequence, existing) => {
+		await this.#appendEvent(job.metadata.scope, lease, (registrySequence, existing) => {
 			if (
 				existing.some(
 					(event) =>
-						event.type === "skill-candidate-work-failed" &&
-						event.sourceEvolutionJobId === job.jobId &&
-						event.attempt === attempt,
+						(event.type === "skill-candidate-work-checkpointed" &&
+							event.sourceEvolutionJobId === job.jobId &&
+							event.stage === "completed") ||
+						(event.type === "skill-candidate-work-failed" &&
+							event.sourceEvolutionJobId === job.jobId &&
+							event.attempt === attempt),
 				)
 			) {
 				return null;
@@ -340,6 +403,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 
 	async #appendEvent(
 		scope: EvolutionScope,
+		lease: EvolutionLeaseToken,
 		build: (
 			registrySequence: number,
 			existing: readonly SkillCandidateRegistryEvent[],
@@ -349,16 +413,71 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			const snapshot = await this.#dependencies.store.loadSkillCandidateRegistry(scope);
 			const event = build(snapshot.revision + 1, snapshot.events);
 			if (event === null) return;
-			const result = await this.#dependencies.store.appendSkillCandidateRegistryEvents(scope, snapshot.revision, [
-				event,
-			]);
+			const result = await this.#dependencies.store.appendSkillCandidateRegistryEvents(
+				scope,
+				snapshot.revision,
+				[event],
+				lease,
+			);
 			if (result === "committed") return;
 		}
 		throw new Error("Skill candidate work history changed too often to append an event");
 	}
 
-	async process(sourceEvolutionJobId: string, signal?: AbortSignal): Promise<void> {
+	async process(sourceEvolutionJobId: string, signal?: AbortSignal): Promise<"busy" | "processed"> {
 		signal?.throwIfAborted();
+		const workId = stableId("skill-candidate-work", { sourceEvolutionJobId });
+		const initialLease = await this.#dependencies.leases.acquire(
+			"candidate-work",
+			workId,
+			this.#dependencies.ownerId,
+			this.#dependencies.clock.now(),
+			this.#leaseTtlMs,
+		);
+		if (initialLease === null) {
+			signal?.throwIfAborted();
+			return "busy";
+		}
+		let currentLease = initialLease;
+		const heartbeatController = new AbortController();
+		const compromisedController = new AbortController();
+		const combined = combineSignals([signal, compromisedController.signal]);
+		const heartbeat = (async () => {
+			try {
+				while (!heartbeatController.signal.aborted) {
+					await wait(this.#heartbeatIntervalMs, heartbeatController.signal);
+					const renewed = await this.#dependencies.leases.renew(
+						currentLease,
+						this.#dependencies.clock.now(),
+						this.#leaseTtlMs,
+					);
+					if (renewed === null) {
+						compromisedController.abort(new Error(`Skill candidate work lease "${workId}" was lost`));
+						return;
+					}
+					currentLease = renewed;
+				}
+			} catch (error) {
+				if (!heartbeatController.signal.aborted) compromisedController.abort(error);
+			}
+		})();
+		try {
+			await this.#processClaimed(sourceEvolutionJobId, () => currentLease, combined.signal);
+			return "processed";
+		} finally {
+			heartbeatController.abort();
+			combined.dispose();
+			await heartbeat.catch(() => {});
+			await this.#dependencies.leases.release(currentLease);
+		}
+	}
+
+	async #processClaimed(
+		sourceEvolutionJobId: string,
+		claim: () => EvolutionLeaseToken,
+		signal: AbortSignal,
+	): Promise<void> {
+		signal.throwIfAborted();
 		const job = await this.#dependencies.jobs.load(sourceEvolutionJobId);
 		if (job === null || job.outcome !== "completed" || job.stage !== "completed") {
 			throw new Error(`Evolution job "${sourceEvolutionJobId}" is not completed candidate work`);
@@ -371,14 +490,16 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			(await this.#dependencies.store.loadSkillCandidateRegistry(job.metadata.scope)).events,
 			job.jobId,
 		);
-		if (history.some((event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed")) {
-			return;
-		}
+		const completedCheckpoint = history.find(
+			(event): event is SkillCandidateWorkCheckpointedEvent =>
+				event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+		);
+		if (completedCheckpoint !== undefined && this.#dependencies.evaluator === undefined) return;
 		const attempt = history.filter((event) => event.type === "skill-candidate-work-failed").length + 1;
 		if (attempt > this.#maxAttempts) throw new Error(`Skill candidate work for "${job.jobId}" exhausted retries`);
 
 		try {
-			await this.#appendCheckpoint(job, "consolidating", attempt, []);
+			await this.#appendCheckpoint(job, "consolidating", attempt, [], claim());
 			const inputArtifact = await this.#dependencies.artifacts.get(job.inputSnapshot);
 			if (!isInputSnapshot(inputArtifact)) throw new Error("Evolution job input snapshot artifact is invalid");
 			const artifacts = await Promise.all(
@@ -401,6 +522,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 			}
 			const result = await this.#dependencies.registry.consolidate({
 				sourceEvolutionJobId: job.jobId,
+				lease: claim(),
 				input: inputArtifact,
 				candidates,
 				idempotencyKey: stableId("skill-candidate-consolidation", {
@@ -420,17 +542,18 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					),
 				]),
 			];
-			await this.#appendCheckpoint(job, "scoring", attempt, processedGroupIds);
+			await this.#appendCheckpoint(job, "scoring", attempt, processedGroupIds, claim());
 			const synthesisTargets = result.groups.filter((group) => group.state === "evidence-qualified");
 			await this.#appendCheckpoint(
 				job,
 				"synthesizing",
 				attempt,
 				synthesisTargets.map((group) => group.groupId),
+				claim(),
 			);
 			const draftedGroups = result.groups.filter((group) => group.state === "drafted");
 			for (const group of synthesisTargets) {
-				signal?.throwIfAborted();
+				signal.throwIfAborted();
 				let draftReference = group.draft;
 				if (draftReference === null) {
 					const draft = await this.#dependencies.synthesizer.synthesize({
@@ -445,6 +568,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				draftedGroups.push(
 					await this.#dependencies.registry.recordDraft({
 						scope: job.metadata.scope,
+						lease: claim(),
 						groupId: group.groupId,
 						draft: draftReference,
 						proposalRevisionIds: group.proposalRevisions.map((revision) => revision.revisionId),
@@ -458,6 +582,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				"validating",
 				attempt,
 				draftedGroups.map((group) => group.groupId),
+				claim(),
 			);
 			const evaluationGroups = new Map(
 				result.groups
@@ -465,7 +590,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					.map((group) => [group.groupId, group]),
 			);
 			for (const group of draftedGroups) {
-				signal?.throwIfAborted();
+				signal.throwIfAborted();
 				if (group.draft === null) throw new Error(`Drafted candidate group "${group.groupId}" has no draft`);
 				const artifact = await this.#dependencies.artifacts.get(group.draft);
 				if (!isSkillDraft(artifact)) throw new Error(`Candidate group "${group.groupId}" draft is invalid`);
@@ -482,6 +607,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				}
 				const validated = await this.#dependencies.registry.recordValidation({
 					scope: job.metadata.scope,
+					lease: claim(),
 					groupId: group.groupId,
 					draft: group.draft,
 					validation: validationReference,
@@ -491,11 +617,12 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				});
 				if (validated.state === "structurally-valid") evaluationGroups.set(validated.groupId, validated);
 			}
-			await this.#appendCheckpoint(job, "evaluating", attempt, [...evaluationGroups.keys()]);
+			await this.#appendCheckpoint(job, "evaluating", attempt, [...evaluationGroups.keys()], claim());
 			const evaluatedGroupIds: string[] = [];
+			if (this.#dependencies.evaluator === undefined && evaluationGroups.size > 0) return;
 			if (this.#dependencies.evaluator !== undefined) {
 				for (const evaluationGroup of evaluationGroups.values()) {
-					signal?.throwIfAborted();
+					signal.throwIfAborted();
 					if (evaluationGroup.draft === null || evaluationGroup.validation === null) {
 						throw new Error(`Candidate group "${evaluationGroup.groupId}" lacks evaluation prerequisites`);
 					}
@@ -506,6 +633,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					}
 					const pending = await this.#dependencies.registry.startEvaluation({
 						scope: job.metadata.scope,
+						lease: claim(),
 						groupId: evaluationGroup.groupId,
 						draft: evaluationGroup.draft,
 						validation: evaluationGroup.validation,
@@ -527,6 +655,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					}
 					await this.#dependencies.registry.recordEvaluation({
 						scope: job.metadata.scope,
+						lease: claim(),
 						groupId: pending.groupId,
 						draft: evaluationGroup.draft,
 						validation: evaluationGroup.validation,
@@ -538,12 +667,16 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 					evaluatedGroupIds.push(pending.groupId);
 				}
 			}
-			await this.#appendCheckpoint(job, "completed", attempt, [
-				...new Set([...processedGroupIds, ...evaluationGroups.keys(), ...evaluatedGroupIds]),
-			]);
+			await this.#appendCheckpoint(
+				job,
+				"completed",
+				attempt,
+				[...new Set([...processedGroupIds, ...evaluationGroups.keys(), ...evaluatedGroupIds])],
+				claim(),
+			);
 		} catch (error) {
-			if (signal?.aborted) throw error;
-			await this.#appendFailure(job, attempt, error);
+			if (signal.aborted) throw error;
+			await this.#appendFailure(job, attempt, error, claim());
 			throw error;
 		}
 	}
@@ -573,8 +706,8 @@ export class SkillCandidateBackgroundWorker {
 		if (jobId === null) return "idle";
 		await this.#dependencies.priority.waitUntilBackgroundAllowed(signal);
 		signal.throwIfAborted();
-		await this.#dependencies.processor.process(jobId, signal);
-		return "ran";
+		const result = await this.#dependencies.processor.process(jobId, signal);
+		return result === "busy" ? "idle" : "ran";
 	}
 
 	start(): void {

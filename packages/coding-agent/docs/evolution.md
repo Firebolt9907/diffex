@@ -1,6 +1,6 @@
 # Harness Evolution
 
-Diffex can derive workspace-scoped guidance from persisted invocation evidence and store it in immutable harness revisions. A revision can contain `EVOLVE.md` memory and evolved `skills/<name>/SKILL.md` artifacts. The selected revision changes both together.
+Diffex can derive workspace-scoped guidance from persisted invocation evidence and store it in immutable harness revisions. A revision can contain `EVOLVE.md` memory and complete evolved skill packages rooted at `skills/<name>/SKILL.md`, including referenced UTF-8 scripts, assets, and documentation. The selected revision changes both together.
 
 ## Controls
 
@@ -11,16 +11,16 @@ Use `/evolve` to:
 - inspect memory proposals and their evidence;
 - inspect skill-candidate provenance, textual draft diffs, deterministic validation, and retrieval/behavior evaluation;
 - activate a skill candidate only after its persisted evaluation is accepted;
-- inspect target revisions and roll back an activated evolved skill to its immutable parent revision;
+- inspect target revisions and roll back an activated evolved skill to its pre-activation revision, even when later descendants preserved it;
 - enable or disable future tracing and evolution work.
 
-Skill activation always requires explicit confirmation. Automatic skill activation is not enabled. Candidates that have not passed every required gate remain read-only.
+Skill activation always requires explicit confirmation. Automatic skill activation is not enabled. Candidates that have not passed every required gate remain read-only. If harness memory changes after evaluation while the evaluated skill inventory remains identical, activation automatically rebases the candidate onto the selected revision and preserves its memory. Skill-inventory changes remain conflicts because they require fresh retrieval and behavior evaluation.
 
 Use `/version` to inspect compatible revisions for the current workspace and select one. Selection validates the complete bundle. A revision with corrupt, unsupported, or workspace-mismatched artifacts is not activated.
 
 ## Request boundaries
 
-Harness selection is resolved at prompt admission. A fresh prompt observes the selected revision; in-flight work and already admitted queued messages keep their pinned memory and skill versions. If `/version` changes while an evolution job is running, the job continues from its frozen base and cannot replace the newer selection.
+Harness selection is resolved at prompt admission. A fresh prompt observes the selected revision; in-flight work and already admitted queued messages keep their pinned memory and skill versions. Background candidate validation reads the atomically selected revision directly, so it does not depend on a session reaching its next prompt boundary first. If `/version` changes while an evolution job is running, the job continues from its frozen base and cannot replace the newer selection.
 
 The footer identifies the active harness and shows background evolution activity. `/skills` lists only evolved skills from the active revision whose workspace identity matches the current workspace.
 
@@ -37,7 +37,7 @@ Evolution model calls use the configured provider and may consume provider quota
 
 ## Validation and security
 
-Source traces, tool output, files, and generated drafts are treated as untrusted data. Deterministic validation checks structure, provenance, workspace scope, immutable versions, inventory, and bounded sensitive-data rules. Retrieval and behavioral evaluation are separate gates.
+Source traces, tool output, files, and generated drafts are treated as untrusted data. Deterministic validation checks structure, provenance, workspace scope, immutable versions, the closed package inventory, portable paths, local-reference resolution, aggregate size limits, and bounded sensitive-data rules. Retrieval and behavioral evaluation are separate gates.
 
 These checks do not prove semantic safety and are not a sandbox. Review candidate provenance, draft diffs, validation issues, and evaluation results before activation. See [Security](security.md).
 
@@ -50,6 +50,6 @@ Evolution state is stored beneath the effective agent directory:
 - `evolution-failures/` contains failure reports;
 - `harness-state/` contains immutable revisions and the selected pointer.
 
-Interrupted jobs and candidate work resume from durable checkpoints. Writer retries use stable idempotency keys, leases, exact base revisions, and compare-and-swap selection. Rollback selects an existing immutable parent; it does not mutate historical revisions.
+Interrupted jobs and candidate work resume from durable checkpoints. Writer retries use stable idempotency keys, leases, exact base revisions, and compare-and-swap selection. Skill rollback follows immutable ancestry to the candidate's application boundary and selects its existing pre-activation revision; it does not mutate historical revisions.
 
-Set `evolution.enabled` to `false` in global settings or use the toggle in `/evolve` to stop future tracing and background/manual evolution controls. Disabling evolution does not unselect the current harness or remove already active evolved skills.
+Set `evolution.enabled` to `false` in global settings or use the toggle in `/evolve` to stop future tracing and background/manual evolution controls. Already-running Diffex processes monitor this global setting and stop their trace collectors and evolution workers when another process disables it. Disabling evolution does not unselect the current harness or remove already active evolved skills.

@@ -2,12 +2,14 @@ import { link, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path";
 import {
 	computeHarnessSkillId,
+	computeHarnessSkillPackageVersion,
 	type HarnessSkill,
 	type HarnessSkillInput,
 	type HarnessStateStore,
 	type HarnessVersionBundle,
 	type HarnessWorkspaceIdentity,
 	validateHarnessSkillContent,
+	validateHarnessSkillFilePath,
 } from "@earendil-works/diffex-harness-state";
 import type {
 	EvolutionArtifactProducer,
@@ -29,6 +31,7 @@ import type {
 	SkillMutationExactDiff,
 	SkillMutationMemoryDisposition,
 	SkillMutationWriteOutput,
+	SkillPackageFile,
 } from "./contracts.ts";
 import { EvolutionExecutionError } from "./errors.ts";
 import type {
@@ -47,6 +50,7 @@ import {
 
 const CANDIDATE_SCHEMA_VERSION = 1 as const;
 const ACTIVATION_SCHEMA_VERSION = 1 as const;
+const MAX_ACTIVATION_REBASE_ATTEMPTS = 8;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
 interface StoredSkillWriterCandidate {
@@ -197,11 +201,34 @@ function skillInput(skill: HarnessSkill): HarnessSkillInput {
 			repositoryId: skill.workspace.repositoryId,
 			...(skill.workspace.directoryId === undefined ? {} : { directoryId: skill.workspace.directoryId }),
 		},
+		files: skill.files.map((file) => ({ path: file.path, content: file.content })),
 	};
 }
 
 function sortSkillInputs(skills: readonly HarnessSkillInput[]): HarnessSkillInput[] {
 	return [...skills].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function sortPackageFiles(files: readonly SkillPackageFile[]): SkillPackageFile[] {
+	return [...files].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+}
+
+function serializedSkills(skills: readonly HarnessSkillInput[] | readonly HarnessSkill[]): string {
+	return serializeEvolutionValue(
+		sortSkillInputs(
+			skills.map((skill) => ({
+				path: skill.path,
+				content: skill.content,
+				workspace: {
+					repositoryId: skill.workspace.repositoryId,
+					...(skill.workspace.directoryId === undefined ? {} : { directoryId: skill.workspace.directoryId }),
+				},
+				files: [...(skill.files ?? [])]
+					.map((file) => ({ path: file.path, content: file.content }))
+					.sort((left, right) => left.path.localeCompare(right.path)),
+			})),
+		),
+	);
 }
 
 function outputForCandidate(candidate: StoredSkillWriterCandidate): SkillMutationWriteOutput {
@@ -487,7 +514,11 @@ export class SkillWriter {
 		};
 	}
 
-	#mutationFor(source: AcceptedSkillMutationSource, base: HarnessVersionBundle): SkillMutation {
+	#mutationFor(
+		source: AcceptedSkillMutationSource,
+		base: HarnessVersionBundle,
+		validatedBase: HarnessVersionBundle,
+	): SkillMutation {
 		const { group, draft, validation, evaluation } = source;
 		if (
 			!sameWorkspace(group.profile.workspace, this.#dependencies.workspace) ||
@@ -500,11 +531,12 @@ export class SkillWriter {
 			) ||
 			draft.workspace.evolutionScope.repositoryId !== group.profile.workspace.evolutionScope.repositoryId ||
 			draft.workspace.evolutionScope.scopeId !== group.profile.workspace.evolutionScope.scopeId ||
-			validation.validatedHarnessVersion !== base.manifest.version ||
-			evaluation.harnessVersion !== base.manifest.version
+			validation.validatedHarnessVersion !== validatedBase.manifest.version ||
+			evaluation.harnessVersion !== validatedBase.manifest.version ||
+			serializedSkills(base.state.skills) !== serializedSkills(validatedBase.state.skills)
 		) {
 			throw new EvolutionExecutionError(
-				"Accepted skill candidate does not match the active workspace and harness base",
+				"Accepted skill candidate does not match the active workspace and compatible harness base",
 				{
 					reasonCode: "harness-base-conflict",
 					retryable: false,
@@ -513,15 +545,22 @@ export class SkillWriter {
 		}
 		const expectedPath = `skills/${draft.proposedName}/SKILL.md`;
 		validateHarnessSkillContent(expectedPath, draft.content);
-		if (!sameValues(validation.canonicalInventory, [expectedPath])) {
+		const expectedInventory = [
+			expectedPath,
+			...draft.files.map((file) => validateHarnessSkillFilePath(expectedPath, file.path)),
+		];
+		if (!sameValues(validation.canonicalInventory, expectedInventory)) {
 			throw new Error(`Candidate group "${group.groupId}" has a noncanonical validated inventory`);
 		}
 		if (
 			evaluation.candidateSkill.skillId !== draft.draftId ||
 			evaluation.candidateSkill.name !== draft.proposedName ||
-			evaluation.candidateSkill.version !== draft.metadata.contentDigest ||
+			evaluation.candidateSkill.version !==
+				computeHarnessSkillPackageVersion({ content: draft.content, files: draft.files }) ||
 			evaluation.candidateSkill.content !== draft.content ||
-			evaluation.candidateSkill.contentDigest !== computeEvolutionContentDigest(draft.content)
+			evaluation.candidateSkill.contentDigest !== computeEvolutionTextDigest(draft.content) ||
+			serializeEvolutionValue(sortPackageFiles(evaluation.candidateSkill.files ?? [])) !==
+				serializeEvolutionValue(sortPackageFiles(draft.files))
 		) {
 			throw new Error(`Candidate group "${group.groupId}" evaluation does not match its draft`);
 		}
@@ -538,7 +577,7 @@ export class SkillWriter {
 			if (
 				frozenVersions.length === 0 ||
 				frozenVersions.some(
-					(version) => version.version !== skill.contentHash || version.contentDigest !== skill.contentHash,
+					(version) => version.version !== skill.packageVersion || version.contentDigest !== skill.contentHash,
 				)
 			) {
 				throw new Error(`Existing skill "${skillId}" no longer matches its frozen digest`);
@@ -585,9 +624,30 @@ export class SkillWriter {
 					: {
 							path: expectedPath,
 							content: draft.content,
+							files: sortPackageFiles(draft.files),
 							contentDigest: computeEvolutionTextDigest(draft.content),
+							packageVersion: computeHarnessSkillPackageVersion({
+								content: draft.content,
+								files: draft.files,
+							}),
 						},
 		};
+	}
+
+	async #mutationForBase(
+		source: AcceptedSkillMutationSource,
+		base: HarnessVersionBundle,
+	): Promise<{ readonly mutation: SkillMutation; readonly validatedBase: HarnessVersionBundle }> {
+		if (source.validation.validatedHarnessVersion !== source.evaluation.harnessVersion) {
+			throw new EvolutionExecutionError("Accepted skill candidate validation and evaluation bases differ", {
+				reasonCode: "harness-base-conflict",
+				retryable: false,
+			});
+		}
+		const validatedBase = await this.#dependencies.harnessState.loadVersion(
+			source.validation.validatedHarnessVersion,
+		);
+		return { mutation: this.#mutationFor(source, base, validatedBase), validatedBase };
 	}
 
 	async buildMutationBatch(input: SkillWriterBuildInput): Promise<SkillMutationBatch> {
@@ -595,7 +655,7 @@ export class SkillWriter {
 		if (!Number.isFinite(Date.parse(input.createdAt))) throw new Error("Skill mutation batch time must be valid");
 		const base = await this.#dependencies.harnessState.loadCurrent();
 		const source = await this.#acceptedSource(input.scope, input.groupId);
-		const mutation = this.#mutationFor(source, base);
+		const { mutation } = await this.#mutationForBase(source, base);
 		const content = {
 			batchId: stableId("skill-mutation-batch", {
 				groupId: input.groupId,
@@ -625,9 +685,12 @@ export class SkillWriter {
 		};
 	}
 
-	async #assertBatch(
-		batch: SkillMutationBatch,
-	): Promise<{ readonly base: HarnessVersionBundle; readonly mutation: SkillMutation }> {
+	async #assertBatch(batch: SkillMutationBatch): Promise<{
+		readonly base: HarnessVersionBundle;
+		readonly mutation: SkillMutation;
+		readonly source: AcceptedSkillMutationSource;
+		readonly validatedBase: HarnessVersionBundle;
+	}> {
 		if (
 			batch.targetKind !== "skill" ||
 			batch.mutations.length !== 1 ||
@@ -642,11 +705,11 @@ export class SkillWriter {
 		assertSafeId(mutation.mutationId, "skill mutation ID");
 		const base = await this.#dependencies.harnessState.loadVersion(batch.expectedBaseVersion);
 		const source = await this.#acceptedSource(batch.metadata.scope, mutation.groupId);
-		const expected = this.#mutationFor(source, base);
+		const { mutation: expected, validatedBase } = await this.#mutationForBase(source, base);
 		if (serializeEvolutionValue(mutation) !== serializeEvolutionValue(expected)) {
 			throw new Error(`Skill mutation batch "${batch.batchId}" does not match its accepted candidate`);
 		}
-		return { base, mutation };
+		return { base, mutation, source, validatedBase };
 	}
 
 	#applyMutation(base: HarnessVersionBundle, mutation: SkillMutation): HarnessSkillInput[] {
@@ -660,9 +723,82 @@ export class SkillWriter {
 				path: mutation.skill.path,
 				content: mutation.skill.content,
 				workspace: mutation.workspace,
+				files: mutation.skill.files,
 			});
 		}
 		return sortSkillInputs(after);
+	}
+
+	#mutationIsApplied(bundle: HarnessVersionBundle, mutation: SkillMutation): boolean {
+		const targetPath = mutation.skill?.path;
+		if (
+			mutation.existingSkills.some(
+				(existing) =>
+					existing.path !== targetPath && bundle.state.skills.some((skill) => skill.path === existing.path),
+			)
+		) {
+			return false;
+		}
+		if (mutation.skill === null) return true;
+		return bundle.state.skills.some(
+			(skill) =>
+				skill.path === mutation.skill?.path &&
+				skill.content === mutation.skill.content &&
+				serializeEvolutionValue(skill.files.map((file) => ({ path: file.path, content: file.content }))) ===
+					serializeEvolutionValue(mutation.skill.files) &&
+				sameWorkspace(skill.workspace, mutation.workspace),
+		);
+	}
+
+	async #selectWithCompatibleRebase(
+		batch: SkillMutationBatch,
+		candidate: StoredSkillWriterCandidate,
+		mutation: SkillMutation,
+		source: AcceptedSkillMutationSource,
+		validatedBase: HarnessVersionBundle,
+		lease: EvolutionLeaseToken,
+	): Promise<string> {
+		let expectedCurrent = candidate.expectedBaseVersion;
+		let targetVersion = candidate.resultingHarnessVersion;
+		let actualCurrent = expectedCurrent;
+		for (let attempt = 0; attempt < MAX_ACTIVATION_REBASE_ATTEMPTS; attempt += 1) {
+			await this.#dependencies.leases.assertHeld(lease);
+			const selection = await this.#dependencies.harnessState.selectVersionIfCurrent(targetVersion, expectedCurrent);
+			if (selection.status === "selected" || selection.actualCurrent === targetVersion) return targetVersion;
+
+			actualCurrent = selection.actualCurrent;
+			const current = await this.#dependencies.harnessState.loadVersion(actualCurrent);
+			if (this.#mutationIsApplied(current, mutation)) {
+				expectedCurrent = actualCurrent;
+				targetVersion = actualCurrent;
+				continue;
+			}
+			const rebasedMutation = this.#mutationFor(source, current, validatedBase);
+			if (serializeEvolutionValue(rebasedMutation) !== serializeEvolutionValue(mutation)) {
+				throw new Error(`Skill mutation batch "${batch.batchId}" changed while rebasing`);
+			}
+			const afterSkills = this.#applyMutation(current, rebasedMutation);
+			const rebased = await this.#dependencies.harnessState.saveVersion(
+				{ memory: current.state.memory, skills: afterSkills },
+				current.manifest.version,
+				current.manifest.metadata,
+			);
+			const staged = await this.#dependencies.harnessState.loadVersion(rebased.manifest.version);
+			if (
+				staged.manifest.base !== current.manifest.version ||
+				staged.state.memory !== current.state.memory ||
+				serializedSkills(staged.state.skills) !== serializedSkills(afterSkills)
+			) {
+				throw new Error(`Skill mutation batch "${batch.batchId}" did not stage its rebased harness bundle`);
+			}
+			expectedCurrent = current.manifest.version;
+			targetVersion = staged.manifest.version;
+		}
+		throw new EvolutionExecutionError("Harness revision kept changing during skill activation", {
+			reasonCode: "harness-base-conflict",
+			retryable: true,
+			diagnostics: { expectedHarnessVersion: expectedCurrent, actualHarnessVersion: actualCurrent },
+		});
 	}
 
 	#writeReceipt(batch: SkillMutationBatch, candidate: StoredSkillWriterCandidate): MutationWriteReceipt {
@@ -725,7 +861,16 @@ export class SkillWriter {
 				contentDigest: skill.contentDigest,
 			})),
 			added:
-				mutation.skill === null ? [] : [{ path: mutation.skill.path, contentDigest: mutation.skill.contentDigest }],
+				mutation.skill === null
+					? []
+					: [
+							{
+								path: mutation.skill.path,
+								contentDigest: mutation.skill.contentDigest,
+								packageVersion: mutation.skill.packageVersion,
+								files: mutation.skill.files.map((file) => file.path),
+							},
+						],
 		};
 		const candidateContent = {
 			schemaVersion: CANDIDATE_SCHEMA_VERSION,
@@ -789,7 +934,7 @@ export class SkillWriter {
 			}
 			return prior.receipt;
 		}
-		await this.#assertBatch(batch);
+		const { mutation, source, validatedBase } = await this.#assertBatch(batch);
 		const output = parseWriteOutput(writeReceipt.result);
 		const candidate = await this.#loadCandidate(batch.batchId);
 		if (
@@ -814,25 +959,18 @@ export class SkillWriter {
 		) {
 			throw new Error(`Skill mutation batch "${batch.batchId}" staged harness bundle is invalid`);
 		}
-		await this.#dependencies.leases.assertHeld(context.lease);
-		const selection = await this.#dependencies.harnessState.selectVersionIfCurrent(
-			candidate.resultingHarnessVersion,
-			candidate.expectedBaseVersion,
+		const resultingHarnessVersion = await this.#selectWithCompatibleRebase(
+			batch,
+			candidate,
+			mutation,
+			source,
+			validatedBase,
+			context.lease,
 		);
-		if (selection.status === "conflict" && selection.actualCurrent !== candidate.resultingHarnessVersion) {
-			throw new EvolutionExecutionError("Harness revision changed before skill activation", {
-				reasonCode: "harness-base-conflict",
-				retryable: false,
-				diagnostics: {
-					expectedHarnessVersion: selection.expectedCurrent,
-					actualHarnessVersion: selection.actualCurrent,
-				},
-			});
-		}
 		const result: HarnessActivationResult = {
 			batchId: batch.batchId,
 			status: "activated",
-			resultingHarnessVersion: candidate.resultingHarnessVersion,
+			resultingHarnessVersion,
 			message: null,
 		};
 		const receipt = this.#activationReceipt(batch, context.idempotencyKey, result, this.#dependencies.clock.now());

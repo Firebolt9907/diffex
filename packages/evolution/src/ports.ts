@@ -39,6 +39,7 @@ import type {
 	SkillCandidateRegistryEvent,
 	SkillCandidateRegistrySnapshot,
 	SkillDraft,
+	SkillDraftValidationReport,
 	ValidationReport,
 } from "./contracts.ts";
 
@@ -59,6 +60,7 @@ export type EvolutionArtifact =
 	| SkillCandidate
 	| SkillCandidatePriorityScore
 	| SkillDraft
+	| SkillDraftValidationReport
 	| DeferredSkillCandidateFinding
 	| ValidationReport;
 
@@ -315,9 +317,20 @@ export interface SkillCandidateDraftRecordingInput {
 	readonly createdAt: string;
 }
 
+export interface SkillCandidateValidationRecordingInput {
+	readonly scope: EvolutionScope;
+	readonly groupId: string;
+	readonly draft: EvolutionArtifactReference;
+	readonly validation: EvolutionArtifactReference;
+	readonly proposalRevisionIds: readonly string[];
+	readonly idempotencyKey: string;
+	readonly createdAt: string;
+}
+
 export interface SkillCandidateRegistry {
 	consolidate(input: SkillCandidateRegistryConsolidationInput): Promise<SkillCandidateRegistryConsolidationResult>;
 	recordDraft(input: SkillCandidateDraftRecordingInput): Promise<SkillCandidateGroup>;
+	recordValidation(input: SkillCandidateValidationRecordingInput): Promise<SkillCandidateGroup>;
 	list(scope: EvolutionScope): Promise<readonly SkillCandidateGroup[]>;
 }
 
@@ -331,6 +344,38 @@ export interface SkillSynthesizerInput {
 
 export interface SkillSynthesizer {
 	synthesize(input: SkillSynthesizerInput): Promise<SkillDraft>;
+}
+
+export interface SkillDraftValidationEnvironment {
+	readonly workspace: {
+		readonly repositoryId: string;
+		readonly directoryId?: string;
+	};
+	readonly harnessVersion: string;
+	readonly skillVersions: readonly {
+		readonly skillId: string;
+		readonly version: string;
+		readonly contentDigest: string;
+	}[];
+}
+
+export interface SkillDraftValidationEnvironmentSource {
+	capture(
+		workspace: SkillCandidateGroup["profile"]["workspace"],
+		signal?: AbortSignal,
+	): Promise<SkillDraftValidationEnvironment>;
+}
+
+export interface SkillDraftValidatorInput {
+	readonly group: SkillCandidateGroup;
+	readonly draft: SkillDraft;
+	readonly idempotencyKey: string;
+	readonly createdAt: string;
+	readonly signal?: AbortSignal;
+}
+
+export interface SkillDraftValidator {
+	validate(input: SkillDraftValidatorInput): Promise<SkillDraftValidationReport>;
 }
 
 export interface EvolutionJobStore {

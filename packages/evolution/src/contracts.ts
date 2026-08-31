@@ -608,6 +608,27 @@ export interface SkillDraft {
 	readonly content: string;
 }
 
+export interface SkillDraftValidationIssue {
+	readonly code: string;
+	readonly message: string;
+}
+
+export interface SkillDraftValidationReport {
+	readonly artifactKind: "skill-draft-validation";
+	readonly metadata: EvolutionArtifactMetadata;
+	readonly validationId: string;
+	readonly groupId: string;
+	readonly draft: EvolutionArtifactReference;
+	readonly validatorVersion: string;
+	readonly assurance: "structure-provenance-scope-and-security-only";
+	readonly disposition: "accepted" | "rejected";
+	readonly issues: readonly SkillDraftValidationIssue[];
+	readonly validatedHarnessVersion: HarnessVersion;
+	readonly validatedSkillVersions: readonly string[];
+	readonly canonicalInventory: readonly string[];
+	readonly memoryRelationshipDigest: string;
+}
+
 export interface SkillCandidateDispositionRecord {
 	readonly eventId: string;
 	readonly from: SkillCandidateState | null;
@@ -625,7 +646,9 @@ export interface SkillCandidateGroup {
 	readonly evidence: SkillCandidateEvidenceContribution;
 	readonly priorityScore: EvolutionArtifactReference | null;
 	readonly draft: EvolutionArtifactReference | null;
+	readonly validation: EvolutionArtifactReference | null;
 	readonly synthesisIdempotencyKey: string;
+	readonly validationIdempotencyKey: string;
 	readonly evaluationIdempotencyKey: string;
 }
 
@@ -658,6 +681,15 @@ export interface SkillCandidateDraftRecordedEvent extends SkillCandidateRegistry
 	readonly idempotencyKey: string;
 }
 
+export interface SkillCandidateValidationRecordedEvent extends SkillCandidateRegistryEventBase {
+	readonly type: "skill-candidate-validation-recorded";
+	readonly groupId: string;
+	readonly draft: EvolutionArtifactReference;
+	readonly validation: EvolutionArtifactReference;
+	readonly proposalRevisionIds: readonly string[];
+	readonly idempotencyKey: string;
+}
+
 export interface SkillCandidateStateTransitionedEvent extends SkillCandidateRegistryEventBase {
 	readonly type: "skill-candidate-state-transitioned";
 	readonly groupId: string;
@@ -666,7 +698,7 @@ export interface SkillCandidateStateTransitionedEvent extends SkillCandidateRegi
 	readonly reasonCodes: readonly string[];
 }
 
-export type SkillCandidateWorkStage = "consolidating" | "scoring" | "synthesizing" | "completed";
+export type SkillCandidateWorkStage = "consolidating" | "scoring" | "synthesizing" | "validating" | "completed";
 
 export interface SkillCandidateWorkCheckpointedEvent extends SkillCandidateRegistryEventBase {
 	readonly type: "skill-candidate-work-checkpointed";
@@ -692,6 +724,7 @@ export type SkillCandidateRegistryEvent =
 	| SkillCandidateProposalRecordedEvent
 	| SkillCandidatePriorityScoredEvent
 	| SkillCandidateDraftRecordedEvent
+	| SkillCandidateValidationRecordedEvent
 	| SkillCandidateStateTransitionedEvent
 	| SkillCandidateWorkCheckpointedEvent
 	| SkillCandidateWorkFailedEvent;

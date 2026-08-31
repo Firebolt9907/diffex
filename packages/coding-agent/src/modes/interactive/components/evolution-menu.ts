@@ -61,7 +61,13 @@ type MenuView =
 			readonly kind: "skill-candidate-review";
 			readonly jobId: string;
 			readonly candidateId: string;
-			readonly section: "draft" | "evaluation" | "provenance" | "validation";
+			readonly section: "draft" | "evaluation" | "validation";
+	  }
+	| {
+			readonly kind: "skill-candidate-evidence";
+			readonly jobId: string;
+			readonly candidateId: string;
+			readonly evidenceKind: "supporting" | "contradicting";
 	  }
 	| {
 			readonly kind: "proposal-evidence";
@@ -79,6 +85,7 @@ type MenuView =
 interface MenuEntry {
 	readonly label: string;
 	readonly enabled: boolean;
+	readonly status?: string;
 	readonly disabledStatus?: string;
 	readonly select: () => void;
 }
@@ -106,9 +113,21 @@ function firstCharacters(value: string, maximum: number): string {
 	return [...sanitizeEvolutionText(value).replace(/\s+/gu, " ").trim()].slice(0, maximum).join("");
 }
 
+export function formatEvolutionJobResult(job: EvolutionJobSummary): string {
+	if (job.analysisStatus === "waiting") return "analysis waiting";
+	if (job.analysisStatus === "processing") return "analysis processing";
+	if (job.analysisStatus === "failed") return "analysis failed";
+	if (job.candidateGeneration.status === "not-applicable" || job.candidateGeneration.status === "completed") {
+		return "full success";
+	}
+	if (job.candidateGeneration.status === "partial-failure") return "partial failure";
+	if (job.candidateGeneration.status === "failed") return "candidate generation failed";
+	return `analysis completed; candidate generation ${job.candidateGeneration.status}`;
+}
+
 export function formatEvolutionJobLabel(job: EvolutionJobSummary, now = new Date()): string {
 	const trigger = job.trigger === "automatic" ? "auto" : "manual";
-	return `${formatEvolutionTimestamp(job.createdAt, now)} - ${trigger} - ${job.stage}`;
+	return `${formatEvolutionTimestamp(job.createdAt, now)} - ${trigger} - ${formatEvolutionJobResult(job)}`;
 }
 
 export function formatEvolutionProposalLabel(proposal: EvolutionProposalDetail["proposal"]): string {
@@ -150,8 +169,71 @@ export function formatEvolutionEvidencePreview(
 	return firstCharacters(content, 100);
 }
 
+export type EvolutionSkillCandidateStage = "draft" | "evaluation" | "validation";
+export type EvolutionSkillCandidateStageStatus =
+	| "waiting"
+	| "blocked"
+	| "failed"
+	| "skipped"
+	| "completed"
+	| "not applicable";
+
+export function evolutionSkillCandidateStageStatus(
+	detail: EvolutionSkillCandidateDetail,
+	stage: EvolutionSkillCandidateStage,
+): EvolutionSkillCandidateStageStatus {
+	const { state } = detail.summary;
+	if (stage === "draft") {
+		if (detail.draft !== null) return "completed";
+		if (state === "synthesis-failed") return "failed";
+		if (state === "proposed" || state === "quarantined") return "blocked";
+		if (state === "rejected" || state === "retired") return "not applicable";
+		return "waiting";
+	}
+	if (stage === "validation") {
+		if (detail.validation !== null) return detail.validation.disposition === "accepted" ? "completed" : "failed";
+		if (state === "synthesis-failed") return "skipped";
+		if (state === "proposed" || state === "quarantined") return "blocked";
+		if (state === "rejected" || state === "retired") return "not applicable";
+		return "waiting";
+	}
+	if (detail.evaluation !== null) return detail.evaluation.disposition === "accepted" ? "completed" : "failed";
+	if (state === "accepted" && detail.summary.latestReasonCodes.includes("retrieval-and-behavior-evaluation-skipped")) {
+		return "skipped";
+	}
+	if (state === "proposed") return "blocked";
+	if (state === "quarantined" || state === "rejected" || state === "synthesis-failed" || state === "retired") {
+		return "not applicable";
+	}
+	return "waiting";
+}
+
+export function explainEvolutionCandidateReason(reasonCode: string): string {
+	const explanations: Readonly<Record<string, string>> = {
+		"awaiting-independent-recurrence": "Waiting for support from another independent task.",
+		"candidate-recorded": "The candidate was recorded for lifecycle review.",
+		"counterevidence-meets-or-exceeds-support": "Counterevidence matches or exceeds the supporting evidence.",
+		"deterministic-draft-validation-passed": "Deterministic draft validation passed.",
+		"evaluation-gates-not-passed": "Retrieval or behavior evaluation did not pass.",
+		"independent-recurrence-qualified": "Independent recurring evidence qualified the candidate.",
+		"outcome-aware-draft-recorded": "A candidate draft was generated and recorded.",
+		"proposal-revision-set-changed": "New proposal evidence requires candidate regeneration.",
+		"retrieval-and-behavior-evaluation-skipped": "Retrieval and behavior evaluation was unavailable and skipped.",
+		"retrieval-and-behavior-evaluation-started": "Retrieval and behavior evaluation started.",
+		"retrieval-and-behavior-gates-passed": "Retrieval and behavior evaluation passed.",
+		"skill-synthesis-attempts-exhausted": "Skill generation failed after all retry attempts.",
+	};
+	return explanations[reasonCode] ?? `${reasonCode.replaceAll("-", " ")}.`;
+}
+
+export function formatEvolutionSkillCandidateOutcome(detail: EvolutionSkillCandidateDetail): string {
+	return detail.candidate.procedure.steps
+		.map((step) => (step.condition === null ? step.action : `${step.action} (${step.condition})`))
+		.join(" ");
+}
+
 export function formatEvolutionSkillDraftDiff(detail: EvolutionSkillCandidateDetail): readonly string[] {
-	if (detail.draft === null) return ["Draft pending"];
+	if (detail.draft === null) return ["Draft not available"];
 	const before = detail.existingContents
 		.map((skill) => `# Existing skill: ${skill.name} (${skill.version})\n${skill.content}`)
 		.join("\n\n");
@@ -248,7 +330,11 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		if (view.kind === "overview" || view.kind === "confirm") return this.#overview !== null;
 		if (view.kind === "jobs") return this.#jobsLoaded;
 		if (view.kind === "job") return this.#job?.jobId === view.jobId;
-		if (view.kind === "skill-candidate" || view.kind === "skill-candidate-review") {
+		if (
+			view.kind === "skill-candidate" ||
+			view.kind === "skill-candidate-review" ||
+			view.kind === "skill-candidate-evidence"
+		) {
 			return this.#skillCandidate?.summary.candidateId === view.candidateId;
 		}
 		return this.#proposal?.proposal.proposalId === view.proposalId;
@@ -313,8 +399,15 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 			if (view.kind === "proposal" || view.kind === "proposal-evidence") {
 				this.#proposal = await this.#client.proposalDetail(view.jobId, view.proposalId);
 			}
-			if (view.kind === "skill-candidate" || view.kind === "skill-candidate-review") {
-				this.#skillCandidate = await this.#client.skillCandidateDetail(view.jobId, view.candidateId);
+			if (
+				view.kind === "skill-candidate" ||
+				view.kind === "skill-candidate-review" ||
+				view.kind === "skill-candidate-evidence"
+			) {
+				[this.#job, this.#skillCandidate] = await Promise.all([
+					this.#client.jobDetail(view.jobId),
+					this.#client.skillCandidateDetail(view.jobId, view.candidateId),
+				]);
 			}
 		} catch (error) {
 			this.#onStatus(error instanceof Error ? error.message : String(error), true);
@@ -329,7 +422,25 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	#schedulePoll(): void {
 		if (this.#pollTimeout !== null) clearTimeout(this.#pollTimeout);
 		this.#pollTimeout = null;
-		if (this.#disposed || this.#overview === null || this.#overview.activeJob === null) return;
+		const nonterminalCandidateStatuses = new Set(["waiting", "processing", "retrying"]);
+		const view = this.#view();
+		const viewingJob =
+			view.kind === "job" ||
+			view.kind === "skill-candidate" ||
+			view.kind === "skill-candidate-review" ||
+			view.kind === "skill-candidate-evidence";
+		const viewedJobHasCandidateWork =
+			viewingJob && this.#job !== null && nonterminalCandidateStatuses.has(this.#job.candidateGeneration.status);
+		const listedJobHasCandidateWork =
+			view.kind === "jobs" &&
+			this.#jobs.some((job) => nonterminalCandidateStatuses.has(job.candidateGeneration.status));
+		if (
+			this.#disposed ||
+			this.#overview === null ||
+			(this.#overview.activeJob === null && !viewedJobHasCandidateWork && !listedJobHasCandidateWork)
+		) {
+			return;
+		}
 		this.#pollTimeout = setTimeout(() => {
 			this.#pollTimeout = null;
 			void this.refresh();
@@ -561,8 +672,14 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	#renderJob(job: EvolutionJobDetail): void {
 		for (const line of [
 			`Trigger: ${job.trigger}`,
-			`Stage: ${job.stage} (${job.outcome})`,
-			`Finished: ${formatEvolutionTimestamp(job.terminalAt)}`,
+			`Result: ${formatEvolutionJobResult(job)}`,
+			`Analysis: ${job.analysisStatus}`,
+			...(job.candidateGeneration.retryNotBefore === null
+				? []
+				: [`Candidate retry: ${formatEvolutionTimestamp(job.candidateGeneration.retryNotBefore)}`]),
+			...(job.candidateGeneration.failureMessage === null
+				? []
+				: [`Candidate error: ${job.candidateGeneration.failureMessage}`]),
 			`Evolution token: ${job.observability.estimatedEvidenceTokens.toLocaleString()}`,
 			`Last checkpoint: ${formatEvolutionTimestamp(job.lastCheckpointAt)}`,
 			`Base harness: ${formatHarnessVersionReference(
@@ -571,16 +688,6 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 				this.#overview?.currentHarnessVersion,
 				job.baseHarnessInfo,
 			)}`,
-			`Target harness: ${
-				job.activatedHarnessVersion === null
-					? "pending"
-					: formatHarnessVersionReference(
-							job.activatedHarnessVersion,
-							this.#harnessVersionInfo,
-							this.#overview?.currentHarnessVersion,
-						)
-			}`,
-			`Rollback available: ${job.observability.rollbackAvailable ? "yes" : "no"}`,
 		]) {
 			this.#addLine(line);
 		}
@@ -589,7 +696,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	#renderProposal(detail: EvolutionProposalDetail): void {
 		this.#addLine(formatEvolutionProposalLabel(detail.proposal));
 		this.addChild(new Spacer(1));
-		this.#addLine(`Validation: ${detail.validationDisposition ?? "pending"}`);
+		this.#addLine(`Validation: ${detail.validationDisposition ?? "not attempted"}`);
 		this.addChild(new Spacer(1));
 		this.#addLine(`Outcome: ${formatEvolutionProposalOutcome(detail.proposal)}`);
 	}
@@ -597,30 +704,51 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	#skillCandidateEntries(detail: EvolutionSkillCandidateDetail, jobId: string): readonly MenuEntry[] {
 		const review = (section: Extract<MenuView, { kind: "skill-candidate-review" }>["section"]) =>
 			this.#push({ kind: "skill-candidate-review", jobId, candidateId: detail.summary.candidateId, section });
+		const evidence = (evidenceKind: Extract<MenuView, { kind: "skill-candidate-evidence" }>["evidenceKind"]) =>
+			this.#push({
+				kind: "skill-candidate-evidence",
+				jobId,
+				candidateId: detail.summary.candidateId,
+				evidenceKind,
+			});
 		return [
-			{ label: "Provenance", enabled: true, select: () => review("provenance") },
+			{
+				label: `Supporting evidence (${detail.supportingEvidence.length})`,
+				enabled: true,
+				select: () => evidence("supporting"),
+			},
+			{
+				label: `Contradicting evidence (${detail.contradictingEvidence.length})`,
+				enabled: true,
+				select: () => evidence("contradicting"),
+			},
 			{
 				label: "Draft diff",
 				enabled: detail.draft !== null,
-				disabledStatus: "pending",
+				status: evolutionSkillCandidateStageStatus(detail, "draft"),
 				select: () => review("draft"),
 			},
 			{
 				label: "Validation",
 				enabled: detail.validation !== null,
-				disabledStatus: "pending",
+				status: evolutionSkillCandidateStageStatus(detail, "validation"),
 				select: () => review("validation"),
 			},
 			{
 				label: "Evaluation",
 				enabled: detail.evaluation !== null,
-				disabledStatus: "pending",
+				status: evolutionSkillCandidateStageStatus(detail, "evaluation"),
 				select: () => review("evaluation"),
 			},
 			{
 				label: "Activate",
 				enabled: detail.activationAvailable,
-				disabledStatus: detail.targetHarnessVersion === null ? "unavailable" : "active",
+				disabledStatus:
+					detail.targetHarnessVersion !== null
+						? "active"
+						: detail.summary.state === "accepted"
+							? "unavailable"
+							: "blocked",
 				select: () => this.#confirm("activate-skill", jobId, detail.summary.candidateId),
 			},
 			{
@@ -633,8 +761,19 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 	}
 
 	#renderSkillCandidate(detail: EvolutionSkillCandidateDetail): void {
-		this.#addLine(`Skill candidate: ${detail.summary.proposedName}`, "accent");
-		this.#addLine(`Target harness: ${detail.targetHarnessVersion ?? "pending activation"}`);
+		this.#addLine(`Skill candidate ${detail.summary.proposedName}`, "accent");
+		this.addChild(new Spacer(1));
+		this.#addLine(`State: ${detail.summary.state}`);
+		this.#addLine(`State changed: ${formatEvolutionTimestamp(detail.summary.latestTransitionAt)}`);
+		for (const reasonCode of detail.summary.latestReasonCodes) {
+			this.#addLine(`Reason: ${explainEvolutionCandidateReason(reasonCode)}`);
+		}
+		this.addChild(new Spacer(1));
+		this.#addLine(`Use when: ${detail.candidate.trigger.description}`);
+		this.#addLine(`Outcome: ${formatEvolutionSkillCandidateOutcome(detail)}`);
+		if (detail.targetHarnessVersion !== null) {
+			this.#addLine(`Active harness: ${detail.targetHarnessVersion}`);
+		}
 	}
 
 	#renderSkillCandidateReview(
@@ -650,29 +789,17 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 			if (lines.length > 200) this.#addLine(`... ${lines.length - 200} more lines`, "muted");
 			return;
 		}
-		if (section === "provenance") {
-			this.#addLine("Provenance", "accent");
-			for (const [label, values] of [
-				["Evolution jobs", detail.sourceEvolutionJobIds],
-				["Candidate revisions", detail.proposalRevisionIds],
-				["Lessons", detail.candidate.sourceLessonIds],
-				["Evidence", [...detail.candidate.supportingEvidenceIds, ...detail.candidate.contradictingEvidenceIds]],
-				["Traces", [...detail.candidate.supportingTraceIds, ...detail.candidate.contradictingTraceIds]],
-				["Task lineages", detail.candidate.taskLineageIds],
-			] as const) {
-				this.#addLine(`${label}: ${values.length === 0 ? "none" : values.join(", ")}`);
-			}
-			return;
-		}
 		if (section === "validation") {
 			this.#addLine("Deterministic validation", "accent");
-			this.#addLine(`Result: ${detail.validation?.disposition ?? "pending"}`);
+			this.#addLine(`Result: ${detail.validation?.disposition ?? "not attempted"}`);
 			for (const issue of detail.validation?.issues ?? [])
 				this.#addLine(`${issue.code}: ${issue.message}`, "warning");
 			return;
 		}
 		this.#addLine("Retrieval and behavior evaluation", "accent");
-		this.#addLine(`Result: ${detail.evaluation?.disposition ?? "pending"}`);
+		this.#addLine(
+			`Result: ${detail.evaluation?.disposition ?? evolutionSkillCandidateStageStatus(detail, "evaluation")}`,
+		);
 		for (const [name, gate] of Object.entries(detail.evaluation?.gates ?? {})) {
 			this.#addLine(`${name}: ${gate.passed ? "passed" : `failed (${gate.reasonCodes.join(", ")})`}`);
 		}
@@ -711,10 +838,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		];
 	}
 
-	#renderProposalEvidence(detail: EvolutionProposalDetail, evidenceKind: "supporting" | "contradicting"): void {
-		const supporting = evidenceKind === "supporting";
-		const label = supporting ? "Supporting evidence" : "Contradicting evidence";
-		const evidence = supporting ? detail.supportingEvidence : detail.contradictingEvidence;
+	#renderEvidence(label: string, evidence: EvolutionProposalDetail["supportingEvidence"]): void {
 		this.#addLine(`${label} (${evidence.length})`, "accent");
 		if (evidence.length === 0) {
 			this.#addLine(`No ${label.toLowerCase()}`, "muted");
@@ -725,14 +849,35 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		}
 	}
 
+	#renderProposalEvidence(detail: EvolutionProposalDetail, evidenceKind: "supporting" | "contradicting"): void {
+		const supporting = evidenceKind === "supporting";
+		this.#renderEvidence(
+			supporting ? "Supporting evidence" : "Contradicting evidence",
+			supporting ? detail.supportingEvidence : detail.contradictingEvidence,
+		);
+	}
+
+	#renderSkillCandidateEvidence(
+		detail: EvolutionSkillCandidateDetail,
+		evidenceKind: "supporting" | "contradicting",
+	): void {
+		const supporting = evidenceKind === "supporting";
+		this.#renderEvidence(
+			supporting ? "Supporting evidence" : "Contradicting evidence",
+			supporting ? detail.supportingEvidence : detail.contradictingEvidence,
+		);
+	}
+
 	#renderEntries(entries: readonly MenuEntry[]): void {
 		this.#entries = entries;
 		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, Math.max(0, entries.length - 1)));
 		entries.forEach((entry, index) => {
 			const selected = index === this.#selectedIndex;
 			const prefix = selected ? SELECTED_LIST_PREFIX : UNSELECTED_LIST_PREFIX;
-			const disabled = entry.enabled ? "" : ` [${entry.disabledStatus ?? "unavailable"}]`;
-			const line = `${prefix}${entry.label}${disabled}`;
+			const status = entry.status === undefined ? "" : ` [${entry.status}]`;
+			const disabled =
+				entry.enabled || entry.status !== undefined ? "" : ` [${entry.disabledStatus ?? "unavailable"}]`;
+			const line = `${prefix}${entry.label}${status}${disabled}`;
 			this.addChild(
 				new TruncatedText(theme.fg(entry.enabled ? (selected ? "selectionAccent" : "text") : "muted", line), 1, 0),
 			);
@@ -800,6 +945,9 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 				this.#renderEntries(this.#skillCandidateEntries(this.#skillCandidate, view.jobId));
 			} else if (view.kind === "skill-candidate-review" && this.#skillCandidate) {
 				this.#renderSkillCandidateReview(this.#skillCandidate, view.section);
+				this.#entries = [];
+			} else if (view.kind === "skill-candidate-evidence" && this.#skillCandidate) {
+				this.#renderSkillCandidateEvidence(this.#skillCandidate, view.evidenceKind);
 				this.#entries = [];
 			} else if (view.kind === "confirm") {
 				for (const line of this.#confirmationLines(view)) this.#addLine(line, "warning");

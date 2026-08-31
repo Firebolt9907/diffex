@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HarnessStateStore, type HarnessVersion, type HarnessVersionList } from "@earendil-works/diffex-harness-state";
-import type { MaterializedInvocation } from "@earendil-works/diffex-harness-trace";
+import type { MaterializedEvidence, MaterializedInvocation } from "@earendil-works/diffex-harness-trace";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	computeEvolutionContentDigest,
@@ -25,6 +25,7 @@ import {
 	PollingEvolutionWorkSource,
 	type SkillCandidate,
 	type SkillCandidateGroup,
+	type SkillCandidateRegistryEvent,
 	type SkillDraft,
 	type SkillDraftValidationReport,
 	type SkillEvaluationReport,
@@ -543,7 +544,131 @@ describe("evolution control service", () => {
 		}
 	});
 
-	it("exposes candidate provenance, gates activation, and rolls back through preserving descendants", async () => {
+	it("separates analysis completion from asynchronous candidate generation outcomes", async () => {
+		const timestamp = "2026-08-20T00:00:00.000Z";
+		const candidateJob = (jobId: string): EvolutionJob =>
+			({
+				metadata: { scope },
+				jobId,
+				trigger: "manual",
+				stage: "completed",
+				outcome: "completed",
+				reasonCode: null,
+				failureMessage: null,
+				completion: { kind: "no-op", resultingHarnessVersion: null, processedEvidenceCursor: 1 },
+				resolution: null,
+				checkpoints: [
+					{
+						stage: "skill-curating",
+						state: { candidateIds: [`candidate-${jobId}`] },
+						outputArtifacts: [],
+						completedAt: timestamp,
+					},
+				],
+				attempt: 1,
+				revision: 1,
+				createdAt: timestamp,
+				updatedAt: timestamp,
+				terminalAt: timestamp,
+				retryNotBefore: null,
+			}) as unknown as EvolutionJob;
+		const jobs = [
+			candidateJob("waiting"),
+			candidateJob("retrying"),
+			candidateJob("completed"),
+			candidateJob("partial"),
+			candidateJob("failed"),
+		];
+		const event = (registrySequence: number, value: Readonly<Record<string, unknown>>): SkillCandidateRegistryEvent =>
+			({
+				metadata: { createdAt: new Date(Date.parse(timestamp) + registrySequence).toISOString() },
+				registrySequence,
+				...value,
+			}) as unknown as SkillCandidateRegistryEvent;
+		const events = [
+			event(1, {
+				type: "skill-candidate-work-failed",
+				sourceEvolutionJobId: "retrying",
+				attempt: 1,
+				stage: "synthesizing",
+				message: "temporary synthesis failure",
+				retryNotBefore: "2026-08-20T00:01:00.000Z",
+				diagnostics: [{ groupId: "group-retrying" }],
+			}),
+			event(2, {
+				type: "skill-candidate-work-checkpointed",
+				sourceEvolutionJobId: "completed",
+				attempt: 1,
+				stage: "completed",
+			}),
+			event(3, {
+				type: "skill-candidate-work-failed",
+				sourceEvolutionJobId: "partial",
+				attempt: 3,
+				stage: "synthesizing",
+				message: "one candidate exhausted synthesis",
+				retryNotBefore: null,
+				diagnostics: [{ groupId: "group-partial-failed" }],
+			}),
+			event(4, {
+				type: "skill-candidate-work-failed",
+				sourceEvolutionJobId: "failed",
+				attempt: 3,
+				stage: "validating",
+				message: "candidate validation exhausted retries",
+				retryNotBefore: null,
+				diagnostics: [{ groupId: "group-failed" }],
+			}),
+		];
+		const group = (groupId: string, sourceEvolutionJobId: string, state: SkillCandidateGroup["state"]) =>
+			({ groupId, state, proposalRevisions: [{ sourceEvolutionJobId }] }) as unknown as SkillCandidateGroup;
+		const groups = [
+			group("group-partial-failed", "partial", "synthesis-failed"),
+			group("group-partial-accepted", "partial", "accepted"),
+			group("group-failed", "failed", "synthesis-failed"),
+		];
+		const service = new EvolutionControlService({
+			scope,
+			jobs: { list: async () => jobs },
+			skillCandidates: { list: async () => groups },
+			skillCandidateRegistryStore: {
+				loadSkillCandidateRegistry: async () => ({ revision: events.length, events }),
+			},
+		} as unknown as EvolutionControlServiceDependencies);
+
+		const summaries = new Map((await service.listJobs()).map((summary) => [summary.jobId, summary]));
+		expect(summaries.get("waiting")).toMatchObject({
+			analysisStatus: "completed",
+			candidateGeneration: { status: "waiting", attempt: 0 },
+		});
+		expect(summaries.get("retrying")).toMatchObject({
+			analysisStatus: "completed",
+			candidateGeneration: {
+				status: "retrying",
+				stage: "synthesizing",
+				attempt: 1,
+				retryNotBefore: "2026-08-20T00:01:00.000Z",
+				failureMessage: "temporary synthesis failure",
+			},
+		});
+		expect(summaries.get("completed")).toMatchObject({
+			analysisStatus: "completed",
+			candidateGeneration: { status: "completed", stage: "completed", attempt: 1 },
+		});
+		expect(summaries.get("partial")).toMatchObject({
+			candidateGeneration: { status: "partial-failure", stage: "synthesizing", attempt: 3 },
+		});
+		expect(summaries.get("failed")).toMatchObject({
+			candidateGeneration: {
+				status: "failed",
+				stage: "validating",
+				attempt: 3,
+				failureMessage: "candidate validation exhausted retries",
+			},
+		});
+	});
+
+	it("exposes candidate evidence, gates activation, and rolls back through preserving descendants", async () => {
 		const inputReference = { artifactId: "input-1", contentDigest: `sha256:${"1".repeat(64)}` };
 		const candidateReference = { artifactId: "candidate-1", contentDigest: `sha256:${"2".repeat(64)}` };
 		const draftReference = { artifactId: "draft-1", contentDigest: `sha256:${"3".repeat(64)}` };
@@ -551,6 +676,7 @@ describe("evolution control service", () => {
 		const evaluationReference = { artifactId: "evaluation-1", contentDigest: `sha256:${"5".repeat(64)}` };
 		const candidate = {
 			artifactKind: "skill-candidate",
+			metadata: { createdAt: "2026-08-20T00:00:00.000Z" },
 			candidateId: "candidate-1",
 			operation: "CREATE",
 			proposedName: "focused-verification",
@@ -591,6 +717,15 @@ describe("evolution control service", () => {
 		const group = {
 			groupId: "group-1",
 			state: "accepted",
+			dispositionHistory: [
+				{
+					eventId: "transition-1",
+					from: "evaluation-pending",
+					to: "accepted",
+					reasonCodes: ["retrieval-and-behavior-gates-passed"],
+					createdAt: "2026-08-20T00:00:02.000Z",
+				},
+			],
 			proposalRevisions: [
 				{
 					revisionId: "revision-1",
@@ -602,9 +737,26 @@ describe("evolution control service", () => {
 			validation: validationReference,
 			evaluation: evaluationReference,
 		} as unknown as SkillCandidateGroup;
+		const supportingEvidence = {
+			evidenceId: "evidence-1",
+			kind: "session_item",
+			itemType: "message",
+			order: { traceSequence: 1, timestamp: null, causalIdentifiers: [], ambiguity: [] },
+			traceSources: [],
+			payload: { message: { content: [{ type: "text", text: "The focused verification passed." }] } },
+		} as MaterializedEvidence;
 		const input = {
 			ingestionHighWaterCursor: 1,
-			evidenceSources: [],
+			evidenceSources: [
+				{
+					sourceId: "source-1",
+					materializationId: "materialization-1",
+					ingestionCursor: 1,
+					origin: "product-runtime",
+					contentDigest: computeEvolutionContentDigest("source-1"),
+					invocation: { ...invocation(1), evidence: [supportingEvidence] },
+				},
+			],
 			harness: { baseVersion: null },
 			expectedHarnessBaseVersion: `sha256:${"a".repeat(64)}`,
 			skillCatalog: [],
@@ -726,14 +878,23 @@ describe("evolution control service", () => {
 					proposedName: candidate.proposedName,
 					operation: "CREATE",
 					state: "accepted",
+					latestTransitionAt: "2026-08-20T00:00:02.000Z",
+					latestReasonCodes: ["retrieval-and-behavior-gates-passed"],
 				},
 			],
 		});
 		const detail = await service.getSkillCandidate(job.jobId, candidate.candidateId);
 		expect(detail).toMatchObject({
-			summary: { groupId: group.groupId, state: "accepted" },
+			summary: {
+				groupId: group.groupId,
+				state: "accepted",
+				latestTransitionAt: "2026-08-20T00:00:02.000Z",
+				latestReasonCodes: ["retrieval-and-behavior-gates-passed"],
+			},
 			sourceEvolutionJobIds: [job.jobId],
 			proposalRevisionIds: ["revision-1"],
+			supportingEvidence: [supportingEvidence],
+			contradictingEvidence: [],
 			draft: { draftId: "draft-1" },
 			validation: { disposition: "accepted" },
 			evaluation: { disposition: "accepted" },

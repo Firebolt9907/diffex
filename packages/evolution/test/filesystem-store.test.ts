@@ -139,6 +139,70 @@ function candidateWorkEvent(eventId: string, registrySequence: number): SkillCan
 	};
 }
 
+function candidateWorkFailureEvent(eventId: string, registrySequence: number): SkillCandidateRegistryEvent {
+	const content = {
+		schemaVersion: SKILL_CANDIDATE_REGISTRY_SCHEMA_VERSION,
+		eventId,
+		registrySequence,
+		type: "skill-candidate-work-failed" as const,
+		workId: "candidate-work-1",
+		sourceEvolutionJobId: "job-1",
+		idempotencyKey: "candidate-work-1:failure-1",
+		attempt: 1,
+		message: "Skill synthesis failed for candidate groups: group-1",
+		retryNotBefore: null,
+		stage: "synthesizing" as const,
+		diagnostics: [
+			{
+				groupId: "group-1",
+				error: {
+					name: "EvolutionExecutionError",
+					message: "Skill synthesizer failed to produce a draft",
+					reasonCode: "skill-synthesis-invalid-response" as const,
+					retryable: false,
+					diagnostics: { lastCorrection: "files must be an array" },
+					cause: { name: "ProviderError", message: "Provider rejected the structured response" },
+				},
+			},
+		],
+	};
+	return {
+		metadata: createEvolutionArtifactMetadata({
+			artifactId: eventId,
+			producer,
+			sourceIds: ["job-1", "group-1"],
+			scope,
+			createdAt: "2026-08-19T12:00:00.000Z",
+			content,
+		}),
+		...content,
+	};
+}
+
+function candidateStateEvent(eventId: string, registrySequence: number): SkillCandidateRegistryEvent {
+	const content = {
+		schemaVersion: SKILL_CANDIDATE_REGISTRY_SCHEMA_VERSION,
+		eventId,
+		registrySequence,
+		type: "skill-candidate-state-transitioned" as const,
+		groupId: "group-1",
+		from: "evidence-qualified" as const,
+		to: "synthesis-failed" as const,
+		reasonCodes: ["skill-synthesis-attempts-exhausted"],
+	};
+	return {
+		metadata: createEvolutionArtifactMetadata({
+			artifactId: eventId,
+			producer,
+			sourceIds: ["group-1"],
+			scope,
+			createdAt: "2026-08-19T12:00:00.000Z",
+			content,
+		}),
+		...content,
+	};
+}
+
 function candidateEvaluationEvent(eventId: string, registrySequence: number): SkillCandidateRegistryEvent {
 	const reference = (artifactId: string) => ({ artifactId, contentDigest: `sha256:${"a".repeat(64)}` });
 	const content = {
@@ -270,13 +334,20 @@ describe("filesystem evolution persistence", () => {
 		const first = candidateWorkEvent("candidate-event-1", 1);
 
 		const evaluation = candidateEvaluationEvent("candidate-event-2", 2);
-		expect(await store.appendSkillCandidateRegistryEvents(scope, 0, [first, evaluation])).toBe("committed");
-		expect(await peer.loadSkillCandidateRegistry(scope)).toEqual({ revision: 2, events: [first, evaluation] });
+		const synthesisFailed = candidateStateEvent("candidate-event-3", 3);
+		const workFailure = candidateWorkFailureEvent("candidate-event-4", 4);
 		expect(
-			await peer.appendSkillCandidateRegistryEvents(scope, 0, [candidateWorkEvent("candidate-event-3", 1)]),
+			await store.appendSkillCandidateRegistryEvents(scope, 0, [first, evaluation, synthesisFailed, workFailure]),
+		).toBe("committed");
+		expect(await peer.loadSkillCandidateRegistry(scope)).toEqual({
+			revision: 4,
+			events: [first, evaluation, synthesisFailed, workFailure],
+		});
+		expect(
+			await peer.appendSkillCandidateRegistryEvents(scope, 0, [candidateWorkEvent("candidate-event-5", 1)]),
 		).toBe("conflict");
 		await expect(
-			peer.appendSkillCandidateRegistryEvents(scope, 2, [candidateWorkEvent("candidate-event-3", 4)]),
+			peer.appendSkillCandidateRegistryEvents(scope, 4, [candidateWorkEvent("candidate-event-5", 6)]),
 		).rejects.toThrow("contiguous sequence");
 	});
 

@@ -648,6 +648,7 @@ export interface DeferredSkillCandidateFinding {
 export type SkillCandidateState =
 	| "proposed"
 	| "evidence-qualified"
+	| "synthesis-failed"
 	| "drafted"
 	| "structurally-valid"
 	| "evaluation-pending"
@@ -975,6 +976,25 @@ export interface SkillCandidateWorkCheckpointedEvent extends SkillCandidateRegis
 	readonly groupIds: readonly string[];
 }
 
+export interface SkillCandidateWorkErrorCause {
+	readonly name: string;
+	readonly message: string;
+}
+
+export interface SkillCandidateWorkErrorDiagnostic {
+	readonly name: string;
+	readonly message: string;
+	readonly reasonCode: EvolutionFailureReasonCode | null;
+	readonly retryable: boolean | null;
+	readonly diagnostics: JsonValue | null;
+	readonly cause: SkillCandidateWorkErrorCause | null;
+}
+
+export interface SkillCandidateGroupFailureDiagnostic {
+	readonly groupId: string | null;
+	readonly error: SkillCandidateWorkErrorDiagnostic;
+}
+
 export interface SkillCandidateWorkFailedEvent extends SkillCandidateRegistryEventBase {
 	readonly type: "skill-candidate-work-failed";
 	readonly workId: string;
@@ -983,6 +1003,10 @@ export interface SkillCandidateWorkFailedEvent extends SkillCandidateRegistryEve
 	readonly attempt: number;
 	readonly message: string;
 	readonly retryNotBefore: string | null;
+	/** Absent only on records written before structured candidate-work failure diagnostics were introduced. */
+	readonly stage?: SkillCandidateWorkStage;
+	/** Absent only on records written before structured candidate-work failure diagnostics were introduced. */
+	readonly diagnostics?: readonly SkillCandidateGroupFailureDiagnostic[];
 }
 
 export type SkillCandidateRegistryEvent =
@@ -1235,7 +1259,7 @@ export interface SkillMutation {
 	readonly proposalRevisionIds: readonly string[];
 	readonly draft: EvolutionArtifactReference;
 	readonly validation: EvolutionArtifactReference;
-	readonly evaluation: EvolutionArtifactReference;
+	readonly evaluation: EvolutionArtifactReference | null;
 	readonly memoryDisposition: SkillMutationMemoryDisposition;
 	readonly existingSkills: readonly SkillMutationExistingArtifact[];
 	readonly skill: SkillMutationArtifact | null;

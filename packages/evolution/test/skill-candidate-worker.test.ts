@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	computeEvolutionContentDigest,
@@ -6,12 +9,16 @@ import {
 	type EvolutionArtifactProducer,
 	type EvolutionArtifactReference,
 	type EvolutionArtifactStore,
+	EvolutionControlService,
+	type EvolutionControlServiceDependencies,
+	EvolutionExecutionError,
 	type EvolutionInputSnapshot,
 	type EvolutionJob,
 	type EvolutionJobStore,
 	type EvolutionLeaseStore,
 	type EvolutionLeaseToken,
 	type EvolutionScope,
+	FileEvolutionPersistence,
 	PollingSkillCandidateWorkSource,
 	type SkillCandidate,
 	type SkillCandidateDraftRecordingInput,
@@ -25,6 +32,7 @@ import {
 	type SkillCandidateRegistrySnapshot,
 	type SkillCandidateRegistryStore,
 	SkillCandidateRegistryWorker,
+	type SkillCandidateSynthesisFailureRecordingInput,
 	type SkillCandidateValidationRecordingInput,
 	type SkillDraft,
 	type SkillDraftValidationReport,
@@ -233,7 +241,11 @@ class MemoryArtifactStore implements EvolutionArtifactStore {
 }
 
 class MemoryRegistryStore implements SkillCandidateRegistryStore {
-	readonly events: SkillCandidateRegistryEvent[] = [];
+	readonly events: SkillCandidateRegistryEvent[];
+
+	constructor(events: readonly SkillCandidateRegistryEvent[] = []) {
+		this.events = [...events];
+	}
 
 	async loadSkillCandidateRegistry(): Promise<SkillCandidateRegistrySnapshot> {
 		return { revision: this.events.length, events: [...this.events] };
@@ -318,6 +330,7 @@ class FixtureRegistry implements SkillCandidateRegistry {
 	readonly requests: SkillCandidateRegistryConsolidationInput[] = [];
 	readonly draftRequests: SkillCandidateDraftRecordingInput[] = [];
 	readonly validationRequests: SkillCandidateValidationRecordingInput[] = [];
+	readonly evaluationSkipRequests: SkillCandidateEvaluationStartInput[] = [];
 	readonly evaluationStartRequests: SkillCandidateEvaluationStartInput[] = [];
 	readonly evaluationRequests: SkillCandidateEvaluationRecordingInput[] = [];
 	readonly groups: SkillCandidateGroup[] = [];
@@ -332,6 +345,33 @@ class FixtureRegistry implements SkillCandidateRegistry {
 			throw new Error("registry unavailable");
 		}
 		return { groups: this.groups, changedGroupIds: ["group-1"] };
+	}
+
+	async recordSynthesisFailures(
+		input: SkillCandidateSynthesisFailureRecordingInput,
+	): Promise<readonly SkillCandidateGroup[]> {
+		return input.failures.map((failure) => {
+			const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === failure.groupId);
+			const group = this.groups[index];
+			if (group === undefined) throw new Error("Unknown group");
+			if (group.state === "synthesis-failed") return group;
+			const failed = {
+				...group,
+				state: "synthesis-failed" as const,
+				dispositionHistory: [
+					...group.dispositionHistory,
+					{
+						eventId: `synthesis-failed-${failure.groupId}`,
+						from: group.state,
+						to: "synthesis-failed" as const,
+						reasonCodes: ["skill-synthesis-attempts-exhausted"],
+						createdAt: input.createdAt,
+					},
+				],
+			};
+			this.groups[index] = failed;
+			return failed;
+		});
 	}
 
 	async recordDraft(input: SkillCandidateDraftRecordingInput): Promise<SkillCandidateGroup> {
@@ -357,6 +397,31 @@ class FixtureRegistry implements SkillCandidateRegistry {
 		};
 		this.groups[index] = validated;
 		return validated;
+	}
+
+	async skipEvaluation(input: SkillCandidateEvaluationStartInput): Promise<SkillCandidateGroup> {
+		this.evaluationSkipRequests.push(input);
+		const index = this.groups.findIndex((candidateGroup) => candidateGroup.groupId === input.groupId);
+		const group = this.groups[index];
+		if (group === undefined) throw new Error("Unknown group");
+		const accepted = {
+			...group,
+			state: "accepted" as const,
+			draft: input.draft,
+			validation: input.validation,
+			dispositionHistory: [
+				...group.dispositionHistory,
+				{
+					eventId: "evaluation-skipped",
+					from: group.state,
+					to: "accepted" as const,
+					reasonCodes: ["retrieval-and-behavior-evaluation-skipped"],
+					createdAt: input.createdAt,
+				},
+			],
+		};
+		this.groups[index] = accepted;
+		return accepted;
 	}
 
 	async startEvaluation(input: SkillCandidateEvaluationStartInput): Promise<SkillCandidateGroup> {
@@ -399,6 +464,7 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 	const leases = new MemoryLeaseStore();
 	const registry = new FixtureRegistry();
 	const synthesisRequests: SkillSynthesizerInput[] = [];
+	const synthesisFailures = new Map<string, unknown>();
 	const validationRequests: SkillDraftValidatorInput[] = [];
 	const evaluationRequests: SkillEvaluatorInput[] = [];
 	let clockTime = now;
@@ -409,6 +475,7 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 		store,
 		registry,
 		synthesisRequests,
+		synthesisFailures,
 		validationRequests,
 		evaluationRequests,
 		clock,
@@ -427,6 +494,8 @@ function fixture(withEvaluator = false, store: MemoryRegistryStore = new MemoryR
 			synthesizer: {
 				async synthesize(request): Promise<SkillDraft> {
 					synthesisRequests.push(request);
+					const synthesisFailure = synthesisFailures.get(request.group.groupId);
+					if (synthesisFailure !== undefined) throw synthesisFailure;
 					const content = {
 						artifactKind: "skill-draft" as const,
 						draftId: "draft-1",
@@ -679,7 +748,200 @@ describe("skill candidate registry worker", () => {
 		]);
 	});
 
-	it("parks structurally valid drafts until an evaluator becomes available", async () => {
+	it("continues processing later candidates when one synthesis fails", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		const group = qualifiedGroup(candidateReference);
+		data.registry.groups.push(
+			{
+				...group,
+				groupId: "group-failing",
+				synthesisIdempotencyKey: "skill-synthesis-failing",
+				validationIdempotencyKey: "skill-validation-failing",
+				evaluationIdempotencyKey: "skill-evaluation-failing",
+			},
+			{
+				...group,
+				groupId: "group-succeeding",
+				synthesisIdempotencyKey: "skill-synthesis-succeeding",
+				validationIdempotencyKey: "skill-validation-succeeding",
+				evaluationIdempotencyKey: "skill-evaluation-succeeding",
+			},
+		);
+		const providerError = new Error("Provider rejected the structured response");
+		providerError.name = "ProviderError";
+		data.synthesisFailures.set(
+			"group-failing",
+			new EvolutionExecutionError("Skill synthesizer failed to produce a draft", {
+				reasonCode: "skill-synthesis-invalid-response",
+				retryable: false,
+				cause: providerError,
+				diagnostics: { lastCorrection: "files must be an array" },
+			}),
+		);
+
+		await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
+			"Skill synthesis failed for candidate groups: group-failing",
+		);
+
+		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
+			"group-failing",
+			"group-succeeding",
+		]);
+		expect(data.validationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
+		expect(data.evaluationRequests.map((request) => request.group.groupId)).toEqual(["group-succeeding"]);
+		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-failing")?.state).toBe(
+			"evidence-qualified",
+		);
+		expect(data.registry.groups.find((candidateGroup) => candidateGroup.groupId === "group-succeeding")?.state).toBe(
+			"accepted",
+		);
+		expect(data.store.events.find((event) => event.type === "skill-candidate-work-failed")).toMatchObject({
+			message: "Skill synthesis failed for candidate groups: group-failing",
+			stage: "synthesizing",
+			diagnostics: [
+				{
+					groupId: "group-failing",
+					error: {
+						name: "EvolutionExecutionError",
+						message: "Skill synthesizer failed to produce a draft",
+						reasonCode: "skill-synthesis-invalid-response",
+						retryable: false,
+						diagnostics: { lastCorrection: "files must be an array" },
+						cause: { name: "ProviderError", message: "Provider rejected the structured response" },
+					},
+				},
+			],
+		});
+		expect(
+			data.store.events.some(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toBe(false);
+
+		data.synthesisFailures.clear();
+		await data.worker.process(data.job.jobId);
+
+		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
+			"group-failing",
+			"group-succeeding",
+			"group-failing",
+		]);
+		expect(data.registry.groups.map((candidateGroup) => candidateGroup.state)).toEqual(["accepted", "accepted"]);
+		expect(
+			data.store.events.some(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toBe(true);
+	});
+
+	it("durably exposes exhausted synthesis without blocking a later candidate in the same batch", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		const group = qualifiedGroup(candidateReference);
+		data.registry.groups.push(
+			{
+				...group,
+				groupId: "group-failing",
+				synthesisIdempotencyKey: "skill-synthesis-failing",
+				validationIdempotencyKey: "skill-validation-failing",
+				evaluationIdempotencyKey: "skill-evaluation-failing",
+			},
+			{
+				...group,
+				groupId: "group-succeeding",
+				synthesisIdempotencyKey: "skill-synthesis-succeeding",
+				validationIdempotencyKey: "skill-validation-succeeding",
+				evaluationIdempotencyKey: "skill-evaluation-succeeding",
+			},
+		);
+		data.synthesisFailures.set("group-failing", new Error("synthesis failed"));
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			await expect(data.worker.process(data.job.jobId)).rejects.toThrow(
+				"Skill synthesis failed for candidate groups: group-failing",
+			);
+			expect(
+				data.store.events.find(
+					(event) => event.type === "skill-candidate-work-failed" && event.attempt === attempt,
+				),
+			).toMatchObject({ retryNotBefore: attempt === 3 ? null : expect.any(String) });
+		}
+
+		expect(data.synthesisRequests.map((request) => request.group.groupId)).toEqual([
+			"group-failing",
+			"group-succeeding",
+			"group-failing",
+			"group-failing",
+		]);
+		expect(data.registry.groups).toEqual([
+			expect.objectContaining({
+				groupId: "group-failing",
+				state: "synthesis-failed",
+				dispositionHistory: [
+					expect.objectContaining({
+						from: "evidence-qualified",
+						to: "synthesis-failed",
+						reasonCodes: ["skill-synthesis-attempts-exhausted"],
+					}),
+				],
+			}),
+			expect.objectContaining({ groupId: "group-succeeding", state: "accepted" }),
+		]);
+
+		const persistenceRoot = await mkdtemp(join(tmpdir(), "diffex-mixed-candidate-outcomes-"));
+		try {
+			const durableStore = new FileEvolutionPersistence(persistenceRoot);
+			expect(await durableStore.appendSkillCandidateRegistryEvents(scope, 0, data.store.events)).toBe("committed");
+			const reloadedStore = new FileEvolutionPersistence(persistenceRoot);
+			const source = new PollingSkillCandidateWorkSource({
+				clock: data.clock,
+				jobs: data.jobs,
+				store: reloadedStore,
+				registry: data.registry,
+				evaluatorAvailable: true,
+			});
+			expect(await source.nextRunnableJob(now)).toBeNull();
+			const control = new EvolutionControlService({
+				scope,
+				jobs: data.jobs,
+				skillCandidates: data.registry,
+				skillCandidateRegistryStore: reloadedStore,
+			} as unknown as EvolutionControlServiceDependencies);
+			expect(await control.listJobs()).toEqual([
+				expect.objectContaining({
+					candidateGeneration: {
+						status: "partial-failure",
+						stage: "synthesizing",
+						updatedAt: expect.any(String),
+						attempt: 3,
+						retryNotBefore: null,
+						failureMessage: "Skill synthesis failed for candidate groups: group-failing",
+					},
+				}),
+			]);
+		} finally {
+			await rm(persistenceRoot, { recursive: true, force: true });
+		}
+
+		const nextJob = { ...data.job, jobId: "job-2" };
+		data.jobs.jobs.push(nextJob);
+		await data.worker.process(nextJob.jobId);
+
+		expect(data.synthesisRequests).toHaveLength(4);
+		expect(
+			data.store.events.some(
+				(event) =>
+					event.type === "skill-candidate-work-checkpointed" &&
+					event.sourceEvolutionJobId === nextJob.jobId &&
+					event.stage === "completed",
+			),
+		).toBe(true);
+	});
+
+	it("accepts structurally valid drafts when retrieval and behavior evaluation is unavailable", async () => {
 		const data = fixture();
 		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
 		if (candidateReference === undefined) throw new Error("Expected candidate reference");
@@ -687,28 +949,30 @@ describe("skill candidate registry worker", () => {
 
 		await data.worker.process(data.job.jobId);
 
-		expect(data.registry.groups[0]?.state).toBe("structurally-valid");
+		expect(data.registry.groups[0]).toMatchObject({
+			state: "accepted",
+			evaluation: null,
+			dispositionHistory: [expect.objectContaining({ reasonCodes: ["retrieval-and-behavior-evaluation-skipped"] })],
+		});
+		expect(data.registry.evaluationSkipRequests).toEqual([
+			expect.objectContaining({
+				groupId: "group-qualified",
+				idempotencyKey: "skill-evaluation-qualified",
+			}),
+		]);
 		expect(
 			data.store.events.some(
 				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
 			),
-		).toBe(false);
-		const unavailableSource = new PollingSkillCandidateWorkSource({
+		).toBe(true);
+		const source = new PollingSkillCandidateWorkSource({
 			clock: data.clock,
 			jobs: data.jobs,
 			store: data.store,
 			registry: data.registry,
 			evaluatorAvailable: false,
 		});
-		const availableSource = new PollingSkillCandidateWorkSource({
-			clock: data.clock,
-			jobs: data.jobs,
-			store: data.store,
-			registry: data.registry,
-			evaluatorAvailable: true,
-		});
-		expect(await unavailableSource.nextRunnableJob(now)).toBeNull();
-		expect(await availableSource.nextRunnableJob(now)).toBe(data.job.jobId);
+		expect(await source.nextRunnableJob(now)).toBeNull();
 	});
 
 	it("reopens legacy completed work when its evaluator becomes available", async () => {

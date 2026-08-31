@@ -2,23 +2,13 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, type Message } from "@earendil-works/diffex-ai";
-import {
-	computeHarnessSkillId,
-	computeHarnessSkillPackageVersion,
-	HarnessStateStore,
-} from "@earendil-works/diffex-harness-state";
+import { computeHarnessSkillId, HarnessStateStore } from "@earendil-works/diffex-harness-state";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	computeEvolutionContentDigest,
-	computeEvolutionTextDigest,
-	createEvolutionArtifactMetadata,
-	type EvolutionArtifactProducer,
 	type EvolutionControlService,
 	type EvolutionModelRequest,
 	type EvolutionScope,
 	EvolutionToolDeniedError,
-	type SkillEvaluationReport,
-	type SkillEvaluatorInput,
 } from "#evolution";
 import { encodeTraceRecord, type MaterializedInvocation, type TraceRecord } from "#harness-trace";
 import {
@@ -37,83 +27,6 @@ import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createSkill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
-
-const skillEvaluatorProducer: EvolutionArtifactProducer = {
-	name: "coding-agent-evolution-runtime-test",
-	version: "1",
-	promptVersion: null,
-	model: null,
-};
-
-function acceptedSkillEvaluation(input: SkillEvaluatorInput): SkillEvaluationReport {
-	const draft = {
-		artifactId: input.draft.draftId,
-		contentDigest: computeEvolutionContentDigest(input.draft),
-	};
-	const validation = {
-		artifactId: input.validation.validationId,
-		contentDigest: computeEvolutionContentDigest(input.validation),
-	};
-	const content = {
-		artifactKind: "skill-evaluation" as const,
-		schemaVersion: 1 as const,
-		evaluationId: `evaluation-${input.group.groupId}`,
-		groupId: input.group.groupId,
-		evaluationIdempotencyKey: input.idempotencyKey,
-		proposalRevisionIds: input.group.proposalRevisions.map((revision) => revision.revisionId),
-		draft,
-		validation,
-		evaluatorVersion: "runtime-test-evaluator-v1",
-		assurance: "retrieval-and-deterministic-behavior-gates" as const,
-		disposition: "accepted" as const,
-		harnessVersion: input.validation.validatedHarnessVersion,
-		candidateSkill: {
-			skillId: input.draft.draftId,
-			name: input.draft.proposedName,
-			description: "Run focused verification after repository changes.",
-			source: "candidate" as const,
-			version: computeHarnessSkillPackageVersion({ content: input.draft.content, files: input.draft.files }),
-			contentDigest: computeEvolutionTextDigest(input.draft.content),
-			content: input.draft.content,
-			files: input.draft.files,
-		},
-		neighboringSkills: [],
-		configuration: {
-			model: { provider: "faux", model: "fixture", configurationDigest: `sha256:${"1".repeat(64)}` },
-			runtime: { name: "node", version: "24", configurationDigest: `sha256:${"2".repeat(64)}` },
-			retriever: { name: "fixture", version: "1", configurationDigest: `sha256:${"3".repeat(64)}` },
-			executor: { name: "fixture", version: "1", configurationDigest: `sha256:${"4".repeat(64)}` },
-		},
-		cases: [],
-		retrievalResults: [],
-		behaviorResults: [],
-		metrics: {
-			exactRetrievalAccuracy: 1,
-			sourceReplayReproducibility: 1,
-			heldOutIntendedBaselineScore: 0,
-			heldOutIntendedFullPoolScore: 1,
-			heldOutIntendedImprovement: 1,
-			negativeRegressionCount: 0,
-			misapplicationCount: 0,
-		},
-		gates: {
-			suite: { passed: true, reasonCodes: [] },
-			retrieval: { passed: true, reasonCodes: [] },
-			behavior: { passed: true, reasonCodes: [] },
-		},
-	};
-	return {
-		metadata: createEvolutionArtifactMetadata({
-			artifactId: content.evaluationId,
-			producer: skillEvaluatorProducer,
-			sourceIds: [input.draft.draftId, input.validation.validationId],
-			scope: input.draft.metadata.scope,
-			createdAt: input.createdAt,
-			content,
-		}),
-		...content,
-	};
-}
 
 function materializedInvocation(traceId: string, sessionPath: string): MaterializedInvocation {
 	return {
@@ -746,6 +659,46 @@ describe("coding-agent evolution runtime", () => {
 		});
 	});
 
+	it("preserves provider stop diagnostics for evolution failures", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "Provider rejected the structured response",
+			}),
+		]);
+		const executor = new CodingAgentEvolutionModelExecutor(harness.session, harness.session.modelRuntime, {
+			async waitUntilBackgroundAllowed() {},
+		});
+		const model = harness.getModel();
+
+		await expect(
+			executor.execute({
+				stage: "skill-synthesizer",
+				model: {
+					provider: model.provider,
+					model: model.id,
+					configurationDigest: `sha256:${"1".repeat(64)}`,
+				},
+				promptVersion: "skill-synthesizer-v1",
+				idempotencyKey: "provider-stop-diagnostics",
+				input: {},
+				outputSchema: { type: "object" },
+				tools: [],
+			}),
+		).rejects.toMatchObject({
+			name: "EvolutionExecutionError",
+			message: "Provider rejected the structured response",
+			reasonCode: "model-call-failed",
+			retryable: true,
+			diagnostics: {
+				stopReason: "error",
+				providerError: "Provider rejected the structured response",
+			},
+		});
+	});
+
 	it("corrects an invalid response-tool submission within the active transcript", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1164,7 +1117,7 @@ describe("coding-agent evolution runtime", () => {
 		});
 	});
 
-	it("evaluates and activates evidence-derived skills once across concurrent runtimes before prompt refresh", async () => {
+	it("validates and activates evidence-derived skills without an evaluator across concurrent runtimes", async () => {
 		const agentDir = join(
 			tmpdir(),
 			`diffex-skill-evolution-flow-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -1320,13 +1273,6 @@ describe("coding-agent evolution runtime", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const evaluationRequests: SkillEvaluatorInput[] = [];
-		const skillEvaluator = {
-			async evaluate(input: SkillEvaluatorInput): Promise<SkillEvaluationReport> {
-				evaluationRequests.push(input);
-				return acceptedSkillEvaluation(input);
-			},
-		};
 		const runtimeOptions = {
 			agentDir,
 			cwd: harness.tempDir,
@@ -1334,7 +1280,6 @@ describe("coding-agent evolution runtime", () => {
 			harnessState: store,
 			modelRuntime: harness.session.modelRuntime,
 			resourceLoader: harness.session.resourceLoader,
-			skillEvaluator,
 		};
 		const runtime = await createCodingAgentEvolutionRuntime(runtimeOptions);
 		const peerRuntime = await createCodingAgentEvolutionRuntime(runtimeOptions);
@@ -1364,12 +1309,11 @@ describe("coding-agent evolution runtime", () => {
 				},
 				{ timeout: 8_000, interval: 20 },
 			);
-			expect(evaluationRequests).toHaveLength(1);
 			const candidate = await runtime.control.getSkillCandidate(started.job.jobId, candidateId);
 			expect(candidate).toMatchObject({
 				summary: { state: "accepted" },
 				validation: { disposition: "accepted", validatedHarnessVersion: root.manifest.version },
-				evaluation: { disposition: "accepted", harnessVersion: root.manifest.version },
+				evaluation: null,
 				activationAvailable: true,
 			});
 
@@ -1403,6 +1347,25 @@ describe("coding-agent evolution runtime", () => {
 					harnessRevision: activation.targetHarnessVersion,
 				}),
 			]);
+
+			await expect(runtime.control.getSkillCandidate(started.job.jobId, candidateId)).resolves.toMatchObject({
+				targetHarnessVersion: activation.targetHarnessVersion,
+				rollbackTargetHarnessVersion: root.manifest.version,
+				rollbackAvailable: true,
+				activationAvailable: false,
+			});
+			await expect(runtime.control.rollbackSkillCandidate(started.job.jobId, candidateId)).resolves.toMatchObject({
+				fromHarnessVersion: activation.targetHarnessVersion,
+				toHarnessVersion: root.manifest.version,
+			});
+			expect((await store.loadCurrent()).manifest.version).toBe(root.manifest.version);
+			await expect(runtime.control.getSkillCandidate(started.job.jobId, candidateId)).resolves.toMatchObject({
+				summary: { state: "accepted" },
+				targetHarnessVersion: null,
+				rollbackTargetHarnessVersion: null,
+				rollbackAvailable: false,
+				activationAvailable: true,
+			});
 		} finally {
 			await Promise.all([peerRuntime.stop(), runtime.stop()]);
 		}

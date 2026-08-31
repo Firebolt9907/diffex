@@ -295,6 +295,68 @@ describe("recursive reflector", () => {
 		for (const schema of schemas) expect(findUnsupportedCodexSchemaKeywords(schema)).toEqual([]);
 	});
 
+	it("preserves failed approaches as evidence-grounded lessons", async () => {
+		const { reflector } = await reflectorFixture();
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				const lesson = { ...lessonForRequest(request.input), kind: "failed-approach" };
+				const lessonSchema = jsonObject(
+					jsonObject(jsonObject(request.outputSchema.properties, "schema properties").lessons, "lessons").items,
+					"lesson schema",
+				);
+				expect(jsonObject(lessonSchema.properties, "lesson properties").kind).toMatchObject({
+					enum: expect.arrayContaining(["failed-approach", "missing-verification", "successful-strategy"]),
+				});
+				return {
+					output: { complete: true, lessons: [lesson] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		const result = await reflector.reflect(input);
+
+		expect(result.lessons).not.toHaveLength(0);
+		expect(result.lessons.every((lesson) => lesson.kind === "failed-approach")).toBe(true);
+		expect(result.lessons[0]).toMatchObject({
+			preconditions: ["Evidence is materialized"],
+			observedOutcome: "The result remains traceable",
+			evidenceIds: expect.any(Array),
+			counterevidenceIds: [],
+			applicabilityBoundaries: ["Repository-scoped tasks"],
+			uncertainty: null,
+			actionableTakeaway: "Read only through the bound evidence registry",
+		});
+	});
+
+	it("keeps reflection target-neutral and separates distinct findings", async () => {
+		const { reflector } = await reflectorFixture();
+		const input = reflectInput({
+			async execute(request) {
+				if (request.stage !== "reflector") throw new Error("Unexpected Curator request");
+				expect(jsonObject(request.input.control, "control").lessonPolicy).toEqual({
+					targetNeutral: true,
+					distinctFindingTypes: [
+						{ findingType: "successful-strategy", lessonKinds: ["successful-strategy"] },
+						{ findingType: "failed-approach", lessonKinds: ["failed-approach", "failure-workaround"] },
+						{ findingType: "verification-gap", lessonKinds: ["missing-verification"] },
+						{ findingType: "tool-behavior", lessonKinds: ["tool-behavior"] },
+						{ findingType: "counterexample", lessonKinds: ["counterexample"] },
+					],
+					separationRule: expect.stringContaining("separate evidence-grounded lessons"),
+					excludedDecisions: ["downstream-target", "filesystem-destination", "final-skill-frontmatter"],
+				});
+				return {
+					output: { complete: true, lessons: [lessonForRequest(request.input)] },
+					model: { provider: "faux", model: "fixture" },
+				};
+			},
+		});
+
+		await expect(reflector.reflect(input)).resolves.toMatchObject({ finalLessonIds: [expect.any(String)] });
+	});
+
 	it("limits each leaf to three high-impact lessons", async () => {
 		const { persistence } = await reflectorFixture();
 		const reflector = new RecursiveReflector(

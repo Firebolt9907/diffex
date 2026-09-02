@@ -1,13 +1,14 @@
 import type { HarnessVersion } from "@earendil-works/diffex-harness-state";
 import { setKeybindings } from "@earendil-works/diffex-tui";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type {
-	EvolutionJobDetail,
-	EvolutionJobSummary,
-	EvolutionMemoryProposal,
-	EvolutionOverview,
-	EvolutionProposalDetail,
-	EvolutionSkillCandidateDetail,
+import {
+	AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD,
+	type EvolutionJobDetail,
+	type EvolutionJobSummary,
+	type EvolutionMemoryProposal,
+	type EvolutionOverview,
+	type EvolutionProposalDetail,
+	type EvolutionSkillCandidateDetail,
 } from "#evolution";
 import type { EvolutionRuntimeEvent } from "../src/core/evolution-runtime.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
@@ -18,6 +19,7 @@ import {
 	explainEvolutionCandidateReason,
 	formatEvolutionEvidencePreview,
 	formatEvolutionJobLabel,
+	formatEvolutionJobResult,
 	formatEvolutionProposalLabel,
 	formatEvolutionProposalOutcome,
 	formatEvolutionSkillCandidateOutcome,
@@ -82,7 +84,7 @@ function jobDetail(overrides: Partial<EvolutionJobDetail> = {}): EvolutionJobDet
 		observability: {
 			queueAgeMs: 10,
 			stageLatencies: [{ stage: "reflecting", durationMs: 20 }],
-			estimatedEvidenceTokens: 12_345,
+			evidenceTokens: 12_345,
 			providerCostUsd: null,
 			reflectorBudget: { modelCalls: 5, reflectionRounds: 2, toolCalls: 3 },
 			sliceCoverage: { analyzed: 3, corrupt: 0, skipped: 1, unreadable: 0 },
@@ -110,9 +112,9 @@ function overview(overrides: Partial<EvolutionOverview> = {}): EvolutionOverview
 		scope: { repositoryId: "repository", scopeId: "repository" },
 		processedEvidenceCursor: 2,
 		ingestionHighWaterCursor: 8,
-		unprocessedEstimatedTokens: 1_100_001,
+		unprocessedTokens: 1_100_001,
 		settledInvocationCount: 6,
-		automaticTokenThreshold: 1_000_000,
+		automaticTokenThreshold: AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD,
 		automaticMinimumInvocations: 5,
 		lastEvolutionAt: null,
 		cooldownRemainingMs: 0,
@@ -597,8 +599,8 @@ describe("EvolutionMenuComponent", () => {
 
 		const output = stripAnsi(component.render(180).join("\n"));
 		expect(output).toContain("Trigger: manual");
-		expect(output).toContain("Result: analysis processing");
-		expect(output).toContain("Analysis: processing");
+		expect(output).toContain("Result: analysis reflecting");
+		expect(output).toContain("Analysis: reflecting");
 		expect(output).toContain("Evolution token: 12,345");
 		expect(output).toContain("Last checkpoint: Today at 9:05 am");
 		expect(output).toContain("Base harness: [current] Default Diffex Agent");
@@ -1056,6 +1058,22 @@ describe("EvolutionMenuComponent", () => {
 				},
 			}),
 		).toBe("Use precise verification guidance.");
+	});
+
+	it("displays each active analysis stage", () => {
+		const stages = [
+			["snapshotting", "analysis snapshotting"],
+			["counter-slot", "analysis reserving counter slot"],
+			["reflecting", "analysis reflecting"],
+			["curating", "analysis curating EVOLVE.md"],
+			["validating", "analysis validating proposals"],
+			["skill-curating", "analysis curating skills"],
+			["writing", "analysis writing EVOLVE.md"],
+			["activating", "analysis activating harness"],
+		] as const;
+		for (const [stage, expected] of stages) {
+			expect(formatEvolutionJobResult(job({ stage }))).toBe(expected);
+		}
 	});
 
 	it("formats evolution timestamps for today and earlier dates", () => {

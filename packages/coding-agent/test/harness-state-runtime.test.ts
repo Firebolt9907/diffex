@@ -6,12 +6,32 @@ import {
 	computeHarnessVersion,
 	HARNESS_VERSION_SCHEMA_VERSION,
 	HarnessStateStore,
+	type HarnessWorkspaceIdentity,
 	harnessVersionDirectoryName,
+	harnessWorkspaceSelectionFileName,
 } from "@earendil-works/diffex-harness-state";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadGlobalHarnessState } from "../src/core/harness-state-runtime.ts";
+import {
+	loadWorkspaceHarnessState,
+	resolveEvolutionWorkspaceStateDirectory,
+	resolveHarnessWorkspace,
+} from "../src/core/harness-state-runtime.ts";
 
-describe("global harness state startup", () => {
+const WORKSPACE: HarnessWorkspaceIdentity = { repositoryId: "global", directoryId: "workspace-a" };
+
+function createStore(agentDir: string): HarnessStateStore {
+	return new HarnessStateStore(agentDir, { workspace: WORKSPACE });
+}
+
+function pointerPath(agentDir: string): string {
+	return join(agentDir, "harness-state", "selections", harnessWorkspaceSelectionFileName(WORKSPACE));
+}
+
+function loadHarnessState(agentDir: string) {
+	return loadWorkspaceHarnessState(agentDir, WORKSPACE);
+}
+
+describe("workspace harness state startup", () => {
 	const agentDirs: string[] = [];
 
 	afterEach(() => {
@@ -32,63 +52,81 @@ describe("global harness state startup", () => {
 		return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
 	}
 
-	it("initializes and activates the empty root when current.json is missing", async () => {
-		const loaded = await loadGlobalHarnessState(createAgentDir());
+	it("derives shared evolution state for the same workspace and isolates different workspaces", async () => {
+		const agentDir = createAgentDir();
+		const workspaceAPath = join(agentDir, "workspace-a");
+		const workspaceBPath = join(agentDir, "workspace-b");
+		mkdirSync(workspaceAPath);
+		mkdirSync(workspaceBPath);
+		const firstWorkspaceA = await resolveHarnessWorkspace(workspaceAPath);
+		const secondWorkspaceA = await resolveHarnessWorkspace(workspaceAPath);
+		const workspaceB = await resolveHarnessWorkspace(workspaceBPath);
+
+		expect(resolveEvolutionWorkspaceStateDirectory(agentDir, firstWorkspaceA.workspace)).toBe(
+			resolveEvolutionWorkspaceStateDirectory(agentDir, secondWorkspaceA.workspace),
+		);
+		expect(resolveEvolutionWorkspaceStateDirectory(agentDir, firstWorkspaceA.workspace)).not.toBe(
+			resolveEvolutionWorkspaceStateDirectory(agentDir, workspaceB.workspace),
+		);
+	});
+
+	it("initializes and activates the empty root when its workspace selection is missing", async () => {
+		const loaded = await loadHarnessState(createAgentDir());
 
 		expect(loaded.warning).toBeUndefined();
 		expect(loaded.bundle?.state.memory).toBe("");
 		expect(loaded.bundle?.manifest.base).toBeNull();
 	});
 
-	it("loads the globally selected non-empty revision", async () => {
+	it("loads the workspace-selected non-empty revision", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		const root = await store.initialize();
 		const advance = await store.advance({ memory: "Remember this revision." }, root.manifest.version);
 		if (advance.status !== "advanced") throw new Error("Expected harness advance to succeed");
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.warning).toBeUndefined();
 		expect(loaded.bundle).toEqual(advance.bundle);
 	});
 
-	it("warns and falls back without rewriting a corrupt current pointer", async () => {
+	it("warns and falls back without rewriting a corrupt workspace selection", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		await store.initialize();
-		const pointerPath = join(agentDir, "harness-state", "current.json");
-		writeFileSync(pointerPath, '{"version":"invalid"}\n');
-		const corruptPointer = readFileSync(pointerPath, "utf8");
+		const selectedPointerPath = pointerPath(agentDir);
+		writeFileSync(selectedPointerPath, '{"version":"invalid"}\n');
+		const corruptPointer = readFileSync(selectedPointerPath, "utf8");
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.bundle).toBeUndefined();
 		expect(loaded.warning).toContain("Continuing with the built-in harness.");
-		expect(readFileSync(pointerPath, "utf8")).toBe(corruptPointer);
+		expect(readFileSync(selectedPointerPath, "utf8")).toBe(corruptPointer);
 	});
 
 	it("warns and falls back when the selected revision is missing", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		await store.initialize();
-		const pointerPath = join(agentDir, "harness-state", "current.json");
+		const selectedPointerPath = pointerPath(agentDir);
 		const missingVersion = `sha256:${"f".repeat(64)}`;
-		writeFileSync(pointerPath, `${JSON.stringify({ version: missingVersion }, null, 2)}\n`);
-		const missingPointer = readFileSync(pointerPath, "utf8");
+		writeFileSync(selectedPointerPath, `${JSON.stringify({ version: missingVersion }, null, 2)}\n`);
+		const missingPointer = readFileSync(selectedPointerPath, "utf8");
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.bundle).toBeUndefined();
 		expect(loaded.warning).toContain("Continuing with the built-in harness.");
-		expect(readFileSync(pointerPath, "utf8")).toBe(missingPointer);
+		expect(readFileSync(selectedPointerPath, "utf8")).toBe(missingPointer);
 	});
 
 	it("warns and falls back when the selected bundle is corrupt", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		const root = await store.initialize();
-		const pointerPath = join(agentDir, "harness-state", "current.json");
+		const selectedPointerPath = pointerPath(agentDir);
 		const memoryPath = join(
 			agentDir,
 			"harness-state",
@@ -97,18 +135,18 @@ describe("global harness state startup", () => {
 			"EVOLVE.md",
 		);
 		writeFileSync(memoryPath, "corrupt bytes");
-		const selectedPointer = readFileSync(pointerPath, "utf8");
+		const selectedPointer = readFileSync(selectedPointerPath, "utf8");
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.bundle).toBeUndefined();
 		expect(loaded.warning).toContain("content hash mismatch");
-		expect(readFileSync(pointerPath, "utf8")).toBe(selectedPointer);
+		expect(readFileSync(selectedPointerPath, "utf8")).toBe(selectedPointer);
 	});
 
 	it("loads a selected revision with evolved skill artifacts", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		const root = await store.initialize();
 		const skill = "---\nname: future\ndescription: Use the future workflow.\n---\n\n# Future workflow\n";
 		const selected = await store.saveVersion(
@@ -126,7 +164,7 @@ describe("global harness state startup", () => {
 		);
 		await store.selectVersion(selected.manifest.version);
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.warning).toBeUndefined();
 		expect(loaded.bundle).toEqual(selected);
@@ -135,7 +173,7 @@ describe("global harness state startup", () => {
 
 	it("warns and preserves the pointer for an unsupported future artifact", async () => {
 		const agentDir = createAgentDir();
-		const store = new HarnessStateStore(agentDir);
+		const store = createStore(agentDir);
 		const root = await store.initialize();
 		const memory = "Future-compatible memory.\n";
 		const future = "Future artifact.\n";
@@ -167,14 +205,14 @@ describe("global harness state startup", () => {
 		);
 		writeFileSync(join(bundlePath, "EVOLVE.md"), memory);
 		writeFileSync(join(bundlePath, "future.txt"), future);
-		const pointerPath = join(agentDir, "harness-state", "current.json");
-		writeFileSync(pointerPath, `${JSON.stringify({ version }, null, 2)}\n`);
-		const incompatiblePointer = readFileSync(pointerPath, "utf8");
+		const selectedPointerPath = pointerPath(agentDir);
+		writeFileSync(selectedPointerPath, `${JSON.stringify({ version }, null, 2)}\n`);
+		const incompatiblePointer = readFileSync(selectedPointerPath, "utf8");
 
-		const loaded = await loadGlobalHarnessState(agentDir);
+		const loaded = await loadHarnessState(agentDir);
 
 		expect(loaded.bundle).toBeUndefined();
 		expect(loaded.warning).toContain('Unsupported harness artifact kind "future-skill-asset"');
-		expect(readFileSync(pointerPath, "utf8")).toBe(incompatiblePointer);
+		expect(readFileSync(selectedPointerPath, "utf8")).toBe(incompatiblePointer);
 	});
 });

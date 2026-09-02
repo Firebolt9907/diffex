@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	HarnessStateStore,
 	type HarnessVersionBundle,
 	type HarnessWorkspaceIdentity,
+	harnessWorkspaceSelectionFileName,
 } from "@earendil-works/diffex-harness-state";
 
 export interface ResolvedHarnessWorkspace {
@@ -27,6 +28,14 @@ export async function resolveHarnessWorkspace(cwd: string): Promise<ResolvedHarn
 	return { workspace: { repositoryId: "global", directoryId }, rootPath };
 }
 
+export function resolveEvolutionWorkspaceStateDirectory(agentDir: string, workspace: HarnessWorkspaceIdentity): string {
+	return join(
+		resolve(agentDir),
+		"evolution-workspaces",
+		harnessWorkspaceSelectionFileName(workspace).slice(0, -".json".length),
+	);
+}
+
 export interface LoadedHarnessState {
 	store: HarnessStateStore;
 	bundle: HarnessVersionBundle | undefined;
@@ -34,11 +43,14 @@ export interface LoadedHarnessState {
 }
 
 /**
- * Initialize the global harness store and load its selected revision.
+ * Initialize the shared harness revision store and load this workspace's selected revision.
  * Invalid selected state is deliberately left untouched so `/version` can repair it.
  */
-export async function loadGlobalHarnessState(agentDir: string): Promise<LoadedHarnessState> {
-	const store = new HarnessStateStore(agentDir);
+export async function loadWorkspaceHarnessState(
+	agentDir: string,
+	workspace: HarnessWorkspaceIdentity,
+): Promise<LoadedHarnessState> {
+	const store = new HarnessStateStore(agentDir, { workspace });
 	try {
 		await store.initialize();
 		return { store, bundle: await store.loadCurrent(), warning: undefined };

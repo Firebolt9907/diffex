@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	computeEvolutionContentDigest,
 	computeEvolutionTextDigest,
+	countEvolutionTokens,
 	type EvolutionArtifactReference,
 	EvolutionBackgroundWorker,
 	EvolutionControlPlane,
@@ -20,7 +21,6 @@ import {
 	type EvolutionScope,
 	type EvolutionSnapshotContext,
 	type EvolutionStageExecutor,
-	estimateEvolutionTokens,
 	FileEvolutionPersistence,
 	PollingEvolutionWorkSource,
 	type SkillCandidate,
@@ -72,7 +72,19 @@ function invocation(sequence: number): MaterializedInvocation {
 			criteria: ["trace_sequence", "session_cursor", "timestamp", "span_parentage", "causal_id"],
 			ambiguity: [],
 		},
-		evidence: [],
+		evidence: [
+			{
+				evidenceId: `trace-${sequence}:assistant`,
+				kind: "session_item",
+				itemType: "message",
+				order: { traceSequence: 1, timestamp: null, causalIdentifiers: [], ambiguity: [] },
+				traceSources: [],
+				payload: {
+					type: "message",
+					message: { role: "assistant", usage: { input: sequence * 10, output: sequence } },
+				},
+			},
+		],
 		diagnostics: [],
 	};
 }
@@ -182,7 +194,7 @@ async function serviceFixture(
 	);
 	const worker = new EvolutionBackgroundWorker({
 		clock,
-		source: new PollingEvolutionWorkSource(store, clock, { pollIntervalMs: 60_000 }),
+		source: new PollingEvolutionWorkSource(store, clock, scope, { pollIntervalMs: 60_000 }),
 		runner: controlPlane,
 		priority: { async waitUntilBackgroundAllowed() {} },
 	});
@@ -318,7 +330,7 @@ describe("evolution control service", () => {
 		expect(overview).toMatchObject({
 			ingestionHighWaterCursor: 3,
 			settledInvocationCount: 1,
-			unprocessedEstimatedTokens: estimateEvolutionTokens([eligible.invocation]),
+			unprocessedTokens: countEvolutionTokens([eligible.invocation]).totalTokens,
 			automaticEligibility: { eligible: false, reason: "insufficient-invocations" },
 		});
 		const started = await fixture.service.startManual();
@@ -328,7 +340,7 @@ describe("evolution control service", () => {
 		const snapshot = await fixture.store.get(job.inputSnapshot);
 		if (!("evidenceSources" in snapshot)) throw new Error("Expected an input snapshot");
 		expect(snapshot.evidenceSources.map((source) => source.materializationId)).toEqual(["materialization-2"]);
-		expect(snapshot.tokenMeasurement.estimatedTokens).toBe(estimateEvolutionTokens([eligible.invocation]));
+		expect(snapshot.tokenMeasurement).toMatchObject(countEvolutionTokens([eligible.invocation]));
 		await fixture.service.cancelJob(started.job.jobId);
 	});
 
@@ -386,7 +398,7 @@ describe("evolution control service", () => {
 			activeJob: null,
 			newestResumableJob: null,
 			processedEvidenceCursor: before.processedEvidenceCursor,
-			unprocessedEstimatedTokens: before.unprocessedEstimatedTokens,
+			unprocessedTokens: before.unprocessedTokens,
 			settledInvocationCount: before.settledInvocationCount,
 		});
 
@@ -668,7 +680,7 @@ describe("evolution control service", () => {
 		});
 	});
 
-	it("exposes candidate evidence, gates activation, and rolls back through preserving descendants", async () => {
+	it("exposes candidate evidence from legacy snapshots and gates activation and rollback", async () => {
 		const inputReference = { artifactId: "input-1", contentDigest: `sha256:${"1".repeat(64)}` };
 		const candidateReference = { artifactId: "candidate-1", contentDigest: `sha256:${"2".repeat(64)}` };
 		const draftReference = { artifactId: "draft-1", contentDigest: `sha256:${"3".repeat(64)}` };
@@ -759,7 +771,7 @@ describe("evolution control service", () => {
 			harness: { baseVersion: null },
 			expectedHarnessBaseVersion: `sha256:${"a".repeat(64)}`,
 			skillCatalog: [],
-			tokenMeasurement: { estimatedTokens: 10 },
+			tokenMeasurement: { estimatorVersion: "canonical-json-utf8-v1", estimatedTokens: 10 },
 		} as unknown as EvolutionInputSnapshot;
 		const job = {
 			metadata: { scope },
@@ -870,6 +882,7 @@ describe("evolution control service", () => {
 		} as unknown as EvolutionControlServiceDependencies);
 
 		expect(await service.getJob(job.jobId)).toMatchObject({
+			observability: { evidenceTokens: 10 },
 			skillCandidates: [
 				{
 					candidateId: candidate.candidateId,
@@ -947,7 +960,7 @@ describe("evolution control service", () => {
 				{ stage: "validating", durationMs: expect.any(Number) },
 				{ stage: "skill-curating", durationMs: expect.any(Number) },
 			],
-			estimatedEvidenceTokens: expect.any(Number),
+			evidenceTokens: expect.any(Number),
 			providerCostUsd: null,
 			reflectorBudget: { modelCalls: 0, reflectionRounds: 0, toolCalls: 0 },
 			sliceCoverage: null,

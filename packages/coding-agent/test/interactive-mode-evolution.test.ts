@@ -1,6 +1,6 @@
 import { setKeybindings } from "@earendil-works/diffex-tui";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EvolutionOverview } from "#evolution";
+import { AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD, type EvolutionOverview } from "#evolution";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type {
 	EvolutionMenuClient,
@@ -44,9 +44,9 @@ function overview(): EvolutionOverview {
 		scope: { repositoryId: "repository", scopeId: "repository" },
 		processedEvidenceCursor: 0,
 		ingestionHighWaterCursor: 0,
-		unprocessedEstimatedTokens: 0,
+		unprocessedTokens: 0,
 		settledInvocationCount: 0,
-		automaticTokenThreshold: 1_000_000,
+		automaticTokenThreshold: AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD,
 		automaticMinimumInvocations: 5,
 		lastEvolutionAt: null,
 		cooldownRemainingMs: 0,

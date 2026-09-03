@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { type Component, CURSOR_MARKER } from "../src/tui.ts";
+import { ACTIVE_ROW_MARKER, type Component, CURSOR_MARKER } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -41,7 +41,19 @@ class RecordingTerminal extends VirtualTerminal {
 
 class CursorComponent implements Component {
 	render(): string[] {
-		return [`${CURSOR_MARKER}\x1b[7m \x1b[0m`];
+		return [`${ACTIVE_ROW_MARKER}${CURSOR_MARKER}\x1b[7m \x1b[0m`];
+	}
+
+	invalidate(): void {}
+}
+
+class FocusedSelectorComponent implements Component {
+	render(): string[] {
+		return [
+			`${CURSOR_MARKER}search`,
+			...Array.from({ length: 10 }, (_, index) => `model ${index + 1}`),
+			`${ACTIVE_ROW_MARKER}selected`,
+		];
 	}
 
 	invalidate(): void {}
@@ -86,6 +98,7 @@ describe("TUI terminal focus", () => {
 		tui.renderNow();
 		assert.strictEqual(tui.isTerminalFocused(), false);
 		assert.strictEqual(terminal.hardwareCursorVisible, false);
+		assert.ok(terminal.writes.every((write) => !write.includes(ACTIVE_ROW_MARKER)));
 
 		terminal.sendInput("\x1b[I");
 		tui.renderNow();
@@ -97,10 +110,30 @@ describe("TUI terminal focus", () => {
 	it("reports focus in alternate-screen mode when mouse tracking is disabled", () => {
 		const terminal = new RecordingTerminal();
 		const tui = new TuiAltScreen(terminal, undefined, undefined, { mouse: false });
+		tui.addChild(new CursorComponent());
 
 		tui.start();
+		tui.renderNow();
 		assert.ok(terminal.writes.includes("\x1b[?1004h"));
+		assert.ok(terminal.writes.every((write) => !write.includes(ACTIVE_ROW_MARKER)));
 		tui.stop();
 		assert.ok(terminal.writes.includes("\x1b[?1004l"));
+	});
+
+	it("keeps focused selector anchors visible on a constrained main screen", async () => {
+		const terminal = new RecordingTerminal(40, 6);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild({ render: () => ["history"], invalidate: () => {} });
+		tui.addChild(new FocusedSelectorComponent());
+		tui.addChild({ render: () => ["footer"], invalidate: () => {} });
+
+		tui.start();
+		tui.renderNow();
+		const viewport = (await terminal.flushAndGetViewport()).join("\n");
+		assert.match(viewport, /search/);
+		assert.match(viewport, /selected/);
+		assert.match(viewport, /footer/);
+		assert.ok(!viewport.includes(ACTIVE_ROW_MARKER));
+		tui.stop();
 	});
 });

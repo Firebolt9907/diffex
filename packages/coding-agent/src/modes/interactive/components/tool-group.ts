@@ -1,4 +1,4 @@
-import { type Component, getGlyphs, truncateToWidth, visibleWidth } from "@earendil-works/diffex-tui";
+import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/diffex-tui";
 import { theme } from "../theme/theme.ts";
 import {
 	DiffexPathDockHinge,
@@ -17,11 +17,17 @@ export class ToolGroupComponent implements Component {
 	private readonly tools = new Map<string, ToolExecutionComponent>();
 	private outputPad: number;
 	private pathOrigin: DiffexPathOrigin;
+	private reusesLeadingGap: boolean;
 	private settled = false;
 
-	constructor(outputPad = 1, pathOrigin: DiffexPathOrigin = "standalone") {
+	constructor(
+		outputPad = 1,
+		pathOrigin: DiffexPathOrigin = "standalone",
+		options: { reuseLeadingGap?: boolean } = {},
+	) {
 		this.outputPad = outputPad;
 		this.pathOrigin = pathOrigin;
+		this.reusesLeadingGap = pathOrigin === "standalone" && options.reuseLeadingGap === true;
 	}
 
 	addTool(toolCallId: string, component: ToolExecutionComponent): ToolExecutionComponent {
@@ -57,8 +63,9 @@ export class ToolGroupComponent implements Component {
 		return this.pathOrigin;
 	}
 
-	setPathOrigin(pathOrigin: DiffexPathOrigin): void {
+	setPathOrigin(pathOrigin: DiffexPathOrigin, options: { reuseLeadingGap?: boolean } = {}): void {
 		this.pathOrigin = pathOrigin;
+		this.reusesLeadingGap = pathOrigin === "standalone" && options.reuseLeadingGap === true;
 	}
 
 	markSettled(): void {
@@ -97,9 +104,12 @@ export class ToolGroupComponent implements Component {
 		const safeWidth = Math.max(1, width);
 		const outputPad = Math.min(Math.max(0, this.outputPad), Math.max(0, safeWidth - 1));
 		const outerRailWidth = safeWidth - outputPad > 1 ? 1 : 0;
-		const railGapWidth = safeWidth - outputPad - outerRailWidth > 1 ? 1 : 0;
-		const treeWidth = safeWidth - outputPad - outerRailWidth - railGapWidth > 1 ? 1 : 0;
-		const toolWidth = Math.max(1, safeWidth - outputPad - outerRailWidth - railGapWidth - treeWidth);
+		const leftPad = " ".repeat(outputPad);
+		const pathPrefix = outerRailWidth > 0 ? (new DiffexPathRail(outputPad).render(safeWidth)[0] ?? leftPad) : leftPad;
+		const pathPrefixWidth = visibleWidth(pathPrefix);
+		const railGapWidth = safeWidth - pathPrefixWidth > 1 ? 1 : 0;
+		const railGap = " ".repeat(railGapWidth);
+		const toolWidth = Math.max(1, safeWidth - pathPrefixWidth - railGapWidth);
 		const renderedTools: RenderedTool[] = [];
 
 		for (const component of this.tools.values()) {
@@ -124,7 +134,9 @@ export class ToolGroupComponent implements Component {
 			? new DiffexPathRail(outputPad).render(safeWidth)
 			: this.pathOrigin === "user-dock"
 				? new DiffexPathDockHinge(outputPad).render(safeWidth)
-				: [];
+				: this.reusesLeadingGap
+					? []
+					: [""];
 		result.push(
 			...new DiffexPathLabel(label, {
 				marker: this.pathOrigin === "standalone" ? "start" : "branch",
@@ -132,37 +144,17 @@ export class ToolGroupComponent implements Component {
 				labelColor: (text) => theme.fg("muted", theme.bold(text)),
 			}).render(safeWidth),
 		);
-		const glyphs = getGlyphs();
-		const leftPad = " ".repeat(outputPad);
-		const outerRail = outerRailWidth > 0 ? theme.fg("borderMuted", glyphs.rail) : "";
-		const railGap = " ".repeat(railGapWidth);
-
-		for (let toolIndex = 0; toolIndex < renderedTools.length; toolIndex++) {
-			const { lines } = renderedTools[toolIndex]!;
-			const isLastTool = toolIndex === renderedTools.length - 1;
-			let renderedFirstLine = false;
-
+		for (const { lines } of renderedTools) {
 			for (const line of lines) {
 				if (line === "") {
 					result.push("");
 					continue;
 				}
 
-				let connector = "";
-				if (treeWidth > 0) {
-					connector = renderedFirstLine
-						? isLastTool
-							? " "
-							: glyphs.rail
-						: isLastTool
-							? glyphs.end
-							: glyphs.branch;
-				}
-				const decoratedLine = leftPad + outerRail + railGap + theme.fg("muted", connector) + line;
+				const decoratedLine = pathPrefix + railGap + line;
 				result.push(
 					visibleWidth(decoratedLine) > safeWidth ? truncateToWidth(decoratedLine, safeWidth, "") : decoratedLine,
 				);
-				renderedFirstLine = true;
 			}
 		}
 

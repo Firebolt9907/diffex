@@ -1,8 +1,13 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type RgbColor, resetCapabilitiesCache, setCapabilities } from "@earendil-works/diffex-tui";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+	type RgbColor,
+	resetCapabilitiesCache,
+	SELECTED_LIST_PREFIX,
+	setCapabilities,
+} from "@earendil-works/diffex-tui";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	detectTerminalBackgroundFromEnv,
 	detectTerminalBackgroundTheme,
@@ -20,8 +25,18 @@ import {
 } from "../src/modes/interactive/theme/theme.ts";
 
 const tempDirs: string[] = [];
+const originalNoColor = process.env.NO_COLOR;
+
+beforeEach(() => {
+	process.env.NO_COLOR = "";
+});
 
 afterEach(() => {
+	if (originalNoColor === undefined) {
+		delete process.env.NO_COLOR;
+	} else {
+		process.env.NO_COLOR = originalNoColor;
+	}
 	resetCapabilitiesCache();
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
@@ -192,8 +207,8 @@ describe("selection theme", () => {
 		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		initTheme("dark", false);
 
-		expect(theme.getFgAnsi("startupIntroText")).toBe("\x1b[38;2;205;214;244m");
-		expect(theme.getFgAnsi("startupIntroAccent")).toBe("\x1b[38;2;137;180;250m");
+		expect(theme.getFgAnsi("startupIntroText")).toBe("\x1b[38;2;204;211;224m");
+		expect(theme.getFgAnsi("startupIntroAccent")).toBe("\x1b[38;2;130;170;255m");
 		expect(theme.getFgAnsi("thinkingMedium")).toBe(theme.getFgAnsi("startupIntroAccent"));
 		expect(theme.getFgAnsi("selectionAccent")).toBe(theme.getFgAnsi("startupIntroAccent"));
 		expect(getEditorTheme().selectList.selectedText("command")).toBe(
@@ -201,7 +216,9 @@ describe("selection theme", () => {
 		);
 		expect(getEditorTheme().selectList.selectedPrefix("> ")).toBe(`${theme.getFgAnsi("selectionAccent")}> \x1b[39m`);
 		expect(getSelectListTheme().selectedText("command")).toBe(`${theme.getFgAnsi("selectionAccent")}command\x1b[39m`);
-		expect(getSettingsListTheme().cursor).toBe(`${theme.getFgAnsi("selectionAccent")}> \x1b[39m`);
+		expect(getSettingsListTheme().cursor).toBe(
+			`${theme.getFgAnsi("selectionAccent")}${SELECTED_LIST_PREFIX}\x1b[39m`,
+		);
 	});
 
 	it("falls back for themes without selection or startup intro tokens", () => {
@@ -249,19 +266,19 @@ describe("editor border theme", () => {
 		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		initTheme("dark", false);
 
-		const expected = "\x1b[38;2;137;180;250m";
+		const expected = "\x1b[38;2;130;170;255m";
 		expect(theme.getFgAnsi("editorBorder")).toBe(expected);
 		expect(getEditorTheme().borderColor("line")).toBe(`${expected}line\x1b[39m`);
 		expect(theme.getThinkingBorderColor("low")("line")).not.toBe(`${expected}line\x1b[39m`);
-		expect(theme.getBashModeBorderColor()("line")).toBe("\x1b[38;2;204;102;102mline\x1b[39m");
+		expect(theme.getBashModeBorderColor()("line")).toBe("\x1b[38;2;240;113;120mline\x1b[39m");
 	});
 
 	it("uses the fixed light theme color", () => {
 		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		initTheme("light", false);
 
-		expect(theme.getFgAnsi("editorBorder")).toBe("\x1b[38;2;60;89;122m");
-		expect(theme.getBashModeBorderColor()("line")).toBe("\x1b[38;2;170;85;85mline\x1b[39m");
+		expect(theme.getFgAnsi("editorBorder")).toBe("\x1b[38;2;49;95;156m");
+		expect(theme.getBashModeBorderColor()("line")).toBe("\x1b[38;2;179;58;70mline\x1b[39m");
 	});
 
 	it("falls back to borderMuted for existing custom themes", () => {

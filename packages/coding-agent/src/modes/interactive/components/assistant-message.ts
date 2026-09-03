@@ -2,6 +2,13 @@ import type { AssistantMessage } from "@earendil-works/diffex-ai";
 import { Container, getGlyphs, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/diffex-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import {
+	DiffexPathLabel,
+	type DiffexPathMarker,
+	type DiffexPathOrigin,
+	DiffexPathRail,
+	DiffexPathTerminus,
+} from "./diffex-path.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -20,6 +27,9 @@ export class AssistantMessageComponent extends Container {
 	private markdownTransformers: readonly MarkdownTransformer[];
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
+	private pathContinuesToTools = false;
+	private pathOrigin: Exclude<DiffexPathOrigin, "continued"> = "standalone";
+	private visibleOutput = false;
 	private isStreaming = false;
 
 	constructor(
@@ -75,6 +85,24 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
+	continuesPathToTools(): boolean {
+		return this.pathContinuesToTools;
+	}
+
+	hasVisibleOutput(): boolean {
+		return this.visibleOutput;
+	}
+
+	setPathOrigin(origin: Exclude<DiffexPathOrigin, "continued">): void {
+		if (this.pathOrigin === origin) {
+			return;
+		}
+		this.pathOrigin = origin;
+		if (this.lastMessage) {
+			this.updateContent(this.lastMessage);
+		}
+	}
+
 	override render(width: number): string[] {
 		const lines = super.render(width);
 		if (this.hasToolCalls || lines.length === 0) {
@@ -89,11 +117,8 @@ export class AssistantMessageComponent extends Container {
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
-
-		// Clear content container
 		this.contentContainer.clear();
 
-		const glyphs = getGlyphs();
 		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
 		const hasVisibleContent = message.content.some(
 			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
@@ -101,27 +126,67 @@ export class AssistantMessageComponent extends Container {
 		const hasTerminalNotice =
 			message.stopReason === "length" ||
 			(!hasToolCalls && (message.stopReason === "aborted" || message.stopReason === "error"));
-		this.hasToolCalls = hasToolCalls;
-		if (hasVisibleContent || hasTerminalNotice) {
-			this.contentContainer.addChild(
-				new Text(theme.fg("accent", `${glyphs.end} ${theme.bold("Diffex")}`), this.outputPad, 0),
-			);
+		let lastVisibleContentIndex = -1;
+		for (let i = message.content.length - 1; i >= 0; i--) {
+			const content = message.content[i];
+			if (
+				(content?.type === "text" && content.text.trim()) ||
+				(content?.type === "thinking" && content.thinking.trim())
+			) {
+				lastVisibleContentIndex = i;
+				break;
+			}
 		}
+		this.hasToolCalls = hasToolCalls;
+		this.pathContinuesToTools = hasToolCalls && hasVisibleContent;
+		this.visibleOutput = Boolean(hasVisibleContent || hasTerminalNotice);
+		let hasRenderedPath = false;
+		let hasRenderedIdentity = false;
+		let pathClosed = false;
+		const firstPathMarker: DiffexPathMarker = this.pathOrigin === "user-dock" ? "branch" : "start";
 
-		let hasRenderedSection = false;
-
-		// Render content in order
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content.type === "text" && content.text.trim()) {
-				this.contentContainer.addChild(new Spacer(1));
+				if (!hasRenderedIdentity) {
+					if (hasRenderedPath) {
+						this.contentContainer.addChild(new DiffexPathRail(this.outputPad));
+					}
+					const marker: DiffexPathMarker = hasToolCalls
+						? hasRenderedPath
+							? "branch"
+							: firstPathMarker
+						: this.isStreaming
+							? hasRenderedPath
+								? "branch"
+								: firstPathMarker
+							: i === lastVisibleContentIndex
+								? "end"
+								: hasRenderedPath
+									? "branch"
+									: firstPathMarker;
+					this.contentContainer.addChild(
+						new DiffexPathLabel("Diffex", {
+							marker,
+							padding: this.outputPad,
+							fill: !hasToolCalls,
+							markerColor: (text) => theme.fg("accent", text),
+							labelColor: (text) => theme.fg("accent", theme.bold(text)),
+						}),
+					);
+					pathClosed = marker === "end";
+					this.contentContainer.addChild(new Spacer(1));
+					hasRenderedIdentity = true;
+				} else {
+					this.contentContainer.addChild(new Spacer(1));
+				}
 				this.contentContainer.addChild(
-					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
+					new Markdown(content.text.trim(), this.outputPad + 2, 0, this.markdownTheme, undefined, {
 						tableStyle: "compact",
 						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
 					}),
 				);
-				hasRenderedSection = true;
+				hasRenderedPath = true;
 			} else if (content.type === "thinking") {
 				const thinkingBlocks: string[] = [];
 				for (; i < message.content.length; i++) {
@@ -139,28 +204,33 @@ export class AssistantMessageComponent extends Container {
 				if (thinkingBlocks.length === 0) {
 					continue;
 				}
-				if (hasRenderedSection) {
-					this.contentContainer.addChild(new Spacer(1));
+				if (hasRenderedPath) {
+					this.contentContainer.addChild(new DiffexPathRail(this.outputPad));
 				}
 
+				const marker: DiffexPathMarker = hasRenderedPath ? "branch" : firstPathMarker;
 				if (this.hideThinkingBlock) {
 					const hiddenLabel = this.hiddenThinkingLabel === "Thinking..." ? "hidden" : this.hiddenThinkingLabel;
 					this.contentContainer.addChild(
-						new Text(
-							theme.fg("thinkingText", `${glyphs.branch} Reasoning ${glyphs.bullet} ${hiddenLabel}`),
-							this.outputPad,
-							0,
-						),
+						new DiffexPathLabel(`Reasoning ${getGlyphs().bullet} ${hiddenLabel}`, {
+							marker,
+							padding: this.outputPad,
+							labelColor: (text) => theme.fg("thinkingText", text),
+						}),
 					);
 				} else {
 					this.contentContainer.addChild(
-						new Text(theme.fg("thinkingText", `${glyphs.branch} Reasoning`), this.outputPad, 0),
+						new DiffexPathLabel("Reasoning", {
+							marker,
+							padding: this.outputPad,
+							labelColor: (text) => theme.fg("thinkingText", text),
+						}),
 					);
-					this.contentContainer.addChild(new Spacer(1));
+					this.contentContainer.addChild(new DiffexPathRail(this.outputPad));
 					this.contentContainer.addChild(
 						new Markdown(
 							thinkingBlocks.join("\n\n"),
-							this.outputPad,
+							this.outputPad + 2,
 							0,
 							this.markdownTheme,
 							{
@@ -178,15 +248,34 @@ export class AssistantMessageComponent extends Container {
 						),
 					);
 				}
-				hasRenderedSection = true;
+				hasRenderedPath = true;
 			}
 		}
 
-		// Tool execution rows carry failures for responses with tool calls.
-		if (message.stopReason === "length") {
-			this.contentContainer.addChild(new Spacer(1));
+		if (!this.isStreaming && !hasToolCalls && !hasRenderedIdentity && (hasVisibleContent || hasTerminalNotice)) {
+			if (hasRenderedPath) {
+				this.contentContainer.addChild(new DiffexPathRail(this.outputPad));
+			}
 			this.contentContainer.addChild(
-				new Text(theme.fg("warning", "Response was truncated before completion."), this.outputPad, 0),
+				new DiffexPathLabel("Diffex", {
+					marker: "end",
+					padding: this.outputPad,
+					fill: true,
+					markerColor: (text) => theme.fg("accent", text),
+					labelColor: (text) => theme.fg("accent", theme.bold(text)),
+				}),
+			);
+			hasRenderedIdentity = true;
+		} else if (!this.isStreaming && !hasToolCalls && hasRenderedIdentity && hasRenderedPath && !pathClosed) {
+			this.contentContainer.addChild(new DiffexPathTerminus(this.outputPad));
+		}
+
+		if (message.stopReason === "length") {
+			if (hasRenderedIdentity) {
+				this.contentContainer.addChild(new Spacer(1));
+			}
+			this.contentContainer.addChild(
+				new Text(theme.fg("warning", "Response was truncated before completion."), this.outputPad + 2, 0),
 			);
 		} else if (!hasToolCalls) {
 			if (message.stopReason === "aborted") {
@@ -195,11 +284,11 @@ export class AssistantMessageComponent extends Container {
 						? message.errorMessage
 						: "Operation aborted";
 				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(new Text(theme.fg("warning", abortMessage), this.outputPad, 0));
+				this.contentContainer.addChild(new Text(theme.fg("warning", abortMessage), this.outputPad + 2, 0));
 			} else if (message.stopReason === "error") {
 				const errorMsg = message.errorMessage || "Unknown error";
 				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad, 0));
+				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad + 2, 0));
 			}
 		}
 	}

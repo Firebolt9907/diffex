@@ -1,7 +1,9 @@
 import { type Component, getGlyphs, truncateToWidth, visibleWidth } from "@earendil-works/diffex-tui";
+import { STANDARD_VIEWPORT_MIN_COLUMNS } from "../responsive-layout.ts";
 import { theme } from "../theme/theme.ts";
 
 export type DiffexPathMarker = "start" | "branch" | "end";
+export type DiffexPathOrigin = "standalone" | "user-dock" | "continued";
 
 export interface DiffexPathLabelOptions {
 	marker: DiffexPathMarker;
@@ -97,10 +99,79 @@ export class DiffexPathRail implements Component {
 		// Styling is resolved during render so theme changes do not require cached state.
 	}
 
+	protected resolveGlyph(): string {
+		return getGlyphs().rail;
+	}
+
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const padding = Math.min(Math.max(0, this.padding), Math.max(0, safeWidth - 1));
-		const line = `${" ".repeat(padding)}${this.color(getGlyphs().rail)}`;
+		const line = `${" ".repeat(padding)}${this.color(this.resolveGlyph())}`;
 		return [visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth, "") : line];
 	}
+}
+
+/** Close an otherwise unlabeled response path after its final content block. */
+export class DiffexPathTerminus extends DiffexPathRail {
+	protected override resolveGlyph(): string {
+		return getGlyphs().end;
+	}
+}
+
+/** Draw the transmitter socket below the user surface. */
+export class DiffexPathHinge implements Component {
+	private extended = false;
+	private padding: number;
+
+	constructor(padding = 0) {
+		this.padding = padding;
+	}
+
+	setExtended(extended: boolean): void {
+		this.extended = extended;
+	}
+
+	setPadding(padding: number): void {
+		this.padding = padding;
+	}
+
+	invalidate(): void {
+		// Styling and glyph mode are resolved during render.
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const padding = Math.min(Math.max(0, this.padding), Math.max(0, safeWidth - 1));
+		const glyphs = getGlyphs();
+		const corner = theme.fg("borderAccent", resolveMarker("start"));
+		const lip = this.extended ? theme.fg("borderMuted", glyphs.separator.repeat(2)) : "";
+		const line = `${" ".repeat(padding)}${corner}${lip}`;
+		return [visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth, "") : line];
+	}
+}
+
+/** Join a docked user surface to the first response node. */
+export class DiffexPathDockHinge implements Component {
+	private readonly hinge: DiffexPathHinge;
+
+	constructor(padding = 1) {
+		this.hinge = new DiffexPathHinge(padding);
+	}
+
+	setOutputPad(padding: number): void {
+		this.hinge.setPadding(padding);
+	}
+
+	invalidate(): void {
+		this.hinge.invalidate();
+	}
+
+	render(width: number): string[] {
+		this.hinge.setExtended(shouldExtendDiffexPathHinge(width));
+		return this.hinge.render(width);
+	}
+}
+
+export function shouldExtendDiffexPathHinge(width: number): boolean {
+	return width >= STANDARD_VIEWPORT_MIN_COLUMNS;
 }

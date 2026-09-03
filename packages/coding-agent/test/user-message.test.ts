@@ -24,6 +24,24 @@ describe("UserMessageComponent", () => {
 		expect(lines.every((line) => visibleWidth(line) === 20)).toBe(true);
 	});
 
+	test("keeps the transmitter hinge outside the docked prompt surface", () => {
+		initTheme("dark");
+		const component = new UserMessageComponent("transmit status");
+
+		component.setDocked(true);
+		const narrow = component.render(60);
+		const standard = component.render(80);
+
+		expect(component.isDocked()).toBe(true);
+		expect(narrow).toHaveLength(3);
+		expect(stripAnsi(narrow[2] ?? "").trimEnd()).toBe("");
+		expect(stripAnsi(standard[2] ?? "").trimEnd()).toBe("");
+		expect(stripAnsi(standard.join("\n"))).not.toContain(getGlyphs().start);
+		expect(narrow.every((line) => visibleWidth(line) === 60)).toBe(true);
+		expect(standard.every((line) => visibleWidth(line) === 80)).toBe(true);
+		expect(standard[2]?.startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
+	});
+
 	test("chains Markdown transformers with user message context", () => {
 		initTheme("dark");
 		const calls: string[] = [];

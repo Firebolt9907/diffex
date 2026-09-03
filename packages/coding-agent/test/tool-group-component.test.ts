@@ -53,6 +53,37 @@ describe("ToolGroupComponent", () => {
 		expect(settled).not.toContain("Exploring");
 	});
 
+	test("renders a standalone tool group as one open Diffex path", () => {
+		const glyphs = getGlyphs();
+		const group = new ToolGroupComponent(1);
+		group.addTool("single", createTool("single", "Single"));
+		const lines = group.render(80).map((line) => stripAnsi(line).trimEnd());
+
+		expect(lines[0]).toBe(` ${glyphs.start} Exploring`);
+		expect(lines[1]?.startsWith(` ${glyphs.rail} ${glyphs.end}`)).toBe(true);
+	});
+
+	test("continues an assistant activity rail without adding a blank gap", () => {
+		const glyphs = getGlyphs();
+		const group = new ToolGroupComponent(1, "continued");
+		group.addTool("continued", createTool("continued", "Continued"));
+		const lines = group.render(80).map((line) => stripAnsi(line).trimEnd());
+
+		expect(lines[0]).toBe(` ${glyphs.rail}`);
+		expect(lines[1]).toBe(` ${glyphs.branch} Exploring`);
+		expect(lines[2]?.startsWith(` ${glyphs.rail} ${glyphs.end}`)).toBe(true);
+	});
+
+	test("joins a user dock without drawing a duplicate rail", () => {
+		const glyphs = getGlyphs();
+		const group = new ToolGroupComponent(1, "user-dock");
+		group.addTool("docked", createTool("docked", "Docked"));
+		const lines = group.render(80).map((line) => stripAnsi(line).trimEnd());
+
+		expect(lines[0]).toBe(` ${glyphs.branch} Exploring`);
+		expect(lines[1]?.startsWith(` ${glyphs.rail} ${glyphs.end}`)).toBe(true);
+	});
+
 	test("forwards display settings to existing tool components", () => {
 		const group = new ToolGroupComponent();
 		const tool = createTool("settings", "Settings");
@@ -94,6 +125,14 @@ describe("ToolGroupComponent", () => {
 		group.addTool("empty", tool);
 
 		expect(group.render(80)).toEqual([]);
+
+		tool.updateResult({
+			content: [{ type: "text", text: "extension failed" }],
+			isError: true,
+		});
+		const failed = stripAnsi(group.render(80).join("\n"));
+		expect(failed).toContain("Empty");
+		expect(failed).toContain("failed");
 	});
 
 	test("preserves reserved empty image rows", () => {

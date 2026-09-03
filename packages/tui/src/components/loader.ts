@@ -1,3 +1,4 @@
+import { getGlyphs } from "../glyphs.ts";
 import type { TUI } from "../tui.ts";
 import { Text } from "./text.ts";
 
@@ -7,40 +8,30 @@ export interface LoaderIndicatorOptions {
 	/** Frame interval in milliseconds for animated indicators. */
 	intervalMs?: number;
 	/** Stable content rendered before both the message and indicator. */
-	prefix?: string;
+	prefix?: string | (() => string);
 	/** Place the animated indicator after the message while preserving its frames. */
 	indicatorPosition?: "before" | "after";
 }
 
-const DEFAULT_FRAMES = [
-	"،    ",
-	"′    ",
-	" ´   ",
-	"  ‾  ",
-	"   ⸌ ",
-	"    ⸌",
-	"    ⸊",
-	"    |",
-	"    ⁎",
-	"    ⁕",
-	"   ⁎⁕",
-	"  ⁕෴⁕",
-	" ⁕⁎⁕ ",
-	"⁕⁎෴⁎⁕",
-	" ⁎⁕⁎ ",
-	"  ෴  ",
-	"  ⁕  ",
-	"     ",
-	"     ",
-	"     ",
-];
-const DEFAULT_INTERVAL_MS = 80;
+const DEFAULT_INTERVAL_MS = 120;
+
+function getDefaultFrames(): string[] {
+	const { bullet, running } = getGlyphs();
+	return [
+		`${running}${bullet.repeat(3)}`,
+		`${bullet}${running}${bullet.repeat(2)}`,
+		`${bullet.repeat(2)}${running}${bullet}`,
+		`${bullet.repeat(3)}${running}`,
+		`${bullet.repeat(2)}${running}${bullet}`,
+		`${bullet}${running}${bullet.repeat(2)}`,
+	];
+}
 
 /**
  * Loader component that updates with an optional spinning animation.
  */
 export class Loader extends Text {
-	private frames = [...DEFAULT_FRAMES];
+	private frames = getDefaultFrames();
 	private intervalMs = DEFAULT_INTERVAL_MS;
 	private currentFrame = 0;
 	private intervalId: NodeJS.Timeout | null = null;
@@ -49,7 +40,7 @@ export class Loader extends Text {
 	private spinnerColorFn: (str: string) => string;
 	private messageColorFn: (str: string) => string;
 	private message: string = "Loading...";
-	private prefix = "";
+	private prefix: string | (() => string) = "";
 	private indicatorPosition: "before" | "after" = "before";
 
 	constructor(
@@ -86,12 +77,17 @@ export class Loader extends Text {
 
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
 		this.renderIndicatorVerbatim = indicator?.frames !== undefined;
-		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
+		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : getDefaultFrames();
 		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
 		this.prefix = indicator?.prefix ?? "";
 		this.indicatorPosition = indicator?.indicatorPosition ?? "before";
 		this.currentFrame = 0;
 		this.start();
+	}
+
+	override invalidate(): void {
+		this.updateDisplay(false);
+		super.invalidate();
 	}
 
 	private restartAnimation(): void {
@@ -105,7 +101,7 @@ export class Loader extends Text {
 		}, this.intervalMs);
 	}
 
-	private updateDisplay(): void {
+	private updateDisplay(requestRender = true): void {
 		const frame = this.frames[this.currentFrame] ?? "";
 		const renderedFrame = this.renderIndicatorVerbatim ? frame : this.spinnerColorFn(frame);
 		const message = this.messageColorFn(this.message);
@@ -113,8 +109,9 @@ export class Loader extends Text {
 			this.indicatorPosition === "after"
 				? `${message}${frame.length > 0 ? ` ${renderedFrame}` : ""}`
 				: `${frame.length > 0 ? `${renderedFrame} ` : ""}${message}`;
-		this.setText(`${this.prefix}${content}`);
-		if (this.ui) {
+		const prefix = typeof this.prefix === "function" ? this.prefix() : this.prefix;
+		this.setText(`${prefix}${content}`);
+		if (requestRender && this.ui) {
 			this.ui.requestRender();
 		}
 	}

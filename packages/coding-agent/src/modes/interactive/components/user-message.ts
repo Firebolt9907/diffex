@@ -1,4 +1,4 @@
-import { Box, Container, getGlyphs, Markdown, type MarkdownTheme } from "@earendil-works/diffex-tui";
+import { Box, Container, getGlyphs, Markdown, type MarkdownTheme, Spacer } from "@earendil-works/diffex-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
@@ -54,7 +54,8 @@ export class UserMessageComponent extends Container {
 	private rebuild(): void {
 		this.clear();
 		const glyphs = getGlyphs();
-		const surface = new Box(this.outputPad, 1, (content) => theme.bg("userMessageBg", content));
+		const surface = new Box(this.outputPad, 0, (content) => theme.bg("userMessageBg", content));
+		surface.addChild(new Spacer(1));
 		surface.addChild(
 			new Markdown(
 				this.text,
@@ -73,6 +74,7 @@ export class UserMessageComponent extends Container {
 				},
 			),
 		);
+		surface.addChild(new Spacer(1));
 		this.addChild(surface);
 	}
 

@@ -1,3 +1,4 @@
+import { getGlyphs } from "@earendil-works/diffex-tui";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -20,7 +21,7 @@ describe("FirstTimeSetupComponent", () => {
 		});
 
 		const output = stripAnsi(component.render(80).join("\n"));
-		expect(output).toContain("> Dark");
+		expect(output).toContain(`${getGlyphs().selected} Dark`);
 		expect(output).not.toContain("→");
 	});
 });

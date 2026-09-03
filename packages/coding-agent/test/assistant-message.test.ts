@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/diffex-ai";
+import { getGlyphs } from "@earendil-works/diffex-tui";
 import { describe, expect, test } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
@@ -81,6 +82,15 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
 	});
 
+	test("does not render an empty Diffex identity row for a tool-only message", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "file.txt" } }]),
+		);
+
+		expect(component.render(60)).toEqual([]);
+	});
+
 	test("renders length stops with neutral truncation wording", () => {
 		initTheme("dark");
 
@@ -112,6 +122,54 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.match(/Reasoning/g)).toHaveLength(1);
 		expect(rendered.match(/hidden/g)).toHaveLength(1);
 		expect(rendered).toContain("answer");
+	});
+
+	test("restores Diffex hierarchy with deliberate reasoning rhythm", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: "brief reasoning" },
+				{ type: "text", text: "final answer" },
+			]),
+		);
+
+		for (const width of [60, 80, 120]) {
+			const lines = component.render(width).map((line) => stripAnsi(line).trimEnd());
+			expect(lines).toEqual([
+				` ${getGlyphs().end} Diffex`,
+				` ${getGlyphs().branch} Reasoning`,
+				"",
+				" brief reasoning",
+				"",
+				" final answer",
+			]);
+		}
+	});
+
+	test("keeps hidden reasoning and terminal notices free of orphan gaps", () => {
+		initTheme("dark");
+		const hidden = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: "private" },
+				{ type: "text", text: "visible" },
+			]),
+			true,
+		);
+		const failed = new AssistantMessageComponent(
+			createAssistantMessage([], { stopReason: "error", errorMessage: "provider unavailable" }),
+		);
+
+		expect(hidden.render(80).map((line) => stripAnsi(line).trimEnd())).toEqual([
+			` ${getGlyphs().end} Diffex`,
+			` ${getGlyphs().branch} Reasoning ${getGlyphs().bullet} hidden`,
+			"",
+			" visible",
+		]);
+		expect(failed.render(80).map((line) => stripAnsi(line).trimEnd())).toEqual([
+			` ${getGlyphs().end} Diffex`,
+			"",
+			" Error: provider unavailable",
+		]);
 	});
 
 	test("uses configured output padding for text and thinking", () => {
@@ -171,13 +229,15 @@ describe("AssistantMessageComponent", () => {
 
 		component.updateContent(message, true);
 		const streaming = stripAnsi(component.render(80).join("\n"));
-		expect(streaming).toContain("Diffex");
-		expect(streaming).toContain("responding");
+		expect(streaming).toContain("partial");
+		expect(streaming.match(/Diffex/g)).toHaveLength(1);
+		expect(streaming).not.toContain("responding");
 		expect(streaming).not.toContain("transformed");
 
 		component.updateContent(message, false);
 		const complete = stripAnsi(component.render(80).join("\n"));
 		expect(complete).toContain("partial transformed");
+		expect(complete.match(/Diffex/g)).toHaveLength(1);
 		expect(complete).not.toContain("responding");
 		expect(streamingStates).toEqual([true, false]);
 	});
@@ -191,9 +251,8 @@ describe("AssistantMessageComponent", () => {
 			createAssistantMessage([], { stopReason: "error", errorMessage: "provider unavailable" }),
 		);
 
-		expect(stripAnsi(cancelled.render(80).join("\n"))).toContain("cancelled");
-		expect(stripAnsi(failed.render(80).join("\n"))).toContain("failed");
-		expect(stripAnsi(failed.render(80).join("\n"))).toContain("provider unavailable");
+		expect(stripAnsi(cancelled.render(80).join("\n"))).toContain("Operation aborted");
+		expect(stripAnsi(failed.render(80).join("\n"))).toContain("Error: provider unavailable");
 	});
 
 	test("reapplies Markdown transformers when available width changes", () => {
@@ -274,10 +333,10 @@ describe("AssistantMessageComponent", () => {
 
 		const paddedComponent = new UserMessageComponent("hello", undefined, 1);
 		const paddedLines = paddedComponent.render(40).map((line) => stripAnsi(line));
-		expect(paddedLines.some((line) => line.startsWith(" hello"))).toBe(true);
+		expect(paddedLines.some((line) => line.startsWith(` ${getGlyphs().selected} hello`))).toBe(true);
 
 		const unpaddedComponent = new UserMessageComponent("hello", undefined, 0);
 		const unpaddedLines = unpaddedComponent.render(40).map((line) => stripAnsi(line));
-		expect(unpaddedLines.some((line) => line.startsWith("hello"))).toBe(true);
+		expect(unpaddedLines.some((line) => line.startsWith(`${getGlyphs().selected} hello`))).toBe(true);
 	});
 });

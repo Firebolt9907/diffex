@@ -9,6 +9,11 @@ export { CustomEditor } from "./custom-editor.ts";
 export { CustomMessageComponent } from "./custom-message.ts";
 export { DaxnutsComponent } from "./daxnuts.ts";
 export { type RenderDiffOptions, renderDiff } from "./diff.ts";
+export {
+	DiffexPathLabel,
+	DiffexPathRail,
+	formatDiffexPathPrefix,
+} from "./diffex-path.ts";
 export { DynamicBorder } from "./dynamic-border.ts";
 export { ExtensionEditorComponent } from "./extension-editor.ts";
 export { ExtensionInputComponent } from "./extension-input.ts";
@@ -33,6 +38,7 @@ export { SubagentsComponent } from "./subagents.ts";
 export { ThemeSelectorComponent } from "./theme-selector.ts";
 export { ThinkingSelectorComponent } from "./thinking-selector.ts";
 export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.ts";
+export { ToolGroupComponent } from "./tool-group.ts";
 export { TreeSelectorComponent } from "./tree-selector.ts";
 export { TrustSelectorComponent } from "./trust-selector.ts";
 export { UserMessageComponent } from "./user-message.ts";

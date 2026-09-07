@@ -583,10 +583,36 @@ export interface SkillCandidateWorkspaceScope {
 	readonly evolutionScope: EvolutionScope;
 }
 
+export interface SkillCandidateSkillability {
+	readonly classification: SkillabilityClassification;
+}
+
 export interface SkillCandidateMemoryRelationship {
 	readonly classification: SkillMemoryRelationshipClassification;
 	readonly memoryProposalIds: readonly string[];
-	readonly rationale: string;
+}
+
+export interface SkillCandidateOutline {
+	readonly outlineId: string;
+	readonly outlineKey: string;
+	readonly sourceLessonIds: readonly string[];
+	readonly operation: SkillCandidateOperation;
+	readonly proposedName: string;
+	readonly existingSkillIds: readonly string[];
+	readonly skillability: SkillCandidateSkillability;
+	readonly memoryRelationship: SkillCandidateMemoryRelationship;
+}
+
+export interface SkillCandidateOutlineSet {
+	readonly artifactKind: "skill-candidate-outline-set";
+	readonly metadata: EvolutionArtifactMetadata;
+	readonly outlineSetId: string;
+	readonly sourceEvolutionJobId: string;
+	readonly discoveryIdempotencyKey: string;
+	readonly inputSnapshotId: string;
+	readonly inputSnapshotContentDigest: string;
+	readonly workspace: SkillCandidateWorkspaceScope;
+	readonly outlines: readonly SkillCandidateOutline[];
 }
 
 export interface SkillCandidateProcedureStep {
@@ -599,6 +625,27 @@ export interface SkillCandidateFailureHandling {
 	readonly signal: string;
 	readonly mitigation: string;
 	readonly recovery: string;
+}
+
+export interface SkillCandidateProcedureDraftStep {
+	readonly action: string;
+	readonly condition: string | null;
+}
+
+export interface SkillCandidateProcedureDraft {
+	readonly trigger: {
+		readonly description: string;
+		readonly positiveExamples: readonly string[];
+		readonly negativeExamples: readonly string[];
+	};
+	readonly steps: readonly SkillCandidateProcedureDraftStep[];
+	readonly requiredTools: readonly string[];
+	readonly environment: readonly string[];
+	readonly failureHandling: readonly SkillCandidateFailureHandling[];
+	readonly additionalPreconditions: readonly string[];
+	readonly additionalApplicabilityBoundaries: readonly string[];
+	readonly verificationChecks: readonly string[];
+	readonly completionCondition: string;
 }
 
 export type SkillCandidateMaterialField =
@@ -650,10 +697,7 @@ export interface SkillCandidate {
 	readonly supportingTraceIds: readonly string[];
 	readonly contradictingTraceIds: readonly string[];
 	readonly taskLineageIds: readonly string[];
-	readonly skillability: {
-		readonly classification: SkillabilityClassification;
-		readonly rationale: string;
-	};
+	readonly skillability: SkillCandidateSkillability;
 	readonly trigger: {
 		readonly description: string;
 		readonly positiveExamples: readonly string[];
@@ -674,6 +718,50 @@ export interface SkillCandidate {
 	readonly memoryRelationship: SkillCandidateMemoryRelationship;
 	readonly capsuleSize: SkillCandidateCapsuleSize;
 }
+
+export type SkillCandidateExpansionFailureReasonCode =
+	| "candidate-assembly-invalid"
+	| "model-call-failed"
+	| "procedure-draft-invalid";
+
+export interface SkillCandidateExpansionAttemptDiagnostic {
+	readonly attempt: 1 | 2;
+	readonly modelRounds: number;
+	readonly reasonCode: SkillCandidateExpansionFailureReasonCode;
+	/** Sanitized summary safe for persistence and operator display; never raw model output. */
+	readonly message: string;
+	readonly inspectedReferences: {
+		readonly evidenceIds: readonly string[];
+		readonly skillIds: readonly string[];
+	};
+	readonly invalidFieldPaths: readonly string[];
+}
+
+export interface SkillCandidateExpansionFailureDiagnostic {
+	readonly reasonCode: SkillCandidateExpansionFailureReasonCode;
+	/** Sanitized terminal summary safe for persistence and operator display. */
+	readonly message: string;
+	readonly attempts: readonly [SkillCandidateExpansionAttemptDiagnostic, SkillCandidateExpansionAttemptDiagnostic];
+}
+
+export interface SkillCandidateExpansionSucceeded {
+	readonly status: "succeeded";
+	readonly outlineId: string;
+	readonly outlineKey: string;
+	readonly attemptCount: 1 | 2;
+	readonly candidate: SkillCandidate;
+}
+
+export interface SkillCandidateExpansionFailed {
+	readonly status: "failed";
+	readonly outlineId: string;
+	readonly outlineKey: string;
+	readonly diagnostic: SkillCandidateExpansionFailureDiagnostic;
+}
+
+export type SkillCandidateExpansionOutcome = SkillCandidateExpansionSucceeded | SkillCandidateExpansionFailed;
+
+export type SkillCurationStatus = "completed" | "completed-with-some-failures";
 
 export interface DeferredSkillCandidateFinding {
 	readonly artifactKind: "skill-candidate-finding";
@@ -1118,6 +1206,7 @@ export type SkillCandidateWorkStage =
 	| "synthesizing"
 	| "validating"
 	| "evaluating"
+	| "activating"
 	| "completed";
 
 export interface SkillCandidateWorkCheckpointedEvent extends SkillCandidateRegistryEventBase {
@@ -1429,6 +1518,7 @@ export interface SkillMutationBatch {
 	readonly expectedBaseVersion: HarnessVersion;
 	readonly workspace: EvolutionSkillWorkspaceIdentity;
 	readonly mutations: readonly SkillMutation[];
+	readonly allowSkillInventoryRebase?: boolean;
 }
 
 export type SkillMutationExactDiff = JsonObject & {
@@ -1725,6 +1815,41 @@ export interface SkillCuratorToolCallLedgerEvent extends EvolutionLedgerEventBas
 	readonly denialCode: string | null;
 }
 
+export interface SkillCandidateOutlinesCheckpointedLedgerEvent extends EvolutionLedgerEventBase {
+	readonly type: "skill-candidate-outlines-checkpointed";
+	readonly idempotencyKey: string;
+	readonly outlineSet: EvolutionArtifactReference;
+}
+
+interface SkillCandidateExpansionLedgerEventBase extends EvolutionLedgerEventBase {
+	readonly curationIdempotencyKey: string;
+	readonly outlineId: string;
+	readonly outlineKey: string;
+	readonly proposedName: string;
+	readonly operation: SkillCandidateOperation;
+}
+
+export interface SkillCandidateExpansionAttemptFailedLedgerEvent extends SkillCandidateExpansionLedgerEventBase {
+	readonly type: "skill-candidate-expansion-attempt-failed";
+	readonly diagnostic: SkillCandidateExpansionAttemptDiagnostic;
+}
+
+export interface SkillCandidateExpansionSucceededLedgerEvent extends SkillCandidateExpansionLedgerEventBase {
+	readonly type: "skill-candidate-expansion-succeeded";
+	readonly attemptCount: 1 | 2;
+	readonly candidate: EvolutionArtifactReference;
+}
+
+export interface SkillCandidateExpansionFailedLedgerEvent extends SkillCandidateExpansionLedgerEventBase {
+	readonly type: "skill-candidate-expansion-failed";
+	readonly diagnostic: SkillCandidateExpansionFailureDiagnostic;
+}
+
+export type SkillCandidateExpansionLedgerEvent =
+	| SkillCandidateExpansionAttemptFailedLedgerEvent
+	| SkillCandidateExpansionSucceededLedgerEvent
+	| SkillCandidateExpansionFailedLedgerEvent;
+
 export interface ReflectorModelCallLedgerEvent extends EvolutionLedgerEventBase {
 	readonly type: "reflector-model-call";
 	readonly modelCallId: string;
@@ -1766,5 +1891,7 @@ export type EvolutionLedgerEvent =
 	| ReflectionNodeCheckpointedLedgerEvent
 	| CuratorToolCallLedgerEvent
 	| SkillCuratorToolCallLedgerEvent
+	| SkillCandidateOutlinesCheckpointedLedgerEvent
+	| SkillCandidateExpansionLedgerEvent
 	| ReflectorModelCallLedgerEvent
 	| ReflectorToolCallLedgerEvent;

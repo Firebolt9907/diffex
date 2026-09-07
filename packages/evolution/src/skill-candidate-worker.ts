@@ -71,6 +71,12 @@ export interface SkillCandidateRegistryWorkerDependencies {
 	readonly validator: SkillDraftValidator;
 	readonly evaluator?: SkillEvaluator;
 	readonly model: SkillSynthesisModelExecutor;
+	readonly activateAcceptedGroups?: (
+		scope: EvolutionScope,
+		sourceEvolutionJobId: string,
+		groupIds: readonly string[],
+		signal?: AbortSignal,
+	) => Promise<void>;
 }
 
 export interface SkillCandidateRegistryWorkerOptions {
@@ -575,6 +581,12 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 		}
 	}
 
+	async #allSourceJobsCompleted(group: SkillCandidateGroup): Promise<boolean> {
+		const sourceJobIds = [...new Set(group.proposalRevisions.map((revision) => revision.sourceEvolutionJobId))];
+		const sourceJobs = await Promise.all(sourceJobIds.map((jobId) => this.#dependencies.jobs.load(jobId)));
+		return sourceJobs.every((job) => job?.outcome === "completed" && job.stage === "completed");
+	}
+
 	async #isKnownOversizedRequest(
 		group: SkillCandidateGroup,
 		events: readonly SkillCandidateRegistryEvent[],
@@ -671,6 +683,7 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				if (
 					group.canonicalCapsule !== null &&
 					group.state === "evidence-qualified" &&
+					(await this.#allSourceJobsCompleted(group)) &&
 					!(await this.#isKnownOversizedRequest(group, registryEvents))
 				) {
 					synthesisTargets.push(group);
@@ -881,6 +894,16 @@ export class SkillCandidateRegistryWorker implements SkillCandidateWorkProcessor
 				}
 			}
 			activeGroupId = null;
+			if (this.#dependencies.activateAcceptedGroups !== undefined) {
+				const acceptedGroupIds = (await this.#dependencies.registry.list(job.metadata.scope))
+					.filter((group) => processedGroupIds.includes(group.groupId) && group.state === "accepted")
+					.map((group) => group.groupId);
+				if (acceptedGroupIds.length > 0) {
+					activeStage = "activating";
+					await this.#appendCheckpoint(job, activeStage, attempt, acceptedGroupIds, claim());
+					await this.#dependencies.activateAcceptedGroups(job.metadata.scope, job.jobId, acceptedGroupIds, signal);
+				}
+			}
 			const activeSynthesisFailures = synthesisFailures.filter((failure) => !failure.parked);
 			if (activeSynthesisFailures.length > 0) {
 				const retryableFailures = activeSynthesisFailures.filter((failure) => failure.retryPending);

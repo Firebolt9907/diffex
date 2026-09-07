@@ -102,8 +102,8 @@ function invocation(traceId: string, inputTokens = 100, outputTokens = 25): Mate
 	};
 }
 
-function materialization(sequence: number): SuccessfulMaterialization {
-	const materialized = invocation(`trace-${sequence}`);
+function materialization(sequence: number, inputTokens = 100, outputTokens = 25): SuccessfulMaterialization {
+	const materialized = invocation(`trace-${sequence}`, inputTokens, outputTokens);
 	return {
 		materializationId: `materialization-${sequence}`,
 		ingestionCursor: sequence,
@@ -495,6 +495,105 @@ describe("durable evolution control plane", () => {
 		});
 	});
 
+	it("processes an automatic backlog in threshold-sized cursor ranges", async () => {
+		const materializations = Array.from({ length: 20 }, (_, index) => materialization(index + 1, 49_999, 1));
+		const fixture = await controlPlaneFixture(new RecordingExecutor({ noOp: true }), materializations);
+
+		const first = await fixture.controlPlane.createJob({ scope, trigger: "automatic" });
+		expect(first).toMatchObject({
+			status: "created",
+			job: { evidenceRange: { afterCursor: 0, throughCursor: 8 } },
+		});
+		if (first.status !== "created") throw new Error("Expected the first automatic evolution job");
+		const firstSnapshot = await fixture.persistence.get(first.job.inputSnapshot);
+		if (!("evidenceSources" in firstSnapshot)) throw new Error("Expected the first automatic input snapshot");
+		expect(firstSnapshot).toMatchObject({
+			ingestionHighWaterCursor: 8,
+			tokenMeasurement: { totalTokens: AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD },
+		});
+		expect(firstSnapshot.evidenceSources.map((source) => source.ingestionCursor)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+		await fixture.controlPlane.runJob(first.job.jobId);
+
+		fixture.clock.advance(AUTOMATIC_EVOLUTION_COOLDOWN_MS);
+		const second = await fixture.controlPlane.createJob({ scope, trigger: "automatic" });
+		expect(second).toMatchObject({
+			status: "created",
+			job: { evidenceRange: { afterCursor: 8, throughCursor: 16 } },
+		});
+		if (second.status !== "created") throw new Error("Expected the second automatic evolution job");
+		const secondSnapshot = await fixture.persistence.get(second.job.inputSnapshot);
+		if (!("evidenceSources" in secondSnapshot)) throw new Error("Expected the second automatic input snapshot");
+		expect(secondSnapshot).toMatchObject({
+			ingestionHighWaterCursor: 16,
+			tokenMeasurement: { totalTokens: AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD },
+		});
+		expect(secondSnapshot.evidenceSources.map((source) => source.ingestionCursor)).toEqual([
+			9, 10, 11, 12, 13, 14, 15, 16,
+		]);
+		await fixture.controlPlane.runJob(second.job.jobId);
+
+		fixture.clock.advance(AUTOMATIC_EVOLUTION_COOLDOWN_MS);
+		await expect(fixture.controlPlane.createJob({ scope, trigger: "automatic" })).resolves.toEqual({
+			status: "not-created",
+			reason: "insufficient-tokens",
+		});
+		expect(await fixture.persistence.load(scope)).toMatchObject({ sequence: 16 });
+
+		materializations.push(...Array.from({ length: 4 }, (_, index) => materialization(index + 21, 49_999, 1)));
+		const third = await fixture.controlPlane.createJob({ scope, trigger: "automatic" });
+		expect(third).toMatchObject({
+			status: "created",
+			job: { evidenceRange: { afterCursor: 16, throughCursor: 24 } },
+		});
+		if (third.status !== "created") throw new Error("Expected the third automatic evolution job");
+		const thirdSnapshot = await fixture.persistence.get(third.job.inputSnapshot);
+		if (!("evidenceSources" in thirdSnapshot)) throw new Error("Expected the third automatic input snapshot");
+		expect(thirdSnapshot).toMatchObject({
+			ingestionHighWaterCursor: 24,
+			tokenMeasurement: { totalTokens: AUTOMATIC_EVOLUTION_TOKEN_THRESHOLD },
+		});
+		expect(thirdSnapshot.evidenceSources.map((source) => source.ingestionCursor)).toEqual([
+			17, 18, 19, 20, 21, 22, 23, 24,
+		]);
+		await fixture.controlPlane.runJob(third.job.jobId);
+		expect(await fixture.persistence.load(scope)).toMatchObject({ sequence: 24 });
+	});
+
+	it("does not cross the automatic token cap at an invocation boundary", async () => {
+		const materializations = [
+			materialization(1, 129_999, 1),
+			materialization(2, 129_999, 1),
+			materialization(3, 129_999, 1),
+			materialization(4, 99_999, 1),
+		];
+		const fixture = await controlPlaneFixture(new RecordingExecutor(), materializations);
+
+		const created = await fixture.controlPlane.createJob({ scope, trigger: "automatic" });
+
+		expect(created).toMatchObject({
+			status: "created",
+			job: { evidenceRange: { afterCursor: 0, throughCursor: 3 } },
+		});
+		if (created.status !== "created") throw new Error("Expected an automatic evolution job");
+		expect(await fixture.persistence.get(created.job.inputSnapshot)).toMatchObject({
+			ingestionHighWaterCursor: 3,
+			tokenMeasurement: { totalTokens: 390_000 },
+		});
+	});
+
+	it("keeps manual evolution snapshots uncapped", async () => {
+		const materializations = Array.from({ length: 20 }, (_, index) => materialization(index + 1, 49_999, 1));
+		const fixture = await controlPlaneFixture(new RecordingExecutor(), materializations);
+
+		const created = await createManualJob(fixture);
+
+		expect(created.evidenceRange).toEqual({ afterCursor: 0, throughCursor: 20 });
+		expect(await fixture.persistence.get(created.inputSnapshot)).toMatchObject({
+			ingestionHighWaterCursor: 20,
+			tokenMeasurement: { totalTokens: 1_000_000 },
+		});
+	});
+
 	it("freezes skill metadata and full content as immutable referenced artifacts", async () => {
 		const content = "---\nname: review\ndescription: Review changes\n---\n\nReview carefully.";
 		const skill: EvolutionSkillSnapshotSource = {
@@ -650,7 +749,7 @@ describe("durable evolution control plane", () => {
 });
 
 describe("checkpointed evolution pipeline", () => {
-	it("executes isolated stages through writing and activation", async () => {
+	it("activates memory changes while a sibling skill expansion fails", async () => {
 		const artifactProducer: EvolutionArtifactProducer = {
 			name: "fixture-stage",
 			version: "1.0.0",
@@ -891,7 +990,6 @@ describe("checkpointed evolution pipeline", () => {
 						taskLineageIds: [],
 						skillability: {
 							classification: "verification-routine" as const,
-							rationale: "The lesson describes a reusable verification routine.",
 						},
 						trigger: {
 							description: "A focused repository change requires verification.",
@@ -919,7 +1017,6 @@ describe("checkpointed evolution pipeline", () => {
 						memoryRelationship: {
 							classification: "complements" as const,
 							memoryProposalIds: ["proposal-1"],
-							rationale: "Memory keeps the constraint while the skill preserves the procedure.",
 						},
 						capsuleSize: {
 							serialization: "canonical-json-utf8-v1" as const,
@@ -930,11 +1027,81 @@ describe("checkpointed evolution pipeline", () => {
 						},
 					};
 					const candidate: SkillCandidate = {
-						metadata: metadata("skill-candidate-1", ["lesson-1", "proposal-1"], candidateContent),
+						metadata: metadata(
+							"skill-candidate-1",
+							["outline-set-1", "outline-1", "lesson-1", "proposal-1"],
+							candidateContent,
+						),
 						...candidateContent,
 					};
+					const failedOutline = {
+						outlineId: "outline-2",
+						outlineKey: "failed-verification",
+						sourceLessonIds: candidate.sourceLessonIds,
+						operation: candidate.operation,
+						proposedName: "failed-verification",
+						existingSkillIds: candidate.existingSkillIds,
+						skillability: candidate.skillability,
+						memoryRelationship: candidate.memoryRelationship,
+					};
+					const outlineSetContent = {
+						artifactKind: "skill-candidate-outline-set" as const,
+						outlineSetId: "outline-set-1",
+						sourceEvolutionJobId: input.jobId,
+						discoveryIdempotencyKey: input.idempotencyKey,
+						inputSnapshotId: input.input.metadata.artifactId,
+						inputSnapshotContentDigest: input.input.metadata.contentDigest,
+						workspace: candidate.workspace,
+						outlines: [
+							{
+								outlineId: "outline-1",
+								outlineKey: "focused-verification",
+								sourceLessonIds: candidate.sourceLessonIds,
+								operation: candidate.operation,
+								proposedName: candidate.proposedName,
+								existingSkillIds: candidate.existingSkillIds,
+								skillability: candidate.skillability,
+								memoryRelationship: candidate.memoryRelationship,
+							},
+							failedOutline,
+						],
+					};
 					return {
+						status: "completed-with-some-failures",
+						outlineSet: {
+							metadata: metadata("outline-set-1", ["lesson-1", "proposal-1"], outlineSetContent),
+							...outlineSetContent,
+						},
 						candidates: [candidate],
+						failedExpansions: [
+							{
+								status: "failed",
+								outlineId: failedOutline.outlineId,
+								outlineKey: failedOutline.outlineKey,
+								diagnostic: {
+									reasonCode: "procedure-draft-invalid",
+									message: "Skill candidate expansion failed after two independent model executions.",
+									attempts: [
+										{
+											attempt: 1,
+											modelRounds: 1,
+											reasonCode: "procedure-draft-invalid",
+											message: "The procedure draft did not satisfy the required contract.",
+											inspectedReferences: { evidenceIds: [], skillIds: [] },
+											invalidFieldPaths: ["steps"],
+										},
+										{
+											attempt: 2,
+											modelRounds: 1,
+											reasonCode: "procedure-draft-invalid",
+											message: "The procedure draft did not satisfy the required contract.",
+											inspectedReferences: { evidenceIds: [], skillIds: [] },
+											invalidFieldPaths: ["completionCondition"],
+										},
+									],
+								},
+							},
+						],
 						deferredFindings: [],
 						proceduralInformationLossFindings: [],
 					};
@@ -1005,14 +1172,23 @@ describe("checkpointed evolution pipeline", () => {
 		const skillCheckpoint = completed.checkpoints.find((checkpoint) => checkpoint.stage === "skill-curating");
 		expect(skillCheckpoint).toMatchObject({
 			state: {
+				skillCurationStatus: "completed-with-some-failures",
+				outlineSetId: "outline-set-1",
+				outlineIds: ["outline-1", "outline-2"],
 				candidateIds: ["skill-candidate-1"],
+				failedCandidateOutlineIds: ["outline-2"],
 				deferredFindingIds: [],
 				proceduralInformationLossFindingIds: [],
 				selectedMemoryProposalIds: ["proposal-1"],
 			},
 		});
 		if (skillCheckpoint === undefined) throw new Error("Expected a skill curation checkpoint");
+		expect(skillCheckpoint.outputArtifacts).toHaveLength(2);
 		expect(await fixture.persistence.get(skillCheckpoint.outputArtifacts[0]!)).toMatchObject({
+			artifactKind: "skill-candidate-outline-set",
+			outlineSetId: "outline-set-1",
+		});
+		expect(await fixture.persistence.get(skillCheckpoint.outputArtifacts[1]!)).toMatchObject({
 			artifactKind: "skill-candidate",
 			candidateId: "skill-candidate-1",
 			operation: "CREATE",
@@ -1072,7 +1248,7 @@ describe("automatic evolution policy", () => {
 		});
 	});
 
-	it("requires a strict token threshold and at least three invocations", () => {
+	it("requires the token threshold and at least three invocations", () => {
 		expect(
 			evaluateAutomaticEvolutionEligibility({
 				invocationCount: 3,
@@ -1080,7 +1256,7 @@ describe("automatic evolution policy", () => {
 				now: "2026-08-19T12:00:00.000Z",
 				previousAutomaticTerminalAt: null,
 			}),
-		).toEqual({ eligible: false, reason: "insufficient-tokens" });
+		).toEqual({ eligible: true });
 		expect(
 			evaluateAutomaticEvolutionEligibility({
 				invocationCount: 2,

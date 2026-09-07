@@ -36,11 +36,14 @@ import type {
 	ScoredProposal,
 	SkillBehaviorEvaluationOutcome,
 	SkillCandidate,
+	SkillCandidateExpansionFailed,
 	SkillCandidateGroup,
 	SkillCandidateGroupCapsule,
+	SkillCandidateOutlineSet,
 	SkillCandidatePriorityScore,
 	SkillCandidateRegistryEvent,
 	SkillCandidateRegistrySnapshot,
+	SkillCurationStatus,
 	SkillDraft,
 	SkillDraftValidationReport,
 	SkillEvaluationCase,
@@ -71,6 +74,7 @@ export type EvolutionArtifact =
 	| ReflectionNode
 	| ScoredProposal
 	| SkillCandidate
+	| SkillCandidateOutlineSet
 	| SkillCandidateGroupCapsule
 	| SkillCandidatePriorityScore
 	| SkillDraft
@@ -141,6 +145,7 @@ export interface SkillCuratorModelRequest {
 	readonly outputSchema: JsonObject;
 	readonly tools: readonly EvolutionModelTool[];
 	readonly validateOutput?: (output: JsonObject) => void;
+	readonly onModelRound?: () => void;
 	readonly signal?: AbortSignal;
 }
 
@@ -274,7 +279,10 @@ export interface SkillCuratorInput {
 }
 
 export interface SkillCurationResult {
+	readonly status: SkillCurationStatus;
+	readonly outlineSet: SkillCandidateOutlineSet;
 	readonly candidates: readonly SkillCandidate[];
+	readonly failedExpansions: readonly SkillCandidateExpansionFailed[];
 	readonly deferredFindings: readonly DeferredSkillCandidateFinding[];
 	readonly proceduralInformationLossFindings: readonly ProceduralInformationLossFinding[];
 }

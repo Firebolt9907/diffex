@@ -1098,6 +1098,7 @@ describe("coding-agent evolution runtime", () => {
 			async waitUntilBackgroundAllowed() {},
 		});
 		const model = harness.getModel();
+		let modelRounds = 0;
 
 		await expect(
 			executor.execute({
@@ -1117,6 +1118,13 @@ describe("coding-agent evolution runtime", () => {
 					properties: { complete: { enum: [true] } },
 				},
 				tools: [],
+				...(stage === "skill-curator"
+					? {
+							onModelRound() {
+								modelRounds += 1;
+							},
+						}
+					: {}),
 			}),
 		).rejects.toMatchObject({
 			name: "EvolutionExecutionError",
@@ -1124,6 +1132,7 @@ describe("coding-agent evolution runtime", () => {
 			retryable: false,
 			diagnostics: { lastCorrection: expect.any(String) },
 		});
+		expect(modelRounds).toBe(stage === "skill-curator" ? 10 : 0);
 	});
 
 	it("isolates transcripts between node executor invocations", async () => {
@@ -1479,46 +1488,41 @@ describe("coding-agent evolution runtime", () => {
 			}),
 			fauxAssistantMessage(
 				fauxToolCall("submit_evolution_response", {
-					decisions: [
+					outlines: [
 						{
-							decisionKey: "focused-verification",
+							outlineKey: "focused-verification",
 							lessonRefs: ["L1"],
+							operation: "CREATE",
+							proposedName: "focused-verification",
 							existingSkillRefs: [],
-							skillability: {
-								classification: "verification-routine",
-								rationale: "The evidence describes a repeatable verification procedure.",
-							},
-							memoryRelationship: {
-								classification: "independent",
-								memoryProposalRefs: [],
-								rationale: "The procedure is on-demand rather than always-on guidance.",
-							},
-							disposition: "candidate",
-							candidate: {
-								operation: "CREATE",
-								proposedName: "focused-verification",
-								triggerDescription: "A repository change requires focused verification.",
-								positiveTriggers: ["A focused source change is ready for verification."],
-								negativeTriggers: ["No repository files changed."],
-								preconditions: ["A focused verification command exists."],
-								procedureSteps: [{ action: "Run the focused verification command.", condition: null }],
-								requiredTools: ["shell"],
-								environment: ["Repository checkout"],
-								failureHandling: [
-									{
-										signal: "The focused verification command fails.",
-										mitigation: "Inspect the first actionable diagnostic.",
-										recovery: "Correct the issue and rerun focused verification.",
-									},
-								],
-								applicabilityBoundaries: ["Repositories with a focused verification command."],
-								verificationChecks: ["The focused verification command exits successfully."],
-								completionCondition: "Focused verification passes without suppressed failures.",
-							},
-							deferredReason: null,
+							skillability: { classification: "verification-routine" },
+							memoryRelationship: { classification: "independent", memoryProposalRefs: [] },
 						},
 					],
-					proceduralInformationLosses: [],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				fauxToolCall("submit_evolution_response", {
+					trigger: {
+						description: "A repository change requires focused verification.",
+						positiveExamples: ["A focused source change is ready for verification."],
+						negativeExamples: ["No repository files changed."],
+					},
+					steps: [{ action: "Run the focused verification command.", condition: null }],
+					requiredTools: ["shell"],
+					environment: ["Repository checkout"],
+					failureHandling: [
+						{
+							signal: "The focused verification command fails.",
+							mitigation: "Inspect the first actionable diagnostic.",
+							recovery: "Correct the issue and rerun focused verification.",
+						},
+					],
+					additionalPreconditions: ["A focused verification command exists."],
+					additionalApplicabilityBoundaries: ["Repositories with a focused verification command."],
+					verificationChecks: ["The focused verification command exits successfully."],
+					completionCondition: "Focused verification passes without suppressed failures.",
 				}),
 				{ stopReason: "toolUse" },
 			),
@@ -1567,19 +1571,23 @@ describe("coding-agent evolution runtime", () => {
 				},
 				{ timeout: 8_000, interval: 20 },
 			);
+			await vi.waitFor(
+				async () => expect((await store.loadCurrent()).manifest.version).not.toBe(root.manifest.version),
+				{ timeout: 8_000, interval: 20 },
+			);
+			const activatedHarnessVersion = (await store.loadCurrent()).manifest.version;
 			const candidate = await runtime.control.getSkillCandidate(started.job.jobId, candidateId);
 			expect(candidate).toMatchObject({
 				summary: { state: "accepted" },
 				validation: { disposition: "accepted", validatedHarnessVersion: root.manifest.version },
 				evaluation: null,
-				activationAvailable: true,
+				targetHarnessVersion: activatedHarnessVersion,
+				activationAvailable: false,
 			});
 
-			const activation = await runtime.control.activateSkillCandidate(started.job.jobId, candidateId);
-			expect((await store.loadCurrent()).manifest.version).toBe(activation.targetHarnessVersion);
 			expect(harness.session.activeHarnessVersion).toBe(root.manifest.version);
 			expect(await peerRuntime.control.overview()).toMatchObject({
-				currentHarnessVersion: activation.targetHarnessVersion,
+				currentHarnessVersion: activatedHarnessVersion,
 				observedHarnessVersion: root.manifest.version,
 				nextPromptWillRefresh: true,
 			});
@@ -1593,7 +1601,7 @@ describe("coding-agent evolution runtime", () => {
 			]);
 			await harness.session.prompt("Use focused verification for this change.");
 
-			expect(harness.session.activeHarnessVersion).toBe(activation.targetHarnessVersion);
+			expect(harness.session.activeHarnessVersion).toBe(activatedHarnessVersion);
 			expect(exposedPrompt).toContain("<name>focused-verification</name>");
 			expect(exposedPrompt).toContain(
 				"A repository change requires focused verification. Use when a focused source change is ready for verification.",
@@ -1602,18 +1610,18 @@ describe("coding-agent evolution runtime", () => {
 				expect.objectContaining({
 					name: "focused-verification",
 					sourceKind: "evolved",
-					harnessRevision: activation.targetHarnessVersion,
+					harnessRevision: activatedHarnessVersion,
 				}),
 			]);
 
 			await expect(runtime.control.getSkillCandidate(started.job.jobId, candidateId)).resolves.toMatchObject({
-				targetHarnessVersion: activation.targetHarnessVersion,
+				targetHarnessVersion: activatedHarnessVersion,
 				rollbackTargetHarnessVersion: root.manifest.version,
 				rollbackAvailable: true,
 				activationAvailable: false,
 			});
 			await expect(runtime.control.rollbackSkillCandidate(started.job.jobId, candidateId)).resolves.toMatchObject({
-				fromHarnessVersion: activation.targetHarnessVersion,
+				fromHarnessVersion: activatedHarnessVersion,
 				toHarnessVersion: root.manifest.version,
 			});
 			expect((await store.loadCurrent()).manifest.version).toBe(root.manifest.version);
@@ -1728,13 +1736,12 @@ describe("coding-agent evolution runtime", () => {
 				const prompt = String(context.messages[0]?.content ?? "");
 				prompts.push(prompt);
 				expect(prompt).toContain(
-					'"objective":"classify-operational-patterns-and-produce-non-executable-skill-candidates"',
+					'"objective":"classify-operational-patterns-and-return-only-compact-skill-candidate-outlines"',
 				);
 				expect(prompt).not.toContain(traceId);
-				return fauxAssistantMessage(
-					fauxToolCall("submit_evolution_response", { decisions: [], proceduralInformationLosses: [] }),
-					{ stopReason: "toolUse" },
-				);
+				return fauxAssistantMessage(fauxToolCall("submit_evolution_response", { outlines: [] }), {
+					stopReason: "toolUse",
+				});
 			},
 		]);
 		const runtime = await createCodingAgentEvolutionRuntime({

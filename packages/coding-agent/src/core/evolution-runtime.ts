@@ -260,6 +260,7 @@ export class CodingAgentEvolutionModelExecutor implements EvolutionModelExecutor
 		let lastCorrection: string | null = null;
 		for (let round = 0; round < MAX_MODEL_ROUNDS; round += 1) {
 			request.signal?.throwIfAborted();
+			if (request.stage === "skill-curator") request.onModelRound?.();
 			const waitStartedAt = performance.now();
 			if (request.stage === "reflector") request.onForegroundWaitStart?.();
 			try {
@@ -874,8 +875,8 @@ class CodingAgentSnapshotSource implements EvolutionSnapshotSource {
 			pipelineVersion: VERSION,
 			promptVersions: {
 				reflector: "reflector-v2",
-				curator: "curator-v1",
-				skillCurator: "skill-curator-v2",
+				curator: "curator-v2",
+				skillCurator: "skill-curator-v4",
 				skillSynthesizer: "skill-synthesizer-v2",
 				validator: "validator-v1",
 				writer: "writer-v1",
@@ -936,7 +937,17 @@ export async function createCodingAgentEvolutionRuntime(
 	const model = new CodingAgentEvolutionModelExecutor(options.session, options.modelRuntime, priority);
 	const reflector = new RecursiveReflector({ version: VERSION, artifacts: persistence, ledger: persistence });
 	const curator = new StructuredDeltaCurator({ version: VERSION, ledger: persistence });
-	const skillCurator = new StructuredSkillCurator({ version: VERSION, artifacts: persistence, ledger: persistence });
+	const candidateRegistry = new PersistentSkillCandidateRegistry({
+		version: VERSION,
+		artifacts: persistence,
+		store: persistence,
+	});
+	const skillCurator = new StructuredSkillCurator({
+		version: VERSION,
+		artifacts: persistence,
+		ledger: persistence,
+		registry: candidateRegistry,
+	});
 	const ranker = new DeterministicProposalRanker({ version: VERSION });
 	const pipeline = new EvolutionPipeline({
 		version: VERSION,
@@ -987,11 +998,6 @@ export async function createCodingAgentEvolutionRuntime(
 		runner,
 		priority,
 	});
-	const candidateRegistry = new PersistentSkillCandidateRegistry({
-		version: VERSION,
-		artifacts: persistence,
-		store: persistence,
-	});
 	const skillSynthesizer = new StructuredSkillSynthesizer({
 		version: VERSION,
 		artifacts: persistence,
@@ -1007,6 +1013,43 @@ export async function createCodingAgentEvolutionRuntime(
 		clock,
 		statePath: join(storageRoot, "skill-writer"),
 	});
+	const activateAcceptedSkillGroups = async (
+		activationScope: EvolutionScope,
+		sourceEvolutionJobId: string,
+		groupIds: readonly string[],
+		signal?: AbortSignal,
+	): Promise<void> => {
+		const sourceJob = await persistence.load(sourceEvolutionJobId);
+		if (sourceJob === null) throw new Error(`Unknown evolution job "${sourceEvolutionJobId}"`);
+		for (const groupId of groupIds) {
+			signal?.throwIfAborted();
+			const lease = await persistence.acquire(
+				"writer",
+				"global",
+				`skill-auto-activation-${randomUUID()}`,
+				clock.now(),
+				SKILL_ACTIVATION_LEASE_TTL_MS,
+			);
+			if (lease === null) throw new Error("Another harness writer is active");
+			try {
+				await skillWriter.activateAcceptedGroup(
+					{
+						scope: activationScope,
+						groupId,
+						createdAt: sourceJob.terminalAt ?? sourceJob.updatedAt,
+						signal,
+					},
+					{
+						idempotencyKey: `skill-auto-activate-${sourceEvolutionJobId}-${groupId}`,
+						lease,
+						signal,
+					},
+				);
+			} finally {
+				await persistence.release(lease);
+			}
+		}
+	};
 	const skillValidator = new DeterministicSkillDraftValidator({
 		version: VERSION,
 		artifacts: persistence,
@@ -1039,6 +1082,7 @@ export async function createCodingAgentEvolutionRuntime(
 			validator: skillValidator,
 			evaluator: options.skillEvaluator,
 			model,
+			activateAcceptedGroups: activateAcceptedSkillGroups,
 		}),
 		priority,
 	});

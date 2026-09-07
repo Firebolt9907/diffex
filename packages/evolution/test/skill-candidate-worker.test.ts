@@ -772,6 +772,79 @@ describe("skill candidate registry worker", () => {
 		]);
 	});
 
+	it("synthesizes and accepts a successful candidate from a partially failed curation", async () => {
+		const data = fixture(true);
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		const checkpoint = data.job.checkpoints[0];
+		if (checkpoint === undefined) throw new Error("Expected a skill curation checkpoint");
+		const partialJob: EvolutionJob = {
+			...data.job,
+			checkpoints: [
+				{
+					...checkpoint,
+					state: {
+						...checkpoint.state,
+						skillCurationStatus: "completed-with-some-failures",
+						failedCandidateOutlineIds: ["outline-failed"],
+					},
+				},
+			],
+		};
+		data.jobs.jobs.splice(0, 1, partialJob);
+		data.registry.groups.push(qualifiedGroup(candidateReference));
+
+		await data.worker.process(partialJob.jobId);
+
+		expect(data.synthesisRequests).toEqual([
+			expect.objectContaining({ group: expect.objectContaining({ groupId: "group-qualified" }) }),
+		]);
+		expect(data.validationRequests).toHaveLength(1);
+		expect(data.evaluationRequests).toHaveLength(1);
+		expect(data.registry.groups[0]?.state).toBe("accepted");
+		expect(
+			data.store.events.some(
+				(event) => event.type === "skill-candidate-work-checkpointed" && event.stage === "completed",
+			),
+		).toBe(true);
+	});
+
+	it("waits for every source evolution job before synthesizing a registered group", async () => {
+		const data = fixture();
+		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];
+		if (candidateReference === undefined) throw new Error("Expected candidate reference");
+		const group = qualifiedGroup(candidateReference);
+		const pendingJob = {
+			...data.job,
+			jobId: "job-pending-source",
+			stage: "skill-curating" as const,
+			outcome: "active" as const,
+		};
+		data.jobs.jobs.push(pendingJob);
+		data.registry.groups.push({
+			...group,
+			proposalRevisions: [
+				...group.proposalRevisions,
+				{
+					...group.proposalRevisions[0]!,
+					revisionId: "proposal-revision-pending",
+					sourceEvolutionJobId: pendingJob.jobId,
+				},
+			],
+		});
+
+		await data.worker.process(data.job.jobId);
+		expect(data.synthesisRequests).toEqual([]);
+
+		data.jobs.jobs.splice(data.jobs.jobs.indexOf(pendingJob), 1, {
+			...pendingJob,
+			stage: "completed",
+			outcome: "completed",
+		});
+		await data.worker.process(pendingJob.jobId);
+		expect(data.synthesisRequests).toHaveLength(1);
+	});
+
 	it("isolates three synthesis inputs while parking an oversized group", async () => {
 		const data = fixture(true);
 		const candidateReference = data.job.checkpoints[0]?.outputArtifacts[0];

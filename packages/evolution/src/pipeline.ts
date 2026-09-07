@@ -701,6 +701,39 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 					"skill candidate ID",
 				);
 				assertUniqueIds(
+					curation.failedExpansions.map((failure) => failure.outlineId),
+					"failed skill candidate outline ID",
+				);
+				const outlineIds = new Set(curation.outlineSet.outlines.map((outline) => outline.outlineId));
+				const successfulOutlineIds = curation.candidates.map((candidate) =>
+					candidate.metadata.sourceIds.filter((sourceId) => outlineIds.has(sourceId)),
+				);
+				const terminalOutlineIds = [
+					...successfulOutlineIds.flat(),
+					...curation.failedExpansions.map((failure) => failure.outlineId),
+				];
+				if (
+					successfulOutlineIds.some((ids) => ids.length !== 1) ||
+					terminalOutlineIds.length !== outlineIds.size ||
+					new Set(terminalOutlineIds).size !== outlineIds.size ||
+					terminalOutlineIds.some((outlineId) => !outlineIds.has(outlineId))
+				) {
+					throw new EvolutionExecutionError("Skill curation did not report exactly one outcome per outline", {
+						reasonCode: "pipeline-invariant",
+						retryable: false,
+					});
+				}
+				const expectedCurationStatus =
+					curation.candidates.length > 0 && curation.failedExpansions.length > 0
+						? "completed-with-some-failures"
+						: "completed";
+				if (curation.status !== expectedCurationStatus) {
+					throw new EvolutionExecutionError("Skill curation reported an inconsistent completion status", {
+						reasonCode: "pipeline-invariant",
+						retryable: false,
+					});
+				}
+				assertUniqueIds(
 					curation.deferredFindings.map((finding) => finding.findingId),
 					"deferred skill finding ID",
 				);
@@ -710,12 +743,17 @@ export class EvolutionPipeline implements EvolutionStageExecutor {
 				);
 				return {
 					artifacts: [
+						curation.outlineSet,
 						...curation.candidates,
 						...curation.deferredFindings,
 						...curation.proceduralInformationLossFindings,
 					],
 					state: {
+						skillCurationStatus: curation.status,
+						outlineSetId: curation.outlineSet.outlineSetId,
+						outlineIds: curation.outlineSet.outlines.map((outline) => outline.outlineId),
 						candidateIds: curation.candidates.map((candidate) => candidate.candidateId),
+						failedCandidateOutlineIds: curation.failedExpansions.map((failure) => failure.outlineId),
 						deferredFindingIds: curation.deferredFindings.map((finding) => finding.findingId),
 						proceduralInformationLossFindingIds: curation.proceduralInformationLossFindings.map(
 							(finding) => finding.findingId,

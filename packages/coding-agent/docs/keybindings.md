@@ -176,11 +176,11 @@ Shift+Tab enters or leaves interactive Plan mode. Thinking level remains selecta
 
 ### Skills Selector
 
-Used inside the multi-select skill picker opened via `/skills`.
+Used inside the skill picker opened via `/skills`.
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.skills.toggle` | `space` | Toggle the current skill without closing the selector |
+| `app.skills.toggle` | `space` | Enable or disable the current skill without closing the selector |
 
 ### Scoped Models Selector
 

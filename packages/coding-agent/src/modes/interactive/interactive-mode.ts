@@ -5167,6 +5167,12 @@ export class InteractiveMode {
 					}
 					this.ui.requestRender();
 				},
+				(reference, enabled) => {
+					if (!this.session.setSkillEnabled(reference.skillId, enabled)) {
+						this.showError(`Skill is no longer available: ${reference.name}`);
+					}
+					this.ui.requestRender();
+				},
 				() => {
 					done();
 					this.ui.requestRender();

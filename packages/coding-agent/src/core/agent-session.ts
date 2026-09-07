@@ -501,6 +501,7 @@ export class AgentSession {
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	private _pendingCurrentPlanRestoration = false;
 	private readonly _skillReferenceSnapshots = new Map<string, SkillReferenceSnapshot>();
+	private readonly _skillEnablementOverrides = new Map<string, boolean>();
 	private _activeSkillTrace: ActiveSkillTrace | undefined;
 
 	// Compaction state
@@ -1405,6 +1406,7 @@ export class AgentSession {
 			this._harnessSwitchInProgress ||
 			this.isStreaming ||
 			this.isRetrying ||
+			this._manualCompactionOperations > 0 ||
 			this.isCompacting ||
 			this.isBashRunning
 		);
@@ -1468,7 +1470,7 @@ export class AgentSession {
 		if (this.isStreaming) {
 			throw new Error("Cannot switch harness versions while a response is streaming.");
 		}
-		if (this.isCompacting) {
+		if (this._manualCompactionOperations > 0 || this.isCompacting) {
 			throw new Error("Cannot switch harness versions while compaction is in progress.");
 		}
 		if (this.isBashRunning) {
@@ -1539,7 +1541,6 @@ export class AgentSession {
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
 		return (
-			this._manualCompactionOperations > 0 ||
 			this._autoCompactionAbortController !== undefined ||
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
@@ -1595,8 +1596,13 @@ export class AgentSession {
 		return `${skillId}\0${version}`;
 	}
 
+	private _isSkillEnabled(skill: Pick<Skill, "disableModelInvocation" | "skillId">): boolean {
+		return this._skillEnablementOverrides.get(skill.skillId) ?? !skill.disableModelInvocation;
+	}
+
 	private _snapshotSkill(skill: Skill): SkillReferenceSnapshot {
 		const snapshot = createSkillReferenceSnapshot(skill);
+		snapshot.enabled = this._isSkillEnabled(skill);
 		this._skillReferenceSnapshots.set(this._skillReferenceKey(snapshot.skillId, snapshot.version), snapshot);
 		return snapshot;
 	}
@@ -1679,6 +1685,18 @@ export class AgentSession {
 		}
 	}
 
+	/** Enable or disable progressive disclosure of a skill for future model prompts. */
+	setSkillEnabled(skillId: string, enabled: boolean): boolean {
+		const skill = this._resourceLoader.getSkills().skills.find((candidate) => candidate.skillId === skillId);
+		if (skill === undefined) return false;
+		this._skillEnablementOverrides.set(skillId, enabled);
+		if (this._activeRunCollaborationMode === "plan") return true;
+		this._installCollaborationModeState(
+			this._deriveCollaborationModeState(this._activeRunCollaborationMode ?? this._collaborationMode),
+		);
+		return true;
+	}
+
 	/** Snapshot every currently available skill for explicit selection. */
 	createSkillReferences(): SkillReference[] {
 		const references: SkillReference[] = [];
@@ -1696,6 +1714,7 @@ export class AgentSession {
 					...(snapshot.harnessRevision === undefined ? {} : { harnessRevision: snapshot.harnessRevision }),
 					reference: snapshot.reference,
 					group: snapshot.group,
+					enabled: snapshot.enabled,
 				});
 			} catch (error) {
 				this._extensionRunner.emitError({
@@ -1755,7 +1774,7 @@ export class AgentSession {
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
-		const loadedSkills = this._resourceLoader.getSkills().skills;
+		const loadedSkills = this._resourceLoader.getSkills().skills.filter((skill) => this._isSkillEnabled(skill));
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		const options: BuildSystemPromptOptions = {

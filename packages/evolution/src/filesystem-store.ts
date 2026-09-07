@@ -20,6 +20,13 @@ import {
 	SKILL_CANDIDATE_REGISTRY_SCHEMA_VERSION,
 	SKILL_LIFECYCLE_OBSERVATION_SCHEMA_VERSION,
 } from "./contracts.ts";
+import {
+	DEFAULT_LESSON_POLICY,
+	LESSON_SCORE_SCHEMA_VERSION,
+	type LessonScoreIdentity,
+	type LessonScoreLedger,
+	type LessonScoreStore,
+} from "./lesson-score-store.ts";
 import type {
 	EvolutionArtifact,
 	EvolutionArtifactStore,
@@ -558,6 +565,92 @@ function parseSkillLifecycleObservation(contents: string, path: string): SkillLi
 	return parsed as unknown as SkillLifecycleObservation;
 }
 
+function isLessonScoreIdentity(value: unknown): value is LessonScoreIdentity {
+	return (
+		isRecord(value) &&
+		typeof value.memoryItemId === "string" &&
+		SAFE_ID_PATTERN.test(value.memoryItemId) &&
+		typeof value.contentDigest === "string" &&
+		DIGEST_PATTERN.test(value.contentDigest) &&
+		typeof value.creationRevision === "string" &&
+		DIGEST_PATTERN.test(value.creationRevision)
+	);
+}
+
+function parseLessonScoreLedger(contents: string, path: string, scope: EvolutionScope): LessonScoreLedger {
+	const parsed = parseJson(contents, path);
+	if (
+		!isRecord(parsed) ||
+		parsed.schemaVersion !== LESSON_SCORE_SCHEMA_VERSION ||
+		!isRecord(parsed.scope) ||
+		typeof parsed.scope.repositoryId !== "string" ||
+		typeof parsed.scope.scopeId !== "string" ||
+		parsed.scope.repositoryId !== scope.repositoryId ||
+		parsed.scope.scopeId !== scope.scopeId ||
+		!Number.isSafeInteger(parsed.revision) ||
+		(parsed.revision as number) < 0 ||
+		!Array.isArray(parsed.catalogs) ||
+		parsed.catalogs.some(
+			(catalog) =>
+				!isRecord(catalog) ||
+				typeof catalog.harnessRevision !== "string" ||
+				!DIGEST_PATTERN.test(catalog.harnessRevision) ||
+				!Array.isArray(catalog.items) ||
+				!catalog.items.every(isLessonScoreIdentity),
+		) ||
+		!isStringArray(parsed.appliedOutputIds) ||
+		parsed.appliedOutputIds.some((id) => id.length === 0) ||
+		new Set(parsed.appliedOutputIds).size !== parsed.appliedOutputIds.length ||
+		!Array.isArray(parsed.rows) ||
+		parsed.rows.some(
+			(row) =>
+				!isRecord(row) ||
+				typeof row.harnessRevision !== "string" ||
+				!DIGEST_PATTERN.test(row.harnessRevision) ||
+				typeof row.points !== "number" ||
+				!Number.isFinite(row.points) ||
+				typeof row.lastAppliedOutputIdempotencyKey !== "string" ||
+				row.lastAppliedOutputIdempotencyKey.length === 0 ||
+				!isLessonScoreIdentity(row),
+		)
+	) {
+		throw new EvolutionStorageCorruptionError(path, "lesson score ledger is invalid or incompatible");
+	}
+	const ledger = parsed as unknown as LessonScoreLedger;
+	const catalogs = new Map(ledger.catalogs.map((catalog) => [catalog.harnessRevision, catalog]));
+	const creations = new Map<string, string>();
+	if (
+		catalogs.size !== ledger.catalogs.length ||
+		ledger.catalogs.some((catalog) => {
+			const ids = new Set<string>();
+			return catalog.items.some((item) => {
+				const creation = creations.get(item.memoryItemId);
+				if (ids.has(item.memoryItemId) || (creation !== undefined && creation !== item.creationRevision)) {
+					return true;
+				}
+				ids.add(item.memoryItemId);
+				creations.set(item.memoryItemId, item.creationRevision);
+				return false;
+			});
+		}) ||
+		new Set(ledger.rows.map((row) => row.memoryItemId)).size !== ledger.rows.length ||
+		ledger.rows.some(
+			(row) =>
+				!catalogs
+					.get(row.harnessRevision)
+					?.items.some(
+						(item) =>
+							item.memoryItemId === row.memoryItemId &&
+							item.contentDigest === row.contentDigest &&
+							item.creationRevision === row.creationRevision,
+					),
+		)
+	) {
+		throw new EvolutionStorageCorruptionError(path, "lesson score ledger has inconsistent identities");
+	}
+	return ledger;
+}
+
 function parseCancellation(contents: string, path: string, expectedJobId: string): EvolutionCancellationRequest {
 	const parsed = parseJson(contents, path);
 	if (
@@ -627,6 +720,7 @@ export class FileEvolutionPersistence
 		EvolutionJobStore,
 		EvolutionLeaseStore,
 		EvolutionLedger,
+		LessonScoreStore,
 		SkillCandidateRegistryStore,
 		SkillLifecycleObservationStore
 {
@@ -637,6 +731,7 @@ export class FileEvolutionPersistence
 	readonly #jobPath: string;
 	readonly #leasePath: string;
 	readonly #ledgerPath: string;
+	readonly #lessonScorePath: string;
 	readonly #skillCandidateRegistryPath: string;
 	readonly #skillLifecycleObservationPath: string;
 	readonly #storeLockPath: string;
@@ -651,6 +746,7 @@ export class FileEvolutionPersistence
 		this.#jobPath = join(this.#rootPath, "jobs");
 		this.#leasePath = join(this.#rootPath, "leases");
 		this.#ledgerPath = join(this.#rootPath, "ledger");
+		this.#lessonScorePath = join(this.#rootPath, "lesson-scores");
 		this.#skillCandidateRegistryPath = join(this.#rootPath, "skill-candidates");
 		this.#skillLifecycleObservationPath = join(this.#rootPath, "skill-observations");
 		this.#storeLockPath = join(this.#rootPath, ".store");
@@ -671,6 +767,7 @@ export class FileEvolutionPersistence
 			this.#jobPath,
 			this.#leasePath,
 			this.#ledgerPath,
+			this.#lessonScorePath,
 			this.#skillCandidateRegistryPath,
 			this.#skillLifecycleObservationPath,
 		]) {
@@ -1124,6 +1221,162 @@ export class FileEvolutionPersistence
 				expiresAt: new Date(0).toISOString(),
 				releasedAt: new Date().toISOString(),
 			} satisfies StoredLease);
+		});
+	}
+
+	async #loadLessonScoreLedger(scope: EvolutionScope): Promise<LessonScoreLedger> {
+		await this.#ensureDirectories();
+		const path = join(this.#lessonScorePath, `${this.#scopeFileName(scope)}.json`);
+		const contents = await this.#readOptional(path);
+		return contents === null
+			? {
+					schemaVersion: LESSON_SCORE_SCHEMA_VERSION,
+					scope,
+					revision: 0,
+					catalogs: [],
+					rows: [],
+					appliedOutputIds: [],
+				}
+			: parseLessonScoreLedger(contents, path, scope);
+	}
+
+	async #saveLessonScoreLedger(ledger: LessonScoreLedger): Promise<void> {
+		const path = join(this.#lessonScorePath, `${this.#scopeFileName(ledger.scope)}.json`);
+		parseLessonScoreLedger(serializeEvolutionValue(ledger), path, ledger.scope);
+		await this.#atomicReplace(path, ledger);
+	}
+
+	async registerLessonScoreRevision(
+		...args: Parameters<LessonScoreStore["registerLessonScoreRevision"]>
+	): Promise<void> {
+		const [scope, snapshot] = args;
+		const catalog = {
+			harnessRevision: snapshot.harnessVersion,
+			items: snapshot.activeMemoryItems.map((item) => {
+				if (item.supersessionRevision !== null) throw new Error("Cannot score superseded memory items");
+				return {
+					memoryItemId: item.memoryItemId,
+					contentDigest: item.contentDigest,
+					creationRevision: item.creationRevision,
+				};
+			}),
+		};
+		await this.#withStoreLock(async () => {
+			const ledger = await this.#loadLessonScoreLedger(scope);
+			const prior = ledger.catalogs.find((item) => item.harnessRevision === catalog.harnessRevision);
+			if (prior !== undefined) {
+				if (serializeEvolutionValue(prior) !== serializeEvolutionValue(catalog)) {
+					throw new Error("Lesson score revision was registered with different active memory items");
+				}
+				return;
+			}
+			await this.#saveLessonScoreLedger({
+				...ledger,
+				revision: ledger.revision + 1,
+				catalogs: [...ledger.catalogs, catalog],
+			});
+		});
+	}
+
+	async loadLessonScores(
+		...args: Parameters<LessonScoreStore["loadLessonScores"]>
+	): ReturnType<LessonScoreStore["loadLessonScores"]> {
+		const [scope, harnessRevision] = args;
+		const ledger = await this.#loadLessonScoreLedger(scope);
+		const catalog = ledger.catalogs.find((item) => item.harnessRevision === harnessRevision);
+		if (catalog === undefined) throw new Error(`Unregistered lesson score revision "${harnessRevision}"`);
+		const rows = new Map(ledger.rows.map((row) => [row.memoryItemId, row]));
+		return {
+			revision: ledger.revision,
+			scope,
+			harnessRevision,
+			scores: catalog.items.map((item) => {
+				const row = rows.get(item.memoryItemId);
+				return {
+					...item,
+					points: row?.points ?? DEFAULT_LESSON_POLICY.initialPoints,
+					lastAppliedOutputIdempotencyKey: row?.lastAppliedOutputIdempotencyKey ?? null,
+				};
+			}),
+		};
+	}
+
+	async applyLessonScoreReport(
+		...args: Parameters<LessonScoreStore["applyLessonScoreReport"]>
+	): ReturnType<LessonScoreStore["applyLessonScoreReport"]> {
+		const [scope, report, currentHarnessRevision] = args;
+		return this.#withStoreLock(async () => {
+			const ledger = await this.#loadLessonScoreLedger(scope);
+			const bound = ledger.catalogs.find((catalog) => catalog.harnessRevision === report.harnessRevision);
+			const current = ledger.catalogs.find((catalog) => catalog.harnessRevision === currentHarnessRevision);
+			if (!bound || !current) throw new Error("Unregistered lesson score revision");
+			if (typeof report.outputId !== "string" || report.outputId.length === 0 || !Array.isArray(report.judgments)) {
+				throw new Error("Invalid lesson score report");
+			}
+			const judgments = new Map<string, "helpful" | "harmful">();
+			for (const judgment of report.judgments) {
+				if (!isRecord(judgment)) throw new Error("Invalid lesson score judgment");
+				const { item: reference, signal } = judgment;
+				if (
+					!isLessonScoreIdentity(reference) ||
+					(signal !== "helpful" && signal !== "harmful") ||
+					judgments.has(reference.memoryItemId) ||
+					!bound.items.some(
+						(item) =>
+							item.memoryItemId === reference.memoryItemId &&
+							item.contentDigest === reference.contentDigest &&
+							item.creationRevision === reference.creationRevision,
+					)
+				) {
+					throw new Error("Invalid lesson score judgment");
+				}
+				judgments.set(reference.memoryItemId, signal);
+			}
+			if (ledger.appliedOutputIds.includes(report.outputId)) return "already-applied";
+			const rows = new Map(ledger.rows.map((row) => [row.memoryItemId, row]));
+			const survivors = new Map(current.items.map((item) => [item.memoryItemId, item]));
+			for (const boundItem of bound.items) {
+				const item = survivors.get(boundItem.memoryItemId);
+				if (!item || item.creationRevision !== boundItem.creationRevision) continue;
+				// Renumbering changes the digest, not identity. REPLACE always mints a new identity.
+				const signal = judgments.get(item.memoryItemId);
+				rows.set(item.memoryItemId, {
+					...item,
+					harnessRevision: currentHarnessRevision,
+					points:
+						(rows.get(item.memoryItemId)?.points ?? DEFAULT_LESSON_POLICY.initialPoints) +
+						DEFAULT_LESSON_POLICY.weights[signal ?? "neutral"],
+					lastAppliedOutputIdempotencyKey: report.outputId,
+				});
+			}
+			await this.#saveLessonScoreLedger({
+				...ledger,
+				revision: ledger.revision + 1,
+				rows: [...rows.values()],
+				appliedOutputIds: [...ledger.appliedOutputIds, report.outputId],
+			});
+			return "committed";
+		});
+	}
+
+	async saveLessonScores(
+		...args: Parameters<LessonScoreStore["saveLessonScores"]>
+	): ReturnType<LessonScoreStore["saveLessonScores"]> {
+		const [scope, expectedRevision, rows] = args;
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+			throw new Error("Invalid lesson score ledger revision");
+		}
+		if (new Set(rows.map((row) => row.memoryItemId)).size !== rows.length) {
+			throw new Error("Duplicate lesson score rows");
+		}
+		return this.#withStoreLock(async () => {
+			const ledger = await this.#loadLessonScoreLedger(scope);
+			if (ledger.revision !== expectedRevision) return "conflict";
+			if (rows.length === 0) return "committed";
+			const updated = new Map(ledger.rows.map((row) => [row.memoryItemId, row]));
+			for (const row of rows) updated.set(row.memoryItemId, row);
+			await this.#saveLessonScoreLedger({ ...ledger, revision: ledger.revision + 1, rows: [...updated.values()] });
+			return "committed";
 		});
 	}
 

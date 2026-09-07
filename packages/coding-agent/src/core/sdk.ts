@@ -9,14 +9,20 @@ import {
 } from "@earendil-works/diffex-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/diffex-ai/compat";
 import type { HarnessStateStore, HarnessVersionBundle } from "@earendil-works/diffex-harness-state";
-import { getAgentDir } from "../config.ts";
+import { EvolutionMemoryWriter, FileEvolutionPersistence } from "#evolution";
+import { getAgentDir, VERSION } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import type { AgentSessionLifecycleObserver } from "./agent-session-lifecycle.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
-import { loadWorkspaceHarnessState, resolveHarnessWorkspace } from "./harness-state-runtime.ts";
+import {
+	loadWorkspaceHarnessState,
+	resolveEvolutionWorkspaceStateDirectory,
+	resolveHarnessWorkspace,
+} from "./harness-state-runtime.ts";
+import { createLessonReportContinuation } from "./lesson-reports.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
@@ -661,6 +667,42 @@ export async function createInternalAgentSession(
 		pinHarnessVersion: options.pinHarnessVersion,
 		telemetryContext,
 		lifecycleObserver: options.lifecycleObserver,
+	});
+	const evolutionPath = join(resolveEvolutionWorkspaceStateDirectory(agentDir, workspace.workspace), "evolution");
+	const lessonScores = new FileEvolutionPersistence(evolutionPath);
+	const memoryWriter = new EvolutionMemoryWriter({
+		version: VERSION,
+		harnessState: loadedHarnessState.store,
+		statePath: join(evolutionPath, "writer"),
+	});
+	agent.preparePrivateContinuation = createLessonReportContinuation({
+		getBundle: () => session.harnessVersionBundle,
+		getOutputId: () =>
+			JSON.stringify([
+				sessionManager.getSessionId(),
+				sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length + 1,
+			]),
+		writer: memoryWriter,
+		stream: (model, context, requestOptions) => modelRuntime.streamSimple(model, context, requestOptions),
+		consume: async (report) => {
+			const scopeId = workspace.workspace.directoryId;
+			if (scopeId === undefined) throw new Error("Resolved workspace is missing its directory identity");
+			const scope = { repositoryId: workspace.workspace.repositoryId, scopeId };
+			// Lock order: harness selection, then score store. No provider calls run under either lock.
+			await loadedHarnessState.store.withCurrentVersion(async (current) => {
+				await lessonScores.registerLessonScoreRevision(scope, {
+					harnessVersion: report.harnessRevision,
+					activeMemoryItems: report.activeMemoryItems,
+				});
+				await lessonScores.registerLessonScoreRevision(scope, {
+					harnessVersion: current.manifest.version,
+					activeMemoryItems: await memoryWriter.loadActiveMemoryItems(current),
+				});
+				await lessonScores.applyLessonScoreReport(scope, report, current.manifest.version);
+			});
+		},
 	});
 	if (session.activeHarnessVersion) {
 		try {

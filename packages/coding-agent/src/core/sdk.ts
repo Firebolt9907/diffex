@@ -3,6 +3,7 @@ import {
 	Agent,
 	type AgentMessage,
 	NOOP_TELEMETRY_CONTEXT,
+	type PrivateContinuation,
 	setDefaultStreamFn,
 	type TelemetryContext,
 	type ThinkingLevel,
@@ -31,6 +32,7 @@ import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, persistSessionState, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import { createSkillReportContinuation } from "./skill-reports.ts";
 import { type PreparedSubagentWake, SubagentController } from "./subagents/controller.ts";
 import {
 	type ChildSnapshotV1,
@@ -669,21 +671,21 @@ export async function createInternalAgentSession(
 		lifecycleObserver: options.lifecycleObserver,
 	});
 	const evolutionPath = join(resolveEvolutionWorkspaceStateDirectory(agentDir, workspace.workspace), "evolution");
-	const lessonScores = new FileEvolutionPersistence(evolutionPath);
+	const scores = new FileEvolutionPersistence(evolutionPath);
 	const memoryWriter = new EvolutionMemoryWriter({
 		version: VERSION,
 		harnessState: loadedHarnessState.store,
 		statePath: join(evolutionPath, "writer"),
 	});
-	agent.preparePrivateContinuation = createLessonReportContinuation({
+	const getOutputId = () =>
+		JSON.stringify([
+			sessionManager.getSessionId(),
+			sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message.role === "assistant")
+				.length + 1,
+		]);
+	const prepareLessonReport = createLessonReportContinuation({
 		getBundle: () => session.harnessVersionBundle,
-		getOutputId: () =>
-			JSON.stringify([
-				sessionManager.getSessionId(),
-				sessionManager
-					.getEntries()
-					.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length + 1,
-			]),
+		getOutputId,
 		writer: memoryWriter,
 		stream: (model, context, requestOptions) => modelRuntime.streamSimple(model, context, requestOptions),
 		consume: async (report) => {
@@ -692,18 +694,49 @@ export async function createInternalAgentSession(
 			const scope = { repositoryId: workspace.workspace.repositoryId, scopeId };
 			// Lock order: harness selection, then score store. No provider calls run under either lock.
 			await loadedHarnessState.store.withCurrentVersion(async (current) => {
-				await lessonScores.registerLessonScoreRevision(scope, {
+				await scores.registerLessonScoreRevision(scope, {
 					harnessVersion: report.harnessRevision,
 					activeMemoryItems: report.activeMemoryItems,
 				});
-				await lessonScores.registerLessonScoreRevision(scope, {
+				await scores.registerLessonScoreRevision(scope, {
 					harnessVersion: current.manifest.version,
 					activeMemoryItems: await memoryWriter.loadActiveMemoryItems(current),
 				});
-				await lessonScores.applyLessonScoreReport(scope, report, current.manifest.version);
+				await scores.applyLessonScoreReport(scope, report, current.manifest.version);
 			});
 		},
 	});
+	const prepareSkillReport = createSkillReportContinuation({
+		getBundle: () => session.harnessVersionBundle,
+		getCatalog: () => session.resourceLoader.getSkills(),
+		getOutputId,
+		workspace: workspace.workspace,
+		stream: (model, context, requestOptions) => modelRuntime.streamSimple(model, context, requestOptions),
+		consume: async (report) => {
+			const bound = await loadedHarnessState.store.loadVersion(report.harnessRevision);
+			// Same lock order as lessons; selection cannot retire or replace a package during scoring.
+			await loadedHarnessState.store.withCurrentVersion(async (current) => {
+				await scores.registerSkillScoreRevision(report.scope, report.workspace, bound);
+				await scores.registerSkillScoreRevision(report.scope, report.workspace, current);
+				await scores.applySkillScoreReport(report.scope, report.workspace, report, current.manifest.version);
+			});
+		},
+	});
+	agent.preparePrivateContinuation = (context, model) => {
+		const continuations: PrivateContinuation[] = [];
+		for (const prepare of [prepareLessonReport, prepareSkillReport]) {
+			try {
+				const continuation = prepare(context, model);
+				if (continuation) continuations.push(continuation);
+			} catch {
+				// A failed binding must not suppress the other private report.
+			}
+		}
+		if (continuations.length === 0) return undefined;
+		return async (message, toolResults, signal) => {
+			for (const continuation of continuations) await continuation(message, toolResults, signal);
+		};
+	};
 	if (session.activeHarnessVersion) {
 		try {
 			await options.lifecycleObserver?.harnessActivated(session.activeHarnessVersion);

@@ -55,6 +55,16 @@ Before an eligible automatic or manual run freezes its input, Diffex grooms the 
 
 The job snapshots the post-groom revision, including its evolved skills, rather than the session's pinned revision. In-flight prompts remain pinned; the next prompt observes the selected revision. The `/evolve` Browse view shows **Reorganizing lessons** during grooming.
 
+## Private skill feedback
+
+After each completed assistant output with workspace-matching evolved skills, a separate private continuation uses the existing system prompt and conversation to request only helpful/harmful judgments on skills used. It shares the lesson-report transport without sharing assessment exchanges. Reports are validated against the workspace, revision, package identities, and exposed skill names/aliases captured before that output. Installed, unknown, ambiguous, duplicate, or malformed references invalidate the whole report.
+
+Skill reports never enter conversation history, extension events, exports, compaction, durable traces, lifecycle observations, or evolution snapshots. Valid reports score helpful +1, harmful -1.5, and every omitted active evolved skill -1. A valid empty report scores every eligible skill -1; failed, missing, or invalid reports change no scores. Explicit and inferred scores commit atomically once per session/output, independently of lesson reports.
+
+Only output-bound package identities still present in the selected workspace revision accrue points. Updated packages start at 0, retired packages stop accruing, and installed skills are never scored. Scores never modify skill artifacts. `DEFAULT_SKILL_POLICY` and `SkillPolicy` in `packages/evolution/src/skill-score-store.ts` expose the shared typed scoring, grooming, and reset defaults, not per-session settings. Reporting and grooming are skipped without workspace-matching evolved skills in the active harness.
+
+Before an eligible automatic or manual run freezes its input, skill grooming removes workspace-matching evolved skills at or below -8 points, then removes the lowest-scoring survivors until at most 10 remain. Equal scores are ordered by skill ID. Removals verify the frozen package version and content digest and use the skill writer's staging and activation path without candidate evaluation. Installed skills and other workspaces are untouched; historical revisions, scores, and lifecycle observations remain available for audit. Below these limits grooming does not advance the selection. The job freezes the post-groom revision and skill catalog; the next prompt observes that selection while admitted prompts remain pinned.
+
 ## Validation and security
 
 Source traces, tool output, files, and generated drafts are treated as untrusted data. Deterministic validation checks structure, provenance, workspace scope, immutable versions, the closed package inventory, portable paths, local-reference resolution, aggregate size limits, and bounded sensitive-data rules. Retrieval and behavioral evaluation remain separate capabilities but are temporarily skipped when the runtime has no evaluator.
@@ -72,6 +82,8 @@ Evolution state is stored beneath the effective agent directory:
 - `harness-state/selections/` contains independent selected pointers keyed by workspace identity.
 
 Sessions resolved to the same workspace identity share evidence totals, jobs, candidates, and harness selection. Different workspace identities never contribute traces, invocation counts, token totals, or jobs to each other. A process that switches to a session in another workspace rotates its trace destination before attaching the replacement session.
+
+The evolution persistence API also provides `skill-scores/` ledgers, partitioned by evolution scope and exact workspace identity. Registration takes a validated harness bundle and includes only its workspace-matching evolved skills, never installed skills. Totals follow the skill ID, package version, and content digest across unrelated harness revisions; changed packages start at 0 and superseded totals remain available for audit. Writes validate revision membership and use atomic compare-and-swap updates. Schema version 2 retains applied output keys alongside totals for replay protection across restarts and concurrent sessions. Scoring holds harness selection stable until commit. Grooming uses compare-and-swap activation and refuses to rebase a scored removal onto a concurrently changed selection.
 
 Interrupted jobs and candidate work resume from durable checkpoints. Writer retries use stable idempotency keys, leases, exact base revisions, and compare-and-swap selection. Skill rollback follows immutable ancestry to the candidate's application boundary and selects its existing pre-activation revision; it does not mutate historical revisions.
 

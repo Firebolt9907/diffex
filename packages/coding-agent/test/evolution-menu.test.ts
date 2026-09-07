@@ -394,11 +394,10 @@ describe("EvolutionMenuComponent", () => {
 		expect(output).not.toContain("Selected harness");
 		expect(output).toContain("Refresh");
 		expect(output).toContain("Evolve [Started]");
-		expect(output).toContain("View");
-		expect(output).not.toContain("View [unavailable]");
+		expect(output).not.toContain("View");
 		expect(output).toContain("Resume [unavailable]");
 		expect(output).toContain("Browse");
-		expect(output).toContain("Rollback [unavailable]");
+		expect(output).not.toContain("Rollback");
 		expect(output).toContain("Cancel");
 
 		component.handleInput("\u001b[B");
@@ -406,7 +405,7 @@ describe("EvolutionMenuComponent", () => {
 		expect(fixture.startManual).not.toHaveBeenCalled();
 		component.handleInput("\u001b[B");
 		component.handleInput("\n");
-		await vi.waitFor(() => expect(fixture.jobDetailCall).toHaveBeenCalledWith("job-active"));
+		expect(fixture.jobDetailCall).not.toHaveBeenCalled();
 		component.dispose();
 	});
 
@@ -431,10 +430,10 @@ describe("EvolutionMenuComponent", () => {
 		expect(output).toContain("Last evolution: Today at 11:10 am");
 		expect(output).toContain("Next automatic evolution: Insufficient information");
 		expect(output).toContain("Evolve");
-		expect(output).toContain("View [unavailable]");
+		expect(output).not.toContain("View");
 		expect(output).toContain("Resume [unavailable]");
 		expect(output).toContain("Browse");
-		expect(output).toContain("Rollback [unavailable]");
+		expect(output).not.toContain("Rollback");
 		expect(output).toContain("Cancel [unavailable]");
 	});
 
@@ -456,7 +455,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(160).join("\n"))).toContain("Cancel"));
 
-		for (let index = 0; index < 6; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(160).join("\n"))).toContain(formatEvolutionJobLabel(resumable)),
@@ -477,7 +476,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Toggle [on]"));
 
-		for (let index = 0; index < 7; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 6; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 
 		expect(fixture.setEnabled).toHaveBeenCalledWith(false);
@@ -485,9 +484,32 @@ describe("EvolutionMenuComponent", () => {
 		const output = stripAnsi(component.render(180).join("\n"));
 		expect(output).toContain("Toggle [off]");
 		expect(output).toContain("Next automatic evolution: Disabled");
-		for (const action of ["Refresh", "Evolve", "View", "Resume", "Browse", "Rollback", "Cancel"]) {
+		for (const action of ["Refresh", "Evolve", "Resume", "Browse", "Cancel"]) {
 			expect(output).toContain(`${action} [unavailable]`);
 		}
+	});
+
+	it("displays and selects the evolution model", async () => {
+		const fixture = client(overview());
+		const selectModel = vi.fn();
+		const component = new EvolutionMenuComponent(
+			fixture.client,
+			() => {},
+			() => {},
+			() => {},
+			1_000,
+			{
+				getModel: () => ({ provider: "faux", model: "faux-evolution" }),
+				selectModel,
+			},
+		);
+		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Model [faux-evolution]"));
+
+		for (let index = 0; index < 5; index += 1) component.handleInput("\u001b[B");
+		component.handleInput("\n");
+
+		expect(selectModel).toHaveBeenCalledOnce();
+		component.dispose();
 	});
 
 	it("rebuilds an idle menu when another process disables evolution", async () => {
@@ -508,7 +530,7 @@ describe("EvolutionMenuComponent", () => {
 		const output = stripAnsi(component.render(180).join("\n"));
 		expect(output).toContain("Toggle [off]");
 		expect(output).toContain("Next automatic evolution: Disabled");
-		for (const action of ["Refresh", "Evolve", "View", "Resume", "Browse", "Rollback", "Cancel"]) {
+		for (const action of ["Refresh", "Evolve", "Resume", "Browse", "Cancel"]) {
 			expect(output).toContain(`${action} [unavailable]`);
 		}
 		expect(render).toHaveBeenCalled();
@@ -552,7 +574,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(job())),
@@ -590,7 +612,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(job())),
@@ -697,7 +719,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(summary)),
@@ -755,7 +777,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(summary)),
@@ -783,7 +805,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(job())),
@@ -854,7 +876,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(job())),
@@ -944,7 +966,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(180).join("\n"))).toContain("Browse"));
 
-		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 3; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(180).join("\n"))).toContain(formatEvolutionJobLabel(job())),
@@ -1174,7 +1196,7 @@ describe("EvolutionMenuComponent", () => {
 		);
 		await vi.waitFor(() => expect(stripAnsi(component.render(160).join("\n"))).toContain("Cancel"));
 
-		for (let index = 0; index < 6; index += 1) component.handleInput("\u001b[B");
+		for (let index = 0; index < 4; index += 1) component.handleInput("\u001b[B");
 		component.handleInput("\n");
 		await vi.waitFor(() =>
 			expect(stripAnsi(component.render(160).join("\n"))).toContain(

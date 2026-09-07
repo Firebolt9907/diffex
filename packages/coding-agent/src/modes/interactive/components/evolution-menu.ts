@@ -280,11 +280,18 @@ export function formatEvolutionSkillDraftDiff(detail: EvolutionSkillCandidateDet
 	});
 }
 
+export interface EvolutionModelMenuControls {
+	getModel(): { readonly provider: string; readonly model: string } | undefined;
+	selectModel(): void;
+}
+
 export class EvolutionMenuComponent extends Container implements Focusable {
 	readonly #client: EvolutionMenuClient;
 	readonly #onClose: () => void;
 	readonly #onStatus: (message: string, error: boolean) => void;
 	readonly #requestRender: () => void;
+	readonly #getModel: EvolutionModelMenuControls["getModel"];
+	readonly #selectModel: EvolutionModelMenuControls["selectModel"];
 	readonly #unsubscribe: () => void;
 	readonly #pollIntervalMs: number;
 	readonly #viewStack: MenuView[] = [{ kind: "overview" }];
@@ -320,12 +327,15 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 		onStatus: (message: string, error: boolean) => void,
 		requestRender: () => void,
 		pollIntervalMs = 1_000,
+		modelControls: EvolutionModelMenuControls = { getModel: () => undefined, selectModel: () => {} },
 	) {
 		super();
 		this.#client = client;
 		this.#onClose = onClose;
 		this.#onStatus = onStatus;
 		this.#requestRender = requestRender;
+		this.#getModel = modelControls.getModel;
+		this.#selectModel = modelControls.selectModel;
 		this.#pollIntervalMs = pollIntervalMs;
 		this.#unsubscribe = client.subscribe((event) => {
 			if (event.type === "enabled-changed") {
@@ -509,6 +519,7 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 
 	#overviewEntries(overview: EvolutionOverview): readonly MenuEntry[] {
 		const evolutionEnabled = this.#client.getEnabled();
+		const evolutionModel = this.#getModel();
 		const cancellableJob =
 			[overview.activeJob, overview.newestResumableJob].find((job) => job?.cancellable === true) ?? null;
 		return [
@@ -518,13 +529,6 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 				enabled: evolutionEnabled && overview.activeJob === null,
 				disabledStatus: evolutionEnabled && overview.activeJob !== null ? "Started" : undefined,
 				select: () => this.#confirm("start"),
-			},
-			{
-				label: "View",
-				enabled: evolutionEnabled && overview.activeJob !== null,
-				select: () => {
-					if (overview.activeJob) this.#push({ kind: "job", jobId: overview.activeJob.jobId });
-				},
 			},
 			{
 				label: "Resume",
@@ -537,16 +541,16 @@ export class EvolutionMenuComponent extends Container implements Focusable {
 				select: () => this.#push({ kind: "jobs" }),
 			},
 			{
-				label: "Rollback",
-				enabled: evolutionEnabled && overview.rollbackAction !== null,
-				select: () => this.#confirm("rollback"),
-			},
-			{
 				label: "Cancel",
 				enabled: evolutionEnabled && cancellableJob !== null,
 				select: () => {
 					if (cancellableJob !== null) this.#confirm("cancel", cancellableJob.jobId);
 				},
+			},
+			{
+				label: `Model [${evolutionModel?.model ?? "unavailable"}]`,
+				enabled: true,
+				select: this.#selectModel,
 			},
 			{
 				label: `Toggle [${evolutionEnabled ? "on" : "off"}]`,

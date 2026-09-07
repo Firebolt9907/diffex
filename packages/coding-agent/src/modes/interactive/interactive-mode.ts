@@ -10,6 +10,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/diffex-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/diffex-ai";
 import type { AssistantMessage, ImageContent, Message, Model } from "@earendil-works/diffex-ai/compat";
+import type { HarnessVersionList } from "@earendil-works/diffex-harness-state";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -159,7 +160,7 @@ import {
 	formatCwdForFooter,
 	formatTokens,
 } from "./components/footer.ts";
-import { formatHarnessVersionLabel } from "./components/harness-version-display.ts";
+import { formatHarnessVersionPickerLabel } from "./components/harness-version-display.ts";
 import {
 	createHarnessVersionSelectorItems,
 	HarnessVersionSelectorComponent,
@@ -379,7 +380,7 @@ export interface InteractiveModeOptions {
 	/** Diffex account authentication client, injectable for controlled hosts and tests. */
 	diffexAccountAuth?: DiffexAccountAuth;
 	/** Process-owned evolution controls for the current repository runtime. */
-	evolution?: EvolutionMenuClient;
+	evolution?: EvolutionMenuClient & { listCurrentDirectoryHarnessVersions(): Promise<HarnessVersionList> };
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
@@ -5425,10 +5426,18 @@ export class InteractiveMode {
 
 	private async showHarnessVersionSelector(): Promise<void> {
 		try {
-			const [{ versions, diagnostics, currentVersion }, versionInfo] = await Promise.all([
-				this.session.listHarnessVersions(),
-				this.options.evolution?.listCurrentDirectoryHarnessVersionInfo() ?? Promise.resolve([]),
+			const evolution = this.options.evolution;
+			const [listing, versionInfo] = await Promise.all([
+				evolution ? evolution.listCurrentDirectoryHarnessVersions() : this.session.listHarnessVersions(),
+				evolution?.listCurrentDirectoryHarnessVersionInfo() ?? Promise.resolve([]),
 			]);
+			const { diagnostics, currentVersion } = listing;
+			const versions = evolution
+				? listing.versions
+				: listing.versions.filter(
+						(bundle) =>
+							bundle.manifest.base === null && bundle.state.memory === "" && bundle.state.skills.length === 0,
+					);
 			const items = createHarnessVersionSelectorItems(versions, diagnostics, versionInfo);
 			if (items.length === 0) {
 				this.showStatus("No harness versions available");
@@ -5439,18 +5448,15 @@ export class InteractiveMode {
 				let switching = false;
 				const label = (version: string, selectedVersion: string | undefined) => {
 					const item = items.find((candidate) => candidate.version === version);
-					return item === undefined ? "Diffex Agent" : formatHarnessVersionLabel(item.display, selectedVersion);
+					return item === undefined
+						? "Diffex Agent"
+						: formatHarnessVersionPickerLabel(item.display, selectedVersion, item.memory, item.skills?.length);
 				};
 				const selector = new HarnessVersionSelectorComponent(
 					items,
-					this.session.activeHarnessVersion ?? currentVersion ?? undefined,
+					currentVersion ?? undefined,
 					(version) => {
 						if (switching) return;
-						if (version === this.session.activeHarnessVersion) {
-							done();
-							this.showStatus(`Harness version already active: ${label(version, version)}`);
-							return;
-						}
 						switching = true;
 						void this.session
 							.switchHarnessVersion(version)
@@ -5462,7 +5468,7 @@ export class InteractiveMode {
 									.catch(() => false);
 								if (activeEvolution) {
 									this.showWarning(
-										"An active evolution is running from its original harness and will not apply to the selected harness.",
+										"An evolution job is still running from its original harness. Its memory activation cannot replace this selection; separate skill work may activate later revisions.",
 									);
 								} else {
 									this.showStatus(`Harness version: ${label(version, version)}`);
@@ -5477,6 +5483,7 @@ export class InteractiveMode {
 						done();
 						this.ui.requestRender();
 					},
+					this.session.harnessVersionBundle?.state.skills,
 				);
 				return { component: selector, focus: selector };
 			});

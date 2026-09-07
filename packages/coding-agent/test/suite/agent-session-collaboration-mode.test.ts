@@ -129,8 +129,7 @@ describe("AgentSession collaboration mode foundation", () => {
 		});
 
 		expect(setCollaborationMode(harness.session, "plan")).toEqual({ status: "changed", mode: "plan" });
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
-		expect(harness.session.getActiveToolNames()).not.toContain("request_user_input");
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "request_user_input"]);
 		expect(harness.session.getToolDefinition("read")?.label).toBe("Base read");
 		const planRead = harness.session.agent.state.tools.find((tool) => tool.name === "read");
 		expect((await planRead?.execute("plan-read", {}))?.content).toContainEqual({
@@ -141,7 +140,7 @@ describe("AgentSession collaboration mode foundation", () => {
 		expect(harness.session.systemPrompt).not.toContain("An untrusted same-name replacement");
 
 		harness.session.setActiveToolsByName(["bash", "custom"]);
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "request_user_input"]);
 		expect(harness.session.systemPrompt.split(PLAN_MODE_SYSTEM_PROMPT)).toHaveLength(2);
 		expect(setCollaborationMode(harness.session, "default")).toEqual({ status: "changed", mode: "default" });
 		expect(harness.session.getActiveToolNames()).toEqual(["bash", "custom"]);
@@ -161,15 +160,83 @@ describe("AgentSession collaboration mode foundation", () => {
 			allowedToolNames: ["read", "grep", "find", "bash"],
 			excludedToolNames: ["grep"],
 		});
+		const questionOnly = await createHarness({
+			tools: createBaseTools(),
+			allowedToolNames: ["request_user_input"],
+		});
+		const excludedQuestion = await createHarness({
+			tools: createBaseTools(),
+			excludedToolNames: ["request_user_input"],
+		});
 		const missing = await createHarness({ tools: [createTool("read")] });
-		harnesses.push(filtered, missing);
+		harnesses.push(filtered, questionOnly, excludedQuestion, missing);
 
 		setCollaborationMode(filtered.session, "plan");
+		setCollaborationMode(questionOnly.session, "plan");
+		setCollaborationMode(excludedQuestion.session, "plan");
 		setCollaborationMode(missing.session, "plan");
 
 		expect(filtered.session.getActiveToolNames()).toEqual(["read", "find"]);
-		expect(missing.session.getActiveToolNames()).toEqual(["read"]);
+		expect(questionOnly.session.getActiveToolNames()).toEqual(["request_user_input"]);
+		expect(excludedQuestion.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+		expect(missing.session.getActiveToolNames()).toEqual(["read", "request_user_input"]);
 		expect(missing.session.getToolDefinition("grep")).toBeUndefined();
+	});
+
+	it("reserves request_user_input for the built-in Plan tool", async () => {
+		const extensionFactories: ExtensionFactory[] = [
+			(pi) => {
+				pi.registerTool({
+					name: "request_user_input",
+					label: "Extension question",
+					description: "Untrusted replacement",
+					parameters: Type.Object({}),
+					execute: async () => ({ content: [{ type: "text", text: "extension" }], details: {} }),
+				});
+			},
+		];
+		const harness = await createHarness({ tools: createBaseTools(), extensionFactories });
+		harnesses.push(harness);
+
+		expect(harness.session.getActiveToolNames()).not.toContain("request_user_input");
+		expect(harness.session.getAllTools().map((tool) => tool.name)).not.toContain("request_user_input");
+		setCollaborationMode(harness.session, "plan");
+		expect(harness.session.getToolDefinition("request_user_input")?.label).toBe("request_user_input");
+	});
+
+	it("rejects a host base override collision without widening the Plan tool surface", async () => {
+		let hostQuestionExecutions = 0;
+		const harness = await createHarness({
+			tools: [createTool("read"), createTool("request_user_input", "host question", () => hostQuestionExecutions++)],
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
+		expect(harness.session.getAllTools().map((tool) => tool.name)).toEqual(["read"]);
+		expect(harness.session.getToolDefinition("request_user_input")).toBeUndefined();
+
+		setCollaborationMode(harness.session, "plan");
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "request_user_input"]);
+		expect(harness.session.getToolDefinition("request_user_input")?.label).toBe("request_user_input");
+		expect(harness.session.getToolDefinition("grep")).toBeUndefined();
+		const planQuestion = harness.session.agent.state.tools.find((tool) => tool.name === "request_user_input");
+		if (!planQuestion) throw new Error("Expected the built-in question tool");
+		await expect(
+			planQuestion.execute("question", {
+				questions: [
+					{
+						id: "scope",
+						header: "Scope",
+						question: "Which scope?",
+						options: [
+							{ label: "Focused", description: "Keep the change focused." },
+							{ label: "Broad", description: "Expand the change." },
+						],
+					},
+				],
+			}),
+		).rejects.toThrow("request_user_input is unavailable without interactive UI.");
+		expect(hostQuestionExecutions).toBe(0);
 	});
 
 	it("captures Plan synchronously at admission and applies its instructions after extension prompt hooks", async () => {
@@ -210,7 +277,7 @@ describe("AgentSession collaboration mode foundation", () => {
 		expect(getCollaborationMode(harness.session)).toBe("plan");
 
 		await harness.session.reload();
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "request_user_input"]);
 		expect(harness.session.systemPrompt.split(PLAN_MODE_SYSTEM_PROMPT)).toHaveLength(2);
 	});
 
@@ -367,5 +434,95 @@ describe("AgentSession collaboration mode foundation", () => {
 		expect(bashExecutions).toBe(0);
 		expect(extensionToolCalls).toBe(0);
 		expect(getAssistantTexts(harness)).toContain('Tool "bash" is unavailable in Plan mode.');
+	});
+
+	it("blocks a stale question call outside the captured Plan run", async () => {
+		let extensionToolCalls = 0;
+		const harness = await createHarness({
+			tools: createBaseTools(),
+			extensionFactories: [
+				(pi) => {
+					pi.on("tool_call", () => {
+						extensionToolCalls++;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		setCollaborationMode(harness.session, "plan");
+		const staleQuestion = harness.session.agent.state.tools.find((tool) => tool.name === "request_user_input");
+		if (!staleQuestion) throw new Error("Expected the built-in question tool");
+		setCollaborationMode(harness.session, "default");
+		harness.session.agent.state.tools.push(staleQuestion);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("request_user_input", {
+					questions: [
+						{
+							id: "scope",
+							header: "Scope",
+							question: "Which scope?",
+							options: [
+								{ label: "Focused", description: "Keep the change focused." },
+								{ label: "Broad", description: "Expand the change." },
+							],
+						},
+					],
+				}),
+				{
+					stopReason: "toolUse",
+				},
+			),
+			(context) => {
+				const result = [...context.messages].reverse().find((message) => message.role === "toolResult");
+				const text = result?.role === "toolResult" ? result.content.find((part) => part.type === "text")?.text : "";
+				return fauxAssistantMessage(text ?? "");
+			},
+		]);
+
+		await harness.session.prompt("try the stale question tool");
+
+		expect(extensionToolCalls).toBe(0);
+		expect(getAssistantTexts(harness)).toContain('Tool "request_user_input" is unavailable outside Plan mode.');
+	});
+
+	it("reports unavailable Plan questions as errors when no TUI supports the call", async () => {
+		const harness = await createHarness({ tools: createBaseTools() });
+		harnesses.push(harness);
+		setCollaborationMode(harness.session, "plan");
+		let observedResult: { isError: boolean; text: string } | undefined;
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("request_user_input", {
+					questions: [
+						{
+							id: "scope",
+							header: "Scope",
+							question: "Which scope?",
+							options: [
+								{ label: "Focused", description: "Keep the change focused." },
+								{ label: "Broad", description: "Expand the change." },
+							],
+						},
+					],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				const result = [...context.messages].reverse().find((message) => message.role === "toolResult");
+				const text = result?.role === "toolResult" ? result.content.find((part) => part.type === "text")?.text : "";
+				observedResult = { isError: result?.role === "toolResult" && result.isError, text: text ?? "" };
+				return fauxAssistantMessage("continued after unavailable question");
+			},
+		]);
+
+		await harness.session.prompt("ask without an interactive UI");
+
+		expect(observedResult).toEqual({
+			isError: true,
+			text: "request_user_input is unavailable without interactive UI.",
+		});
+		expect(getAssistantTexts(harness)).toContain("continued after unavailable question");
+		expect(getCollaborationMode(harness.session)).toBe("plan");
 	});
 });

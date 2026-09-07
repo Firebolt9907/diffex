@@ -67,6 +67,12 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import {
+	type CollaborationMode,
+	getCollaborationMode,
+	restoreCollaborationMode,
+	setCollaborationMode,
+} from "../../core/collaboration-mode.ts";
 import { type DiffexAccountAuth, HostedDiffexAccountAuth } from "../../core/diffex-account-auth.ts";
 import type {
 	AutocompleteProviderFactory,
@@ -561,6 +567,7 @@ export class InteractiveMode {
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
+	private directBashCommandsInProgress = 0;
 
 	// Track pending bash components (shown in pending area, moved to chat on submit)
 	private pendingBashComponents: BashExecutionComponent[] = [];
@@ -636,6 +643,7 @@ export class InteractiveMode {
 			this.resetExtensionUI();
 		});
 		this.runtimeHost.setRebindSession(async () => {
+			this.restoreCurrentCollaborationMode();
 			await this.rebindCurrentSession({ renderBeforeBind: true });
 		});
 		this.version = VERSION;
@@ -704,6 +712,13 @@ export class InteractiveMode {
 			(message) => this.showError(message),
 			() => this.updateEditorBorderColor(),
 		);
+	}
+
+	private restoreCurrentCollaborationMode(): void {
+		const result = restoreCollaborationMode(this.session);
+		if (result.status === "busy") {
+			throw new Error("Cannot restore collaboration mode while Diffex is busy");
+		}
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -964,6 +979,7 @@ export class InteractiveMode {
 
 	async init(): Promise<void> {
 		if (this.isInitialized) return;
+		this.restoreCurrentCollaborationMode();
 
 		this.registerSignalHandlers();
 
@@ -1955,6 +1971,7 @@ export class InteractiveMode {
 						return { cancelled: true };
 					}
 
+					this.restoreCurrentCollaborationMode();
 					this.chatContainer.clear();
 					this.renderInitialMessages();
 					if (result.editorText && !this.editor.getText().trim()) {
@@ -3182,6 +3199,7 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
+		this.defaultEditor.onAction("app.mode.toggle", () => this.toggleCollaborationMode());
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.cycleModel("forward"));
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
 
@@ -3276,6 +3294,10 @@ export class InteractiveMode {
 			if (text === "/settings") {
 				this.editor.setText("");
 				await this.showSettingsSelector();
+				return;
+			}
+			if (text === "/plan" || text.startsWith("/plan ")) {
+				await this.handlePlanCommand(text);
 				return;
 			}
 			if (text === "/skills") {
@@ -3456,6 +3478,41 @@ export class InteractiveMode {
 			}
 			this.editor.addToHistory?.(text);
 		};
+	}
+
+	private async handlePlanCommand(originalText: string): Promise<void> {
+		const request = originalText.slice("/plan".length).trim();
+		if (getCollaborationMode(this.session) === "plan") {
+			if (request) {
+				await this.defaultEditor.onSubmit?.(request);
+			} else {
+				this.showCollaborationModeStatus("Mode: Plan");
+			}
+			return;
+		}
+		if (this.directBashCommandsInProgress > 0) {
+			this.editor.setText(originalText);
+			this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
+			return;
+		}
+
+		try {
+			const result = setCollaborationMode(this.session, "plan");
+			if (result.status === "busy") {
+				this.editor.setText(originalText);
+				this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
+				return;
+			}
+		} catch (error) {
+			this.editor.setText(originalText);
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+
+		this.showCollaborationModeStatus("Mode: Plan");
+		if (request) {
+			await this.defaultEditor.onSubmit?.(request);
+		}
 	}
 
 	private subscribeToAgent(): void {
@@ -3835,6 +3892,20 @@ export class InteractiveMode {
 		const text = new Text(theme.fg("dim", message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
+		this.lastStatusSpacer = spacer;
+		this.lastStatusText = text;
+		this.ui.requestRender();
+	}
+
+	private showCollaborationModeStatus(message: string): void {
+		const spacer = new Spacer(1);
+		const text = new Text(theme.fg("dim", message), 1, 0);
+		const children = this.chatContainer.children;
+		const activePathIndices = [this.pendingUserDock, this.streamingComponent, this.activeToolGroup]
+			.map((component) => (component ? children.indexOf(component) : -1))
+			.filter((index) => index >= 0);
+		const insertionIndex = activePathIndices.length > 0 ? Math.min(...activePathIndices) : children.length;
+		children.splice(insertionIndex, 0, spacer, text);
 		this.lastStatusSpacer = spacer;
 		this.lastStatusText = text;
 		this.ui.requestRender();
@@ -4486,6 +4557,24 @@ export class InteractiveMode {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			this.showStatus(`Thinking level: ${newLevel}`);
+		}
+	}
+
+	private toggleCollaborationMode(): void {
+		if (this.directBashCommandsInProgress > 0) {
+			this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
+			return;
+		}
+		const mode: CollaborationMode = getCollaborationMode(this.session) === "plan" ? "default" : "plan";
+		try {
+			const result = setCollaborationMode(this.session, mode);
+			if (result.status === "busy") {
+				this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
+				return;
+			}
+			this.showCollaborationModeStatus(`Mode: ${result.mode === "plan" ? "Plan" : "Default"}`);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
 		}
 	}
 
@@ -5708,6 +5797,7 @@ export class InteractiveMode {
 						}
 
 						// Update UI
+						this.restoreCurrentCollaborationMode();
 						this.chatContainer.clear();
 						this.renderInitialMessages();
 						if (result.editorText && !this.editor.getText().trim()) {
@@ -7034,6 +7124,15 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+		this.directBashCommandsInProgress++;
+		try {
+			await this.runBashCommand(command, excludeFromContext);
+		} finally {
+			this.directBashCommandsInProgress--;
+		}
+	}
+
+	private async runBashCommand(command: string, excludeFromContext: boolean): Promise<void> {
 		const extensionRunner = this.session.extensionRunner;
 
 		// Emit user_bash event to let extensions intercept

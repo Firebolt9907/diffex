@@ -9,10 +9,17 @@ export type CollaborationModeTransitionResult =
 
 export const GET_COLLABORATION_MODE: unique symbol = Symbol("getCollaborationMode");
 export const CHANGE_COLLABORATION_MODE: unique symbol = Symbol("changeCollaborationMode");
+export const IS_COLLABORATION_MODE_BUSY: unique symbol = Symbol("isCollaborationModeBusy");
+export const SUBSCRIBE_PROMPT_ADMISSION: unique symbol = Symbol("subscribePromptAdmission");
+
+/** Ephemeral TUI validity checks kept off public session events and serialized protocols. */
+export const planHandoffSettlementGuards = new WeakMap<object, () => boolean>();
 
 export interface CollaborationModeController {
 	[GET_COLLABORATION_MODE](): CollaborationMode;
 	[CHANGE_COLLABORATION_MODE](mode: CollaborationMode, persist: boolean): CollaborationModeTransitionResult;
+	[IS_COLLABORATION_MODE_BUSY](): boolean;
+	[SUBSCRIBE_PROMPT_ADMISSION](listener: () => void): () => void;
 }
 
 export const COLLABORATION_MODE_CUSTOM_TYPE = "diffex.collaboration-mode";
@@ -44,6 +51,15 @@ export function resolveCollaborationMode(sessionManager: SessionManager): Collab
 
 export function getCollaborationMode(session: CollaborationModeController): CollaborationMode {
 	return session[GET_COLLABORATION_MODE]();
+}
+
+export function isCollaborationModeBusy(session: CollaborationModeController): boolean {
+	return session[IS_COLLABORATION_MODE_BUSY]();
+}
+
+/** Package-internal TUI invalidation; not a public session/protocol event. */
+export function subscribePromptAdmission(session: CollaborationModeController, listener: () => void): () => void {
+	return session[SUBSCRIBE_PROMPT_ADMISSION](listener);
 }
 
 export function setCollaborationMode(

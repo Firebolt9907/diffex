@@ -69,8 +69,11 @@ import {
 	type CollaborationMode,
 	type CollaborationModeTransitionResult,
 	GET_COLLABORATION_MODE,
+	IS_COLLABORATION_MODE_BUSY,
 	PLAN_MODE_SYSTEM_PROMPT,
 	PLAN_MODE_TOOL_NAMES,
+	planHandoffSettlementGuards,
+	SUBSCRIBE_PROMPT_ADMISSION,
 } from "./collaboration-mode.ts";
 import {
 	type CompactionResult,
@@ -568,6 +571,8 @@ export class AgentSession {
 	private readonly _lifecycleObserver: AgentSessionLifecycleObserver | undefined;
 	private _harnessSwitchInProgress = false;
 	private _promptAdmissionInProgress = false;
+	private readonly _promptAdmissionListeners = new Set<() => void>();
+	private _planHandoffGeneration = 0;
 	private _subagentCoordination: SubagentCoordination | undefined;
 	private _pendingSubagentEscalationEnvelope: PendingSubagentEscalationEnvelope | undefined;
 	private readonly _pendingIdleSubagentEscalations = new Map<string, number>();
@@ -912,10 +917,13 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(planHandoff?: { readonly plan: string }): Promise<void> {
+		const generation = this._planHandoffGeneration;
+		const event = { type: "agent_settled", ...(planHandoff ? { planHandoff } : {}) } as const;
+		planHandoffSettlementGuards.set(event, () => !this._disposePromise && generation === this._planHandoffGeneration);
 		this._isAgentRunActive = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled", ...(planHandoff ? { planHandoff } : {}) });
+			this._emit(event);
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
@@ -1292,6 +1300,7 @@ export class AgentSession {
 			failures.push(error);
 		}
 		this._eventListeners = [];
+		this._promptAdmissionListeners.clear();
 		try {
 			cleanupSessionResources(this.sessionId);
 		} catch (error) {
@@ -1377,9 +1386,20 @@ export class AgentSession {
 			?.definition;
 	}
 
-	[CHANGE_COLLABORATION_MODE](mode: CollaborationMode, persist: boolean): CollaborationModeTransitionResult {
-		if (mode === this._collaborationMode) return { status: "unchanged", mode };
-		if (
+	[SUBSCRIBE_PROMPT_ADMISSION](listener: () => void): () => void {
+		this._promptAdmissionListeners.add(listener);
+		return () => {
+			this._promptAdmissionListeners.delete(listener);
+		};
+	}
+
+	private _invalidatePlanHandoff(): void {
+		this._planHandoffGeneration++;
+		for (const listener of this._promptAdmissionListeners) listener();
+	}
+
+	[IS_COLLABORATION_MODE_BUSY](): boolean {
+		return (
 			this._collaborationModeTransitionInProgress ||
 			this._promptAdmissionInProgress ||
 			this._harnessSwitchInProgress ||
@@ -1387,7 +1407,12 @@ export class AgentSession {
 			this.isRetrying ||
 			this.isCompacting ||
 			this.isBashRunning
-		) {
+		);
+	}
+
+	[CHANGE_COLLABORATION_MODE](mode: CollaborationMode, persist: boolean): CollaborationModeTransitionResult {
+		if (mode === this._collaborationMode) return { status: "unchanged", mode };
+		if (this[IS_COLLABORATION_MODE_BUSY]()) {
 			return { status: "busy", mode: this._collaborationMode };
 		}
 
@@ -1398,6 +1423,7 @@ export class AgentSession {
 				? appendCustomEntryWithRollback(this.sessionManager, COLLABORATION_MODE_CUSTOM_TYPE, { mode })
 				: undefined;
 			this._collaborationMode = mode;
+			this._planHandoffGeneration++;
 			this._installCollaborationModeState(nextState);
 			if (entryId) {
 				const entry = this.sessionManager.getEntry(entryId);
@@ -1899,7 +1925,7 @@ export class AgentSession {
 	private async _runAgentPrompt(
 		messages: AgentMessage | AgentMessage[],
 		collaborationMode: CollaborationMode = this._collaborationMode,
-		collaborationState?: CollaborationModeState,
+		collaborationState: CollaborationModeState | undefined = this._capturePlanAdmissionState(),
 	): Promise<void> {
 		this._agentRunAborted = false;
 		this._latestFinalizedPlan = undefined;
@@ -1908,6 +1934,8 @@ export class AgentSession {
 		if (collaborationState) this._installCollaborationModeState(collaborationState);
 		this._isAgentRunActive = true;
 		try {
+			// Extension custom messages can start a logical run without prompt().
+			this._invalidatePlanHandoff();
 			let firstRun = true;
 			while (true) {
 				if (firstRun) await this.agent.prompt(messages);
@@ -2215,6 +2243,9 @@ export class AgentSession {
 			if (reservesAdmission) this._promptAdmissionInProgress = false;
 		};
 		try {
+			if (reservesAdmission) {
+				this._invalidatePlanHandoff();
+			}
 			return this._traceOperation("prompt", (operationSpan) =>
 				this._prompt(
 					text,
@@ -4656,6 +4687,7 @@ export class AgentSession {
 			}
 
 			// Update agent state
+			this._planHandoffGeneration++;
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._filterPendingIdleSubagentEscalationsToSelectedBranch();

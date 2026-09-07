@@ -69,9 +69,13 @@ import {
 } from "../../core/cache-stats.ts";
 import {
 	type CollaborationMode,
+	type CollaborationModeTransitionResult,
 	getCollaborationMode,
+	isCollaborationModeBusy,
+	planHandoffSettlementGuards,
 	restoreCollaborationMode,
 	setCollaborationMode,
+	subscribePromptAdmission,
 } from "../../core/collaboration-mode.ts";
 import { type DiffexAccountAuth, HostedDiffexAccountAuth } from "../../core/diffex-account-auth.ts";
 import type {
@@ -214,6 +218,16 @@ interface Expandable {
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
+}
+
+function setInteractiveCollaborationMode(
+	session: AgentSession,
+	mode: CollaborationMode,
+	directBashCommandsInProgress: number,
+): CollaborationModeTransitionResult {
+	// The core Bash guard starts after the awaited user_bash extension hook.
+	if (directBashCommandsInProgress > 0) return { status: "busy", mode: getCollaborationMode(session) };
+	return setCollaborationMode(session, mode);
 }
 
 class ExpandableText extends Text implements Expandable {
@@ -3523,14 +3537,8 @@ export class InteractiveMode {
 			}
 			return;
 		}
-		if (this.directBashCommandsInProgress > 0) {
-			this.editor.setText(originalText);
-			this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
-			return;
-		}
-
 		try {
-			const result = setCollaborationMode(this.session, "plan");
+			const result = setInteractiveCollaborationMode(this.session, "plan", this.directBashCommandsInProgress);
 			if (result.status === "busy") {
 				this.editor.setText(originalText);
 				this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
@@ -3550,9 +3558,14 @@ export class InteractiveMode {
 	}
 
 	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
+		const unsubscribeAdmission = subscribePromptAdmission(this.session, () => this.clearPlanHandoff());
+		const unsubscribeAgent = this.session.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
+		this.unsubscribe = () => {
+			unsubscribeAdmission();
+			unsubscribeAgent();
+		};
 	}
 
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
@@ -3564,6 +3577,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.clearPlanHandoff();
 				this.agentResponseStartMs = Date.now();
 				this.pendingTools.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
@@ -3756,7 +3770,9 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.checkShutdownRequested();
-				this.handleSettledPlanHandoff(event.planHandoff);
+				if (planHandoffSettlementGuards.get(event)?.() !== false) {
+					this.handleSettledPlanHandoff(event.planHandoff);
+				}
 				break;
 
 			case "subagent_wait_start":
@@ -4600,13 +4616,9 @@ export class InteractiveMode {
 	}
 
 	private toggleCollaborationMode(): void {
-		if (this.directBashCommandsInProgress > 0) {
-			this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
-			return;
-		}
 		const mode: CollaborationMode = getCollaborationMode(this.session) === "plan" ? "default" : "plan";
 		try {
-			const result = setCollaborationMode(this.session, mode);
+			const result = setInteractiveCollaborationMode(this.session, mode, this.directBashCommandsInProgress);
 			if (result.status === "busy") {
 				this.showCollaborationModeStatus("Cannot switch modes while Diffex is busy.");
 				return;
@@ -4996,13 +5008,13 @@ export class InteractiveMode {
 		dismiss?.();
 	}
 
-	private schedulePendingPlanHandoff(): void {
+	private schedulePendingPlanHandoff(delayMs = 0): void {
 		if (!this.pendingPlanHandoff || this.planHandoffCheckScheduled) return;
 		this.planHandoffCheckScheduled = true;
 		setTimeout(() => {
 			this.planHandoffCheckScheduled = false;
 			this.maybeShowPendingPlanHandoff();
-		}, 0);
+		}, delayMs);
 	}
 
 	private handleSettledPlanHandoff(planHandoff?: { readonly plan: string }): void {
@@ -5015,9 +5027,16 @@ export class InteractiveMode {
 	}
 
 	private maybeShowPendingPlanHandoff(): void {
-		if (!this.pendingPlanHandoff) return;
+		const planHandoff = this.pendingPlanHandoff;
+		if (!planHandoff) return;
 		if (getCollaborationMode(this.session) !== "plan" || this.hasQueuedPlanHandoffInput()) {
 			this.clearPlanHandoff();
+			return;
+		}
+		if (this.directBashCommandsInProgress > 0 || isCollaborationModeBusy(this.session)) {
+			// Some busy operations finish without a TUI event. Retain one offer
+			// and recheck until idle, invalidated, or stopped.
+			this.schedulePendingPlanHandoff(100);
 			return;
 		}
 		if (this.isPlanHandoffModalBlocked()) return;
@@ -5033,15 +5052,16 @@ export class InteractiveMode {
 				"Implement this plan?",
 				["Implement the plan", "Stay in Plan mode"],
 				(option) => {
-					this.pendingPlanHandoff = undefined;
-					finish();
+					if (this.pendingPlanHandoff !== planHandoff || this.dismissPlanHandoffSelector !== finish) return;
 					if (option === "Implement the plan") {
 						void this.implementSettledPlan();
+					} else {
+						this.clearPlanHandoff();
 					}
 				},
 				() => {
-					this.pendingPlanHandoff = undefined;
-					finish();
+					if (this.pendingPlanHandoff !== planHandoff || this.dismissPlanHandoffSelector !== finish) return;
+					this.clearPlanHandoff();
 				},
 				{ tui: this.ui, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
 			);
@@ -5051,14 +5071,22 @@ export class InteractiveMode {
 	}
 
 	private async implementSettledPlan(): Promise<void> {
+		if (!this.pendingPlanHandoff) return;
+		if (getCollaborationMode(this.session) !== "plan" || this.hasQueuedPlanHandoffInput()) {
+			this.clearPlanHandoff();
+			return;
+		}
 		const implementationPrompt = "Implement the plan.";
 		const session = this.session;
 		try {
-			const result = setCollaborationMode(session, "default");
+			const result = setInteractiveCollaborationMode(session, "default", this.directBashCommandsInProgress);
 			if (result.status === "busy") {
+				this.dismissPlanHandoffSelector?.();
+				this.schedulePendingPlanHandoff(100);
 				this.showError("Cannot switch modes while Diffex is busy.");
 				return;
 			}
+			this.clearPlanHandoff();
 			this.showCollaborationModeStatus("Mode: Default");
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));

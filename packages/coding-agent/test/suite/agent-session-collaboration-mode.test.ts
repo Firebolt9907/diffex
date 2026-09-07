@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/diffex-agent-core";
@@ -8,10 +8,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	COLLABORATION_MODE_CUSTOM_TYPE,
 	getCollaborationMode,
+	isCollaborationModeBusy,
 	PLAN_MODE_SYSTEM_PROMPT,
 	resolveCollaborationMode,
 	restoreCollaborationMode,
 	setCollaborationMode,
+	subscribePromptAdmission,
 } from "../../src/core/collaboration-mode.ts";
 import type { ExtensionFactory } from "../../src/core/extensions/index.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -74,6 +76,8 @@ describe("AgentSession collaboration mode foundation", () => {
 
 		expect(publicApi).not.toHaveProperty("setCollaborationMode");
 		expect(publicApi).not.toHaveProperty("restoreCollaborationMode");
+		expect(publicApi).not.toHaveProperty("isCollaborationModeBusy");
+		expect(publicApi).not.toHaveProperty("subscribePromptAdmission");
 		expect(getCollaborationMode(harness.session)).toBe("default");
 		expect(harness.session.getActiveToolNames()).toContain("bash");
 
@@ -84,6 +88,48 @@ describe("AgentSession collaboration mode foundation", () => {
 				.getBranch()
 				.filter((entry) => entry.type === "custom" && entry.customType === COLLABORATION_MODE_CUSTOM_TYPE),
 		).toHaveLength(1);
+	});
+
+	it("notifies admission synchronously under the busy guard and supports unsubscribe", async () => {
+		const order: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", () => {
+						order.push("input");
+						return { action: "handled" };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const unsubscribe = subscribePromptAdmission(harness.session, () => {
+			order.push("admission");
+			expect(isCollaborationModeBusy(harness.session)).toBe(true);
+			expect(setCollaborationMode(harness.session, "plan").status).toBe("busy");
+		});
+		const prompt = harness.session.prompt("first request", { source: "extension" });
+		expect(order).toEqual(["admission"]);
+		await prompt;
+		expect(order).toEqual(["admission", "input"]);
+		expect(isCollaborationModeBusy(harness.session)).toBe(false);
+		unsubscribe();
+		await harness.session.prompt("second request", { source: "extension" });
+		expect(order).toEqual(["admission", "input", "input"]);
+	});
+
+	it("releases admission if an internal listener throws", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const unsubscribe = subscribePromptAdmission(harness.session, () => {
+			throw new Error("listener failed");
+		});
+		await expect(harness.session.prompt("request")).rejects.toThrow("listener failed");
+		expect(isCollaborationModeBusy(harness.session)).toBe(false);
+		unsubscribe();
+		harness.setResponses([fauxAssistantMessage("recovered")]);
+		await harness.session.prompt("retry");
+		expect(getAssistantTexts(harness)).toContain("recovered");
 	});
 
 	it("installs a mode only after its session entry persists", async () => {
@@ -98,6 +144,30 @@ describe("AgentSession collaboration mode foundation", () => {
 		expect(getCollaborationMode(harness.session)).toBe("default");
 		expect(harness.session.getActiveToolNames()).toContain("bash");
 		expect(resolveCollaborationMode(sessionManager)).toBe("default");
+	});
+
+	it("saves a new session's mode preference lazily with its first assistant message", async () => {
+		const sessionDir = mkdtempSync(join(tmpdir(), "diffex-plan-mode-lazy-"));
+		try {
+			const sessionManager = SessionManager.create(process.cwd(), sessionDir);
+			const harness = await createHarness({ sessionManager, tools: createBaseTools() });
+			harnesses.push(harness);
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a disk-backed session path");
+
+			setCollaborationMode(harness.session, "plan");
+			expect(resolveCollaborationMode(sessionManager)).toBe("plan");
+			expect(existsSync(sessionFile)).toBe(false);
+
+			sessionManager.appendMessage(fauxAssistantMessage("first response"));
+			expect(existsSync(sessionFile)).toBe(true);
+			expect(resolveCollaborationMode(SessionManager.open(sessionFile))).toBe("plan");
+
+			setCollaborationMode(harness.session, "default");
+			expect(resolveCollaborationMode(SessionManager.open(sessionFile))).toBe("default");
+		} finally {
+			rmSync(sessionDir, { recursive: true, force: true });
+		}
 	});
 
 	it("uses only trusted filtered base tools in Plan and restores the latest requested Default tools", async () => {
@@ -364,6 +434,27 @@ describe("AgentSession collaboration mode foundation", () => {
 
 		setCollaborationMode(harness.session, "default");
 		expect(harness.session.getActiveToolNames()).toEqual(["bash"]);
+	});
+
+	it("captures trusted Plan tools when an extension custom message starts the logical run", async () => {
+		let reads = 0;
+		const harness = await createHarness({ tools: [createTool("read", "trusted read", () => reads++)] });
+		harnesses.push(harness);
+		setCollaborationMode(harness.session, "plan");
+		const admittedTools = harness.session.agent.state.tools.slice();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read", {}), { stopReason: "toolUse" }),
+			(context) => {
+				expect(context.tools?.every((tool, index) => tool === admittedTools[index])).toBe(true);
+				return fauxAssistantMessage("planned");
+			},
+		]);
+		await harness.session.sendCustomMessage(
+			{ customType: "new_request", content: "inspect the repository", display: true },
+			{ triggerTurn: true },
+		);
+		expect(reads).toBe(1);
+		expect(getAssistantTexts(harness)).toContain("planned");
 	});
 
 	it.each(["isStreaming", "isCompacting", "isRetrying", "isBashRunning"] as const)(

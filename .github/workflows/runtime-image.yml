@@ -32,6 +32,8 @@ concurrency:
 
 jobs:
   build:
+    # Publication is paused until the runtime image and deployment consumers are validated.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

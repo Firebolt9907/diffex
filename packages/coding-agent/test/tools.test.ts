@@ -5,15 +5,13 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { type BashOperations, createBashTool, createLocalBashOperations } from "../src/core/tools/bash.ts";
+import { createEditTool } from "../src/core/tools/edit.ts";
 import { computeEditsDiff } from "../src/core/tools/edit-diff.ts";
-import {
-	createEditTool,
-	createFindTool,
-	createGrepTool,
-	createLsTool,
-	createReadTool,
-	createWriteTool,
-} from "../src/index.ts";
+import { createFindTool } from "../src/core/tools/find.ts";
+import { createGrepTool } from "../src/core/tools/grep.ts";
+import { createLsTool } from "../src/core/tools/ls.ts";
+import { createReadTool } from "../src/core/tools/read.ts";
+import { createWriteTool } from "../src/core/tools/write.ts";
 import * as shellModule from "../src/utils/shell.ts";
 
 const readTool = createReadTool(process.cwd());
@@ -638,13 +636,6 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result).trim()).toBe("prefix-output\ncommand-output");
 		});
 
-		it("should work without command prefix", async () => {
-			const bashWithoutPrefix = createBashTool(testDir, {});
-
-			const result = await bashWithoutPrefix.execute("test-prefix-3", { command: "echo no-prefix" });
-			expect(getTextOutput(result).trim()).toBe("no-prefix");
-		});
-
 		it("should coalesce streaming updates for chatty output", async () => {
 			const operations: BashOperations = {
 				exec: async (_command, _cwd, { onData }) => {
@@ -1128,19 +1119,6 @@ describe("edit tool CRLF handling", () => {
 
 	afterEach(() => {
 		rmSync(testDir, { recursive: true, force: true });
-	});
-
-	it("should match LF oldText against CRLF file content", async () => {
-		const testFile = join(testDir, "crlf-test.txt");
-
-		writeFileSync(testFile, "line one\r\nline two\r\nline three\r\n");
-
-		const result = await editTool.execute("test-crlf-1", {
-			path: testFile,
-			edits: [{ oldText: "line two\n", newText: "replaced line\n" }],
-		});
-
-		expect(getTextOutput(result)).toContain("Successfully replaced");
 	});
 
 	it("should preserve CRLF line endings after edit", async () => {

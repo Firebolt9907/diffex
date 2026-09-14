@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### New Features
+
+- Added a streamlined interactive transcript and compact dialogs for clearer conversation and activity states ([#166](https://github.com/diffexai/diffex/pull/166) by [@jefft72](https://github.com/jefft72)).
+- Added an animated Diffex welcome sequence at interactive startup ([#167](https://github.com/diffexai/diffex/pull/167) by [@jefft72](https://github.com/jefft72)).
+- Added a responsive interactive layout with adaptive editor and footer sizing, compact queued-message summaries, and a recoverable small-terminal view. See [Interactive Mode](docs/usage.md#interactive-mode) ([#168](https://github.com/diffexai/diffex/pull/168) by [@jefft72](https://github.com/jefft72)).
+
+### Fixed
+
+- Fixed startup changelog previews to show only entries not previously seen.
+
 ## [0.2.2] - 2026-09-14
 
 ### Breaking Changes

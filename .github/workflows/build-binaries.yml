@@ -100,12 +100,7 @@ jobs:
         if: steps.restore.outputs.restored != 'true'
         run: |
           npm run check
-          # Approved one-time notification hotfix; main already passed full CI.
-          if [ "$RELEASE_TAG" = 'v0.2.4' ]; then
-            (cd packages/coding-agent && node ../../node_modules/vitest/dist/cli.js --run test/version-update-e2e.test.ts)
-          else
-            ./test.sh
-          fi
+          ./test.sh
           git diff --exit-code HEAD
       - name: Prepare reviewed tarballs and private source snapshot
         if: steps.restore.outputs.restored != 'true'
@@ -132,7 +127,6 @@ jobs:
           retention-days: 90
 
   native-acceptance:
-    if: (github.event.inputs.tag || github.ref_name) != 'v0.2.4'
     needs: [resolve-source, prepare-artifacts]
     permissions:
       contents: read
@@ -143,10 +137,6 @@ jobs:
 
   publish-npm:
     needs: [resolve-source, prepare-artifacts, native-acceptance]
-    if: >-
-      ${{ !cancelled() && needs.resolve-source.result == 'success' && needs.prepare-artifacts.result == 'success' &&
-      (needs.native-acceptance.result == 'success' ||
-      ((github.event.inputs.tag || github.ref_name) == 'v0.2.4' && needs.native-acceptance.result == 'skipped')) }}
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
@@ -177,7 +167,6 @@ jobs:
 
   announce-diffex-release:
     needs: [resolve-source, publish-npm]
-    if: ${{ !cancelled() && needs.publish-npm.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: diffex-release-upload

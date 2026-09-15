@@ -31,9 +31,7 @@ import {
 	type Component,
 	Container,
 	fuzzyFilter,
-	getCapabilities,
 	getGlyphs,
-	hyperlink,
 	Markdown,
 	matchesKey,
 	ProcessTerminal,
@@ -319,7 +317,6 @@ const AUTH_TYPE_ORDER = { oauth: 0, api_key: 1 } satisfies Record<AuthSelectorPr
 const DIFFEX_ACCOUNT_LOGIN_ID = "diffex";
 const DIFFEX_ACCOUNT_SELECTOR_ID = "diffex-account";
 const DIFFEX_ACCOUNT_LOGIN_LABEL = "Sign in to Diffex";
-const DIFFEX_UPDATE_AVAILABLE_NOTIFICATION_ENABLED = false;
 
 function createFuzzyAutocompleteItems<T>(
 	items: T[],
@@ -1155,7 +1152,7 @@ export class InteractiveMode {
 
 		// Start version check asynchronously
 		checkForNewDiffexVersion(this.version).then((newRelease) => {
-			if (newRelease && DIFFEX_UPDATE_AVAILABLE_NOTIFICATION_ENABLED) {
+			if (newRelease) {
 				this.showNewVersionNotification(newRelease);
 			}
 		});
@@ -4723,37 +4720,12 @@ export class InteractiveMode {
 		this.pendingUserDock = undefined;
 		const action = theme.fg("accent", `${APP_NAME} update`);
 		const updateInstruction = theme.fg("muted", `New version ${release.version} is available. Run `) + action;
-		const changelogUrl = "https://github.com/diffexai/diffex/blob/main/packages/coding-agent/CHANGELOG.md";
-		const changelogLink = getCapabilities().hyperlinks
-			? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
-			: theme.fg("accent", changelogUrl);
-		const changelogLine = theme.fg("muted", "Changelog: ") + changelogLink;
-		const note = release.note?.trim();
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
 		this.chatContainer.addChild(
 			new Text(`${theme.bold(theme.fg("warning", "Update Available"))}\n${updateInstruction}`, 1, 0),
 		);
-		if (note) {
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(
-				new Markdown(
-					note,
-					1,
-					0,
-					this.getMarkdownThemeWithSettings(),
-					{
-						color: (text) => theme.fg("muted", text),
-					},
-					{
-						tableStyle: "compact",
-					},
-				),
-			);
-			this.chatContainer.addChild(new Spacer(1));
-		}
-		this.chatContainer.addChild(new Text(changelogLine, 1, 0));
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
 		this.ui.requestRender();
 	}

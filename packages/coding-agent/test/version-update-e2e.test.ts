@@ -53,7 +53,20 @@ describe.skipIf(process.platform === "win32")("version discovery through the sou
 	});
 
 	it.each([
-		{ name: "fresh install with a newer release", settings: {}, expectedRequests: 1, showChangelog: false },
+		{
+			name: "fresh install with a newer release",
+			settings: {},
+			expectedRequests: 1,
+			showChangelog: false,
+			showUpdate: true,
+		},
+		{
+			name: "current install with no newer release",
+			settings: {},
+			version: installed.version,
+			expectedRequests: 1,
+			showChangelog: false,
+		},
 		{
 			name: "upgrade with legacy telemetry enabled and delayed network failure",
 			settings: { lastChangelogVersion: "0.0.0", collapseChangelog: true, enableInstallTelemetry: true },
@@ -79,36 +92,44 @@ describe.skipIf(process.platform === "win32")("version discovery through the sou
 			expectedRequests: 0,
 			showChangelog: false,
 		},
-	])("accepts input and exits quietly for $name", async ({ expectedRequests, showChangelog, ...options }) => {
-		const result = await reproduce({ ...options, interactive: true, sharedTempDir, packageName: installed.name });
-		expect(result.code, result.output).toBe(0);
-		expect(result.quitSent).toBe(true);
-		expect(result.interactions).toEqual(["ci-ready", "ci-settled"]);
-		expect(result.inputBeforeResponse).toBe(options.delayResponse === true);
-		expect(result.settings).toEqual({
-			theme: "dark",
-			packages: [],
-			...options.settings,
-			lastChangelogVersion: checkpoint,
-		});
-		if (expectedRequests) {
-			expectCanonicalRequest(result.events);
-			expect(result.events.filter((event) => event.type === "discovery-settled")).toHaveLength(1);
-		} else {
-			expect(
-				result.events.filter((event) => event.type === "request" || event.type === "discovery-settled"),
-			).toEqual([]);
-		}
-		expect(result.events.filter((event) => event.type === "spawn" || event.type === "spawnSync")).toEqual([
-			{ type: "spawnSync", command: "fd", args: ["--version"] },
-			{ type: "spawnSync", command: "rg", args: ["--version"] },
-		]);
-		expect(result.output.includes("What's new"), result.output).toBe(showChangelog);
-		expect(result.output.includes("Controlled upgrade release."), result.output).toBe(showChangelog);
-		expect(result.output).not.toMatch(
-			/New version|Could not determine latest|controlled network failure|update service|No published Diffex release|Refusing self-update/,
-		);
-	});
+	])(
+		"accepts input and exits for $name",
+		async ({ expectedRequests, showChangelog, showUpdate = false, ...options }) => {
+			const result = await reproduce({ ...options, interactive: true, sharedTempDir, packageName: installed.name });
+			expect(result.code, result.output).toBe(0);
+			expect(result.quitSent).toBe(true);
+			expect(result.interactions).toEqual(["ci-ready", "ci-settled"]);
+			expect(result.inputBeforeResponse).toBe(options.delayResponse === true);
+			expect(result.settings).toEqual({
+				theme: "dark",
+				packages: [],
+				...options.settings,
+				lastChangelogVersion: checkpoint,
+			});
+			if (expectedRequests) {
+				expectCanonicalRequest(result.events);
+				expect(result.events.filter((event) => event.type === "discovery-settled")).toHaveLength(1);
+			} else {
+				expect(
+					result.events.filter((event) => event.type === "request" || event.type === "discovery-settled"),
+				).toEqual([]);
+			}
+			expect(result.events.filter((event) => event.type === "spawn" || event.type === "spawnSync")).toEqual([
+				{ type: "spawnSync", command: "fd", args: ["--version"] },
+				{ type: "spawnSync", command: "rg", args: ["--version"] },
+			]);
+			expect(result.output.includes("What's new"), result.output).toBe(showChangelog);
+			expect(result.output.includes("Controlled upgrade release."), result.output).toBe(showChangelog);
+			expect(result.output.includes("Update Available"), result.output).toBe(showUpdate);
+			expect(result.output.includes("New version 9999.0.0 is available. Run diffex update"), result.output).toBe(
+				showUpdate,
+			);
+			expect(result.output).not.toContain("Changelog:");
+			expect(result.output).not.toMatch(
+				/Could not determine latest|controlled network failure|update service|No published Diffex release|Refusing self-update/,
+			);
+		},
+	);
 
 	it("installs the exact canonical newer version after automatic opt-out without uninstalling", async () => {
 		const result = await reproduce({ sharedTempDir, skip: true, packageName: installed.name });

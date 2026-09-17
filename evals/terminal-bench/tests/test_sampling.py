@@ -28,12 +28,13 @@ class SamplingTests(unittest.TestCase):
         self.started = []
         self.cleaned = []
         self.fail_trial = False
+        self.sample_count = 5
 
         async def create(config):
             # The complete selection must be durable before any remote work.
             gate = read_json(self.root / "sample/gate.json")
             self.assertEqual(gate["identity_sha256"], fingerprint(gate["identity"]))
-            self.assertEqual(len(gate["identity"]["sample"]["tasks"]), 5)
+            self.assertEqual(len(gate["identity"]["sample"]["tasks"]), self.sample_count)
             self.assertEqual(config.agent.model_name, self.config.model)
             self.assertEqual(config.agent.kwargs, self.config.policy.model_dump(
                 include={"thinking", "tools", "subagents", "project_resources"}))
@@ -114,6 +115,49 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(gate["identity"]["sample"]["seed"], 123456)
         self.assertEqual(self.started, sample_tasks(list(self.tasks), 5, 123456))
 
+    def test_single_random_task_runs_once_and_verifies_without_prerequisites(self):
+        self.sample_count = 1
+        with patch("diffex_terminal_bench.benchmark.secrets.randbits", return_value=42):
+            self.cli("--random")
+        selected = sample_tasks(list(self.tasks), 1, 42)
+        self.assertEqual(self.started, selected)
+        self.assertEqual(len(self.cleaned), 1)
+        gate = read_json(self.root / "sample/gate.json")
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["expected_trials"], 1)
+        self.assertEqual(gate["completed_trials"], 1)
+        self.assertEqual(gate["identity"]["sample"], {"count": 1, "seed": 42, "tasks": selected})
+        self.assertFalse((self.root / "oracle").exists())
+        self.create.reset_mock()
+        with patch("diffex_terminal_bench.gate.validate_trial") as validate:
+            self.cli("--verify-sample")
+        self.assertEqual([call.args[1] for call in validate.call_args_list], selected)
+        self.create.assert_not_called()
+
+    def test_random_seed_replays_single_task_and_preserves_explicit_output(self):
+        self.sample_count = 1
+        output = self.cli("--random", "--seed", "0")
+        self.assertEqual(self.started, sample_tasks(list(self.tasks), 1, 0))
+        self.assertIn(f"Sample output: {self.root.resolve()}", output)
+        with self.assertRaises(FileExistsError):
+            self.cli("--random", "--seed", "0")
+        self.assertEqual(len(self.started), 1)
+
+    def test_random_defaults_to_unique_output_directories(self):
+        with patch("diffex_terminal_bench.benchmark.execute", new_callable=AsyncMock) as execute:
+            for _ in range(2):
+                with patch("sys.argv", ["benchmark", "--random"]), redirect_stdout(io.StringIO()):
+                    main()
+        roots = [call.args[3] for call in execute.call_args_list]
+        self.assertEqual(len(roots), 2)
+        self.assertNotEqual(roots[0], roots[1])
+        for call in execute.call_args_list:
+            self.assertEqual(call.args[3].parent, PACKAGE / "results")
+            self.assertTrue(call.args[3].name.startswith("sample-tb21-"))
+            self.assertEqual(call.args[2]["sample"]["count"], 1)
+            self.assertEqual(call.args[4:], ("sample", False))
+        self.create.assert_not_called()
+
     def test_failed_sample_finishes_remaining_tasks_and_cannot_verify(self):
         self.fail_trial = True
         with self.assertRaisesRegex(SystemExit, "completed 5 trials with 1 failed"):
@@ -180,7 +224,8 @@ class SamplingTests(unittest.TestCase):
     def test_invalid_flags_fail_before_dataset_or_remote_work(self):
         cases = [("--sample", "0"), ("--sample", "-1"), ("--sample", "90"), ("--sample", "1.5"),
                  ("--stage", "pilot", "--seed", "42"), ("--sample", "5", "--through", "integration"),
-                 ("--verify-sample", "--seed", "42")]
+                 ("--verify-sample", "--seed", "42"), ("--random", "--sample", "5"),
+                 ("--random", "--through", "integration"), ("--random", "--verify-sample")]
         for arguments in cases:
             with self.subTest(arguments=arguments), self.assertRaises(SystemExit) as error:
                 self.cli(*arguments)

@@ -18,6 +18,7 @@ from harbor.models.verifier.result import VerifierResult
 from harbor.upload.uploader import _create_job_archive_file, _load_job_from_disk, _read_trial_lock_for_upload
 
 from diffex_terminal_bench.benchmark import PACKAGE, trial_config
+from diffex_terminal_bench.config import PINS
 from diffex_terminal_bench.dataset import load_config
 from diffex_terminal_bench.export_job import export_job
 from diffex_terminal_bench.gate import fingerprint, inventory, read_json, sample_tasks, write_json
@@ -45,7 +46,7 @@ class ExportJobTests(unittest.TestCase):
             result = TrialResult(task_name=f"terminal-bench/{task}", trial_name=directory.name, trial_uri=directory.as_uri(),
                 task_id=trial.task.get_task_id(), task_checksum="a" * 64, config=trial,
                 source="terminal-bench@2.1", started_at=now, finished_at=now,
-                agent_info=AgentInfo(name="diffex", version="0.2.4", model_info=ModelInfo(name="gpt-5.5", provider="openai")),
+                agent_info=AgentInfo(name="diffex", version=PINS["diffex_version"], model_info=ModelInfo(name="gpt-5.5", provider="openai")),
                 agent_result=AgentContext(n_input_tokens=20, n_output_tokens=5, cost_usd=0.01),
                 verifier_result=VerifierResult(rewards={"reward": int(index != 2)}))
             lock = TrialLock(task=TaskLock(name=task, type="local", digest="sha256:" + "a" * 64),

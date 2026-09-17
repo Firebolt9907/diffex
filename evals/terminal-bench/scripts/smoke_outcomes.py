@@ -95,7 +95,9 @@ async def smoke(platform):
                     if expected != "completed":
                         assert not context.metadata["diffex_accounting"]["complete"]
                         assert context.n_input_tokens is None and context.cost_usd is None
-                    if scenario in ("authentication", "exhausted", "interrupted-output"):
+                    if scenario in ("authentication", "exhausted"):
+                        assert outcome["process"]["exit_code"] == 1, outcome
+                    if scenario == "interrupted-output":
                         assert outcome["process"]["exit_code"] == 0, outcome
                     if scenario == "recovered":
                         assert outcome["recovered_retries"] == 1, outcome

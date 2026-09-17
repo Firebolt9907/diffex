@@ -237,13 +237,14 @@ def verify_sample(config: BenchmarkConfig, root: Path, cache: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PACKAGE / "benchmark.toml")
-    parser.add_argument("--output", type=Path, default=PACKAGE / "results/release-gate")
+    parser.add_argument("--output", type=Path,
+                        help="Output directory (default: a fresh results/sample-tb21-* directory for --random; results/release-gate otherwise)")
     parser.add_argument("-n", "--concurrency", type=int,
                         help="Maximum simultaneous trials, including cleanup (default: config concurrency or 1); use the same value for every stage and verification")
     parser.add_argument("--dataset-cache", type=Path, default=PACKAGE / "results/dataset-cache",
                         help="Shared archive cache; every use verifies the pinned SHA-256")
     parser.add_argument("--results-dir", type=Path, help="Directory to scan with --refresh-index (defaults to the output parent)")
-    parser.add_argument("--seed", type=int, help="Reproducible task selection for --sample (default: generate and record a seed)")
+    parser.add_argument("--seed", type=int, help="Reproducible task selection for --sample or --random (default: generate and record a seed)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--prepare", action="store_true", help="Verify dataset and report stage sizes without creating sandboxes")
     mode.add_argument("--refresh-index", action="store_true", help="Rebuild index.md from local reports without downloads or API calls")
@@ -252,10 +253,13 @@ def main() -> None:
     mode.add_argument("--verify-through", choices=STAGES, help="Recheck retained or downloaded stage evidence without API calls")
     mode.add_argument("--through", choices=STAGES[:-1], help="Run prerequisite stages in order; stops on first failure")
     mode.add_argument("--sample", type=int, metavar="COUNT", help="Run COUNT distinct random tasks once, without prerequisite stages")
+    mode.add_argument("--random", action="store_true", help="Run exactly one random task without prerequisites, using a fresh output directory by default")
     mode.add_argument("--verify-sample", action="store_true", help="Recheck the saved sample selection and evidence without sandbox or model calls")
     args = parser.parse_args()
+    if args.random:
+        args.sample = 1
     if args.seed is not None and args.sample is None:
-        parser.error("--seed requires --sample")
+        parser.error("--seed requires --sample or --random")
     if args.sample is not None and args.sample < 1:
         parser.error("--sample must be a positive integer")
     if args.results_dir is not None and not args.refresh_index:
@@ -263,7 +267,11 @@ def main() -> None:
     if args.concurrency is not None and args.concurrency < 1:
         parser.error("--concurrency must be a positive integer")
     os.umask(0o077)
-    root = args.output.resolve()
+    default_output = PACKAGE / "results/release-gate"
+    if args.random:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        default_output = PACKAGE / "results" / f"sample-tb21-{timestamp}-{uuid.uuid4().hex}"
+    root = (args.output or default_output).resolve()
     if args.diagnose_trial:
         directory = args.diagnose_trial.resolve()
         print(f"{directory.name}: {describe_failure(diagnose_trial(directory))}")
@@ -300,7 +308,8 @@ def main() -> None:
             seed = args.seed if args.seed is not None else secrets.randbits(64)
             selected = sample_tasks(list(tasks), args.sample, seed)
             identity["sample"] = {"count": args.sample, "seed": seed, "tasks": selected}
-            print(f"Sample seed: {seed}; {len(selected)} tasks: {', '.join(selected)}", flush=True)
+            print(f"Sample seed: {seed}; selected tasks ({len(selected)}): {', '.join(selected)}", flush=True)
+            print(f"Sample output: {root}", flush=True)
         if args.verify_through:
             require_previous(root, args.verify_through, identity, config.pilot_tasks, list(tasks), include_current=True)
             refresh_index(root.parent)

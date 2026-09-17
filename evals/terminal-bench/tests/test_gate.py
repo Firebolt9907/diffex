@@ -1,19 +1,26 @@
 """Gate regressions exercise real native parsing and ATIF conversion."""
 
+import asyncio
 import copy
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, TrialConfig
 
+from diffex_terminal_bench.benchmark import PACKAGE, main, run_stage
 from diffex_terminal_bench.config import PINS
+from diffex_terminal_bench.dataset import BenchmarkConfig, load_config
+from diffex_terminal_bench.execution import SUBAGENT_TOOLS
 from diffex_terminal_bench.gate import inventory, require_previous, sha256, stage_tasks, validate_trial, write_json
 from diffex_terminal_bench.outcome import parse_outcome
 from diffex_terminal_bench.trajectory import export_trajectory
-from test_trajectory import assistant, entry
+from test_trajectory import USAGE, assistant, entry, interrupted_child_records
 
 
 class GateTests(unittest.TestCase):
@@ -80,6 +87,187 @@ class GateTests(unittest.TestCase):
         data = json.loads(path.read_text())
         data[key] = value
         write_json(path, data)
+
+    def write_interrupted_child(self, **options):
+        self.identity["policy"]["subagents"] = "enabled"
+        for name in ("requested.json", "effective.json"):
+            self.mutate(self.run / name, "subagents", "enabled")
+            self.mutate(self.run / name, "tools", ["bash", *SUBAGENT_TOOLS])
+        for name in ("config.json", "lock.json"):
+            document = json.loads((self.directory / name).read_text())
+            document["agent"]["kwargs"] = self.identity["policy"].copy()
+            write_json(self.directory / name, document)
+        root, child = interrupted_child_records(**options)
+        # Keep the final root response identical to the completed stdout stream.
+        root[-1] = entry("one", assistant("response"))
+        for name, records in (("root", root), ("child", child)):
+            path = self.run / "sessions" / ("root.jsonl" if name == "root" else ".subagents/child.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("".join(json.dumps(record) + "\n" for record in [{"type": "session", "id": name}, *records]))
+        self.reexport()
+
+    def reexport(self):
+        context = AgentContext()
+        export_trajectory(self.run, self.directory / "agent/trajectory.json", context,
+                          json.loads((self.run / "outcome.json").read_text()))
+        self.mutate(self.directory / "result.json", "agent_result", context.model_dump(mode="json"))
+
+    def test_intentional_interruption_passes_with_partial_usage_and_zero_reward(self):
+        self.write_interrupted_child()
+        report = validate_trial(self.directory, "task", self.identity)
+        self.assertEqual(report["rewards"], {"reward": 0})
+        self.assertEqual(report["usage"]["prompt_tokens"], 76)
+        self.assertFalse(report["usage_complete"])
+        self.assertEqual(report["usage_missing_fields"], ["cached_tokens", "completion_tokens", "cost_usd", "prompt_tokens"])
+
+    def test_partial_accounting_still_rejects_corruption_and_execution_errors(self):
+        cases = [{"status": "running"}, {"interrupt_error": True}, {"stop_reason": "error"},
+                 {"usage": {**USAGE, "input": -1}}, {"usage": {**USAGE, "cost": {"total": "invalid"}}}]
+        for options in cases:
+            with self.subTest(options=options):
+                self.write_interrupted_child(**options)
+                with self.assertRaisesRegex(ValueError, "Native evidence is incomplete"):
+                    validate_trial(self.directory, "task", self.identity)
+        self.write_interrupted_child()
+        child = self.run / "sessions/.subagents/child.jsonl"
+        child.write_text(child.read_text() + '{"type":\n')
+        self.reexport()
+        with self.assertRaisesRegex(ValueError, "invalid_record"):
+            validate_trial(self.directory, "task", self.identity)
+        child.unlink()
+        self.reexport()
+        with self.assertRaisesRegex(ValueError, "missing_child_trajectory"):
+            validate_trial(self.directory, "task", self.identity)
+
+    def test_partial_accounting_and_harbor_totals_must_still_reconcile(self):
+        self.write_interrupted_child()
+        result_path = self.directory / "result.json"
+        original = result_path.read_bytes()
+        for field in ("n_input_tokens", "n_output_tokens", "n_cache_tokens", "cost_usd", "model_usage"):
+            result = json.loads(original)
+            result["agent_result"][field] = None
+            write_json(result_path, result)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "usage differs"):
+                validate_trial(self.directory, "task", self.identity)
+        result = json.loads(original)
+        result["agent_result"]["metadata"]["diffex_accounting"]["complete"] = True
+        write_json(result_path, result)
+        with self.assertRaisesRegex(ValueError, "accounting metadata differs"):
+            validate_trial(self.directory, "task", self.identity)
+        result_path.write_bytes(original)
+        self.mutate(self.run / "accounting.json", "complete", True)
+        with self.assertRaisesRegex(ValueError, "does not reconcile"):
+            validate_trial(self.directory, "task", self.identity)
+
+    def test_stage_continues_after_partial_usage_with_real_gate_validation(self):
+        self.write_interrupted_child()
+        pilot = ["task", *[f"task-{index}" for index in range(2, 11)]]
+        identity = {**self.identity, "task_digests": {name: "sha256:task" for name in pilot}}
+        config = BenchmarkConfig.model_validate({**load_config(PACKAGE / "benchmark.toml").model_dump(),
+                                                "model": "openai/gpt-5", "policy": self.identity["policy"],
+                                                "pilot_tasks": pilot, "concurrency": 1})
+        calls = []
+
+        async def create(config):
+            calls.append(config.trial_name)
+            destination = config.trials_dir / config.trial_name
+            for path in self.directory.rglob("*"):
+                if path.is_file():
+                    target = destination / path.relative_to(self.directory)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(path.read_bytes())
+            return Mock(run=AsyncMock())
+
+        manager = Mock(_cleanup=AsyncMock())
+        with patch("diffex_terminal_bench.benchmark.require_previous"), \
+             patch("diffex_terminal_bench.benchmark.AsyncDaytona"), \
+             patch("diffex_terminal_bench.benchmark.Trial.create", side_effect=create), \
+             patch("diffex_terminal_bench.benchmark.Packager.compute_content_hash", return_value=("task", [])), \
+             patch("diffex_terminal_bench.benchmark.confirm_cleanup", new_callable=AsyncMock,
+                   return_value={"confirmed": True, "unexpected_sandboxes": []}), \
+             patch("diffex_terminal_bench.benchmark.DaytonaClientManager.get_instance", new_callable=AsyncMock, return_value=manager):
+            asyncio.run(run_stage(config, {name: Path(name) for name in pilot}, identity, self.root / "stages", "pilot"))
+        report = json.loads((self.root / "stages/pilot/gate.json").read_text())
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(calls), 10)
+        self.assertEqual([trial["task"] for trial in report["trials"]], pilot)
+        for trial in report["trials"]:
+            self.assertEqual(trial["evidence"]["rewards"], {"reward": 0})
+            self.assertFalse(trial["evidence"]["usage_complete"])
+            self.assertEqual(trial["evidence"]["usage"]["prompt_tokens"], 76)
+
+    def test_cli_finishes_stage_after_execution_evidence_and_cleanup_failures(self):
+        pilot = ["task", *[f"task-{index}" for index in range(2, 11)]]
+        config = BenchmarkConfig.model_validate({**load_config(PACKAGE / "benchmark.toml").model_dump(),
+                                                "model": "openai/gpt-5", "policy": self.identity["policy"],
+                                                "pilot_tasks": pilot, "concurrency": 3})
+        identity = {**self.identity, "task_digests": {name: "sha256:task" for name in pilot},
+                    "dataset": config.dataset.model_dump()}
+        started, cleaned = [], []
+        output = io.StringIO()
+        root = self.root / "stages"
+
+        async def create(config):
+            index = int(config.trial_name.split("-", 1)[0])
+            started.append(index)
+            destination = config.trials_dir / config.trial_name
+            for path in self.directory.rglob("*"):
+                if path.is_file():
+                    target = destination / path.relative_to(self.directory)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(path.read_bytes())
+            if index == 2:
+                self.mutate(destination / "result.json", "exception_info", {
+                    "exception_type": "AgentTimeoutError",
+                    "exception_message": "Agent execution timed out after 900.0 seconds"})
+            elif index == 3:
+                (destination / "agent/run-fixture/stderr.log").unlink()
+            elif index == 4:
+                (destination / "result.json").write_text("{")
+            elif index == 5:
+                self.mutate(destination / "agent/run-fixture/process.json", "exit_code", 1)
+            elif index == 7:
+                raise RuntimeError("private provider error")
+            return Mock(run=AsyncMock())
+
+        async def cleanup(client, directory, label):
+            index = int(directory.name.split("-", 1)[0])
+            cleaned.append(index)
+            report = {"confirmed": index != 6, "unexpected_sandboxes": []}
+            write_json(directory / "sandbox-cleanup.json", report)
+            return report
+
+        manager = Mock(_cleanup=AsyncMock())
+        with patch("sys.argv", ["benchmark", "--stage", "pilot", "--output", str(root)]), \
+             patch("diffex_terminal_bench.benchmark.load_config", return_value=config), \
+             patch("diffex_terminal_bench.benchmark.preflight"), \
+             patch("diffex_terminal_bench.benchmark.prepare_dataset") as prepare, \
+             patch("diffex_terminal_bench.benchmark.run_identity", return_value=identity), \
+             patch("diffex_terminal_bench.benchmark.require_previous"), \
+             patch("diffex_terminal_bench.benchmark.AsyncDaytona"), \
+             patch("diffex_terminal_bench.benchmark.Trial.create", side_effect=create), \
+             patch("diffex_terminal_bench.benchmark.Packager.compute_content_hash", return_value=("task", [])), \
+             patch("diffex_terminal_bench.benchmark.confirm_cleanup", side_effect=cleanup), \
+             patch("diffex_terminal_bench.benchmark.DaytonaClientManager.get_instance", return_value=manager), \
+             redirect_stdout(output):
+            prepare.return_value.__enter__.return_value = ({name: Path(name) for name in pilot}, identity["task_digests"])
+            with self.assertRaises(SystemExit) as error:
+                main()
+        report = json.loads((root / "pilot/gate.json").read_text())
+        self.assertEqual(started, list(range(1, 11)))
+        self.assertEqual(sorted(cleaned), started)
+        self.assertEqual(report["completed_trials"], 10)
+        self.assertFalse(report["passed"])
+        self.assertIn("finished_at", report)
+        self.assertEqual([row["trial_index"] for row in report["failures"]], list(range(2, 8)))
+        self.assertEqual(len(report["trials"]), 4)
+        self.assertTrue(all(row["evidence"]["rewards"] == {"reward": 0} for row in report["trials"]))
+        self.assertIn("completed 10 trials with 6 failed", str(error.exception.code))
+        self.assertTrue(error.exception.__suppress_context__)
+        self.assertNotIn("private provider error", output.getvalue() + json.dumps(report))
+        self.assertEqual((root / "pilot/004-task-4/result.json").read_text(), "{")
+        self.assertIn("failed; 10/10 completed; 4 checked; 6 failed", (self.root / "index.md").read_text())
+        manager._cleanup.assert_awaited_once()
 
     def test_zero_reward_is_valid_benchmark_result(self):
         report = validate_trial(self.directory, "task", self.identity)

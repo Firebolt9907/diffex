@@ -7,6 +7,7 @@ from importlib.metadata import version
 import os
 from pathlib import Path
 import platform
+import secrets
 import signal
 import subprocess
 import uuid
@@ -21,12 +22,18 @@ from diffex_terminal_bench.adapter import DiffexAgent
 from diffex_terminal_bench.config import PINS
 from diffex_terminal_bench.dataset import BenchmarkConfig, load_config, prepare_dataset
 from diffex_terminal_bench.daytona_backend import confirm_cleanup
+from diffex_terminal_bench.diagnostics import TrialExecutionFailure, describe_failure, diagnose_trial
 from diffex_terminal_bench.execution import PROVIDER_ENV
-from diffex_terminal_bench.gate import STAGES, fingerprint, inventory, require_previous, sha256, stage_tasks, validate_trial, write_json
+from diffex_terminal_bench.gate import STAGES, fingerprint, inventory, read_json, require_previous, sample_tasks, sha256, stage_tasks, validate_trial, verify_stage, write_json
+from diffex_terminal_bench.summary import refresh_index, write_index
 
 
 PACKAGE = Path(__file__).resolve().parents[2]
 REPOSITORY = PACKAGE.parents[1]
+
+
+class StageFailedError(RuntimeError):
+    """Expected qualification failure after all started trials are cleaned up."""
 
 
 def preflight(config: BenchmarkConfig, *, oracle: bool) -> None:
@@ -52,7 +59,7 @@ def run_identity(config: BenchmarkConfig, digests: dict) -> dict:
             "daytona_api_url": os.environ.get("DAYTONA_API_URL", "https://app.daytona.io/api"),
             "harness_files": {path.name: sha256(path) for path in sorted(Path(__file__).parent.iterdir()) if path.is_file()},
             "release_agents_sha256": sha256(Path(__file__).with_name("release-agents.md")),
-            "timeout_multiplier": 1.0, "resource_overrides": None, "concurrency": 1, "harbor_retries": 0}
+            "timeout_multiplier": 1.0, "resource_overrides": None, "concurrency": config.concurrency, "harbor_retries": 0}
 
 
 def trial_config(config: BenchmarkConfig, task_path: Path, directory: Path, label: str, *, oracle: bool) -> TrialConfig:
@@ -71,16 +78,34 @@ def trial_config(config: BenchmarkConfig, task_path: Path, directory: Path, labe
 
 
 async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: dict, root: Path, stage: str) -> None:
-    require_previous(root, stage, identity, config.pilot_tasks, list(tasks))
-    selected = stage_tasks(stage, config.pilot_tasks, list(tasks))
+    if stage != "sample":
+        require_previous(root, stage, identity, config.pilot_tasks, list(tasks))
+    selected = stage_tasks(stage, config.pilot_tasks, list(tasks), sample=identity.get("sample"))
     directory = root / stage
     directory.mkdir(parents=True)  # Never overwrite a previous attempt.
     report = {"schema_version": 1, "stage": stage, "identity": identity, "identity_sha256": fingerprint(identity),
-              "started_at": datetime.now(timezone.utc).isoformat(), "passed": False, "trials": []}
+              "started_at": datetime.now(timezone.utc).isoformat(), "passed": False, "trials": [],
+              "failures": [], "completed_trials": 0, "expected_trials": len(selected)}
     write_json(directory / "gate.json", report)
+    refresh_index(root.parent)
     try:
         async with AsyncDaytona() as client:
-            for index, task in enumerate(selected, 1):
+            pending = iter(enumerate(selected, 1))
+
+            def record_failure(index: int, task: str, exc: BaseException, phase: str) -> None:
+                failure = {"error": type(exc).__name__, "trial_index": index,
+                           "task": task, "directory": f"{index:03d}-{task}", "phase": phase}
+                if isinstance(exc, TrialExecutionFailure):
+                    failure["diagnostics"] = exc.details
+                previous = next((row for row in report["failures"] if row["trial_index"] == index), None)
+                if previous is not None:
+                    previous.setdefault("additional_errors", []).append(failure)
+                    return
+                report["failures"].append(failure)
+                report["failures"].sort(key=lambda row: row["trial_index"])
+                report.setdefault("failure", failure)
+
+            async def run_trial(index: int, task: str) -> None:
                 trial_dir = directory / f"{index:03d}-{task}"
                 label = uuid.uuid4().hex
                 trial_dir.mkdir()
@@ -91,6 +116,9 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                         raise ValueError("Task content changed after dataset verification")
                     trial = await Trial.create(trial_config(config, tasks[task], trial_dir, label, oracle=stage == "oracle"))
                     await trial.run()
+                except BaseException as exc:
+                    record_failure(index, task, exc, "execution")
+                    raise
                 finally:
                     cleanup = asyncio.create_task(confirm_cleanup(client, trial_dir, label))
                     cancelled = False
@@ -101,23 +129,75 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                             # Preserve evidence and finish remote deletion even
                             # when SIGTERM arrives during a cancelled trial.
                             cancelled = True
-                    cleanup.result()
-                    if cancelled:
-                        raise asyncio.CancelledError
+                        except Exception:
+                            break
+                    try:
+                        cleanup_report = cleanup.result()
+                        if cleanup_report.get("confirmed") is not True or cleanup_report.get("unexpected_sandboxes", []):
+                            raise ValueError("Sandbox cleanup failed or required recovery")
+                    except BaseException as exc:
+                        record_failure(index, task, exc, "cleanup")
+                        raise
+                    finally:
+                        if cancelled:
+                            raise asyncio.CancelledError
                 evidence = validate_trial(trial_dir, task, identity, oracle=stage == "oracle")
                 report["trials"].append({"task": task, "directory": trial_dir.name,
                                          "evidence": evidence, "files": inventory(trial_dir)})
-                write_json(directory / "gate.json", report)
+                report["trials"].sort(key=lambda row: row["directory"])
+
+            async def worker() -> None:
+                # A slot includes installation, execution, verification, and
+                # the cleanup attempt, even when this trial fails.
+                while True:
+                    item = next(pending, None)
+                    if item is None:
+                        return
+                    index, task = item
+                    try:
+                        await run_trial(index, task)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        if not any(row["trial_index"] == index for row in report["failures"]):
+                            record_failure(index, task, exc, "trial")
+                        # A cancelled stage still stops scheduling. A trial
+                        # raising CancelledError on its own must not lose a slot.
+                        if asyncio.current_task().cancelling():
+                            raise asyncio.CancelledError from exc
+                        failure = next(row for row in report["failures"] if row["trial_index"] == index)
+                        reason = describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure["error"]
+                        print(f"{stage} {index}/{len(selected)}: failed: {reason}. "
+                              f"Evidence: {directory / failure['directory']}. Continuing remaining trials.", flush=True)
+                    report["completed_trials"] += 1
+                    write_json(directory / "gate.json", report)
+                    refresh_index(root.parent)
+
+            # Only stage-level failures or explicit cancellation cancel peers.
+            # Wait for every started trial's cleanup before closing clients.
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(config.concurrency, len(selected))):
+                    group.create_task(worker())
+            if report["completed_trials"] != len(selected):
+                raise RuntimeError("Stage did not complete every selected trial")
+        if report["failures"]:
+            failure = report["failure"]
+            reason = describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure["error"]
+            raise StageFailedError(f"{stage}: completed {len(selected)} trials with {len(report['failures'])} failed; "
+                                   f"qualification failed. First failure: {reason}. "
+                                   f"Evidence: {directory / failure['directory']}. All failures: {directory / 'gate.json'}.")
         report["passed"] = True
     except BaseException as exc:
-        report["failure"] = {"error": type(exc).__name__, "trial_index": len(report["trials"]) + 1}
+        report.setdefault("failure", {"error": type(exc).__name__})
         raise
     finally:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_json(directory / "gate.json", report)
-        # Harbor owns a separate singleton HTTP client; close it on this loop.
-        manager = await DaytonaClientManager.get_instance()
-        await manager._cleanup()
+        try:
+            write_json(directory / "gate.json", report)
+            refresh_index(root.parent)
+        finally:
+            # Harbor owns a separate singleton HTTP client; close it even if
+            # writing the final report fails.
+            manager = await DaytonaClientManager.get_instance()
+            await manager._cleanup()
     print(f"{stage}: passed; evidence: {directory}", flush=True)
 
 
@@ -132,34 +212,104 @@ async def execute(config: BenchmarkConfig, tasks: dict, identity: dict, root: Pa
         loop.remove_signal_handler(signal.SIGTERM)
 
 
+def verify_sample(config: BenchmarkConfig, root: Path, cache: Path) -> None:
+    directory = root / "sample"
+    report = read_json(directory / "gate.json")
+    if not report.get("finished_at"):
+        raise ValueError(f"sample: no final report; the run is still running or was interrupted. "
+                         f"Wait for completion before verification. Evidence: {directory / 'gate.json'}")
+    if report.get("passed") is not True:
+        failure = report.get("failure") or {}
+        reason = describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure.get("error", "unknown error")
+        raise ValueError(f"sample: recorded run did not pass ({report.get('completed_trials', 'unknown')}/"
+                         f"{report.get('expected_trials', 'unknown')} trials completed). "
+                         f"First failure: {failure.get('directory', 'see gate.json')}: {reason}. "
+                         f"Evidence: {directory / 'gate.json'}. --verify-sample requires a passing run. "
+                         "To export retained terminal results, use diffex_terminal_bench.export_job with --allow-partial.")
+    with prepare_dataset(config, cache) as (tasks, digests):
+        identity = run_identity(config, digests)
+        identity["sample"] = report["identity"].get("sample")
+        verify_stage(root, "sample", identity, config.pilot_tasks, list(tasks))
+    refresh_index(root.parent)
+    print(f"Verified retained sample evidence: {directory}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PACKAGE / "benchmark.toml")
     parser.add_argument("--output", type=Path, default=PACKAGE / "results/release-gate")
+    parser.add_argument("-n", "--concurrency", type=int,
+                        help="Maximum simultaneous trials, including cleanup (default: config concurrency or 1); use the same value for every stage and verification")
+    parser.add_argument("--dataset-cache", type=Path, default=PACKAGE / "results/dataset-cache",
+                        help="Shared archive cache; every use verifies the pinned SHA-256")
+    parser.add_argument("--results-dir", type=Path, help="Directory to scan with --refresh-index (defaults to the output parent)")
+    parser.add_argument("--seed", type=int, help="Reproducible task selection for --sample (default: generate and record a seed)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--prepare", action="store_true", help="Verify dataset and report stage sizes without creating sandboxes")
+    mode.add_argument("--refresh-index", action="store_true", help="Rebuild index.md from local reports without downloads or API calls")
+    mode.add_argument("--diagnose-trial", type=Path, help="Explain a retained trial failure without downloads or API calls")
     mode.add_argument("--stage", choices=STAGES)
     mode.add_argument("--verify-through", choices=STAGES, help="Recheck retained or downloaded stage evidence without API calls")
     mode.add_argument("--through", choices=STAGES[:-1], help="Run prerequisite stages in order; stops on first failure")
+    mode.add_argument("--sample", type=int, metavar="COUNT", help="Run COUNT distinct random tasks once, without prerequisite stages")
+    mode.add_argument("--verify-sample", action="store_true", help="Recheck the saved sample selection and evidence without sandbox or model calls")
     args = parser.parse_args()
+    if args.seed is not None and args.sample is None:
+        parser.error("--seed requires --sample")
+    if args.sample is not None and args.sample < 1:
+        parser.error("--sample must be a positive integer")
+    if args.results_dir is not None and not args.refresh_index:
+        parser.error("--results-dir requires --refresh-index")
+    if args.concurrency is not None and args.concurrency < 1:
+        parser.error("--concurrency must be a positive integer")
     os.umask(0o077)
-    config = load_config(args.config)
     root = args.output.resolve()
-    stage = args.stage or args.through
+    if args.diagnose_trial:
+        directory = args.diagnose_trial.resolve()
+        print(f"{directory.name}: {describe_failure(diagnose_trial(directory))}")
+        print(f"Retained evidence: {directory}")
+        return
+    if args.refresh_index:
+        directory = args.results_dir.resolve() if args.results_dir is not None else root.parent
+        print(f"Updated run index: {write_index(directory)}")
+        return
+    config = load_config(args.config)
+    if args.sample is not None and args.sample > config.dataset.task_count:
+        parser.error(f"--sample cannot exceed the dataset's {config.dataset.task_count} tasks")
+    if args.concurrency is not None:
+        config = BenchmarkConfig.model_validate({**config.model_dump(), "concurrency": args.concurrency})
+    if args.verify_sample:
+        try:
+            verify_sample(config, root, args.dataset_cache.resolve())
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise SystemExit(f"Sample verification failed: {exc}") from None
+        return
+    stage = "sample" if args.sample is not None else args.stage or args.through
     if not args.prepare and not args.verify_through:
         preflight(config, oracle=stage == "oracle")
-    with prepare_dataset(config, root / "dataset-cache") as (tasks, digests):
+    with prepare_dataset(config, args.dataset_cache.resolve()) as (tasks, digests):
         if args.prepare:
             write_json(root / "dataset.json", {"dataset": config.dataset.model_dump(), "task_digests": digests,
+                       "model": config.model, "policy": config.policy.model_dump(), "concurrency": config.concurrency,
                        "stages": {name: len(stage_tasks(name, config.pilot_tasks, list(tasks))) for name in STAGES}})
+            refresh_index(root.parent)
             print(f"Verified {len(tasks)} pinned tasks: {root / 'dataset.json'}")
             return
         identity = run_identity(config, digests)
+        if args.sample is not None:
+            seed = args.seed if args.seed is not None else secrets.randbits(64)
+            selected = sample_tasks(list(tasks), args.sample, seed)
+            identity["sample"] = {"count": args.sample, "seed": seed, "tasks": selected}
+            print(f"Sample seed: {seed}; {len(selected)} tasks: {', '.join(selected)}", flush=True)
         if args.verify_through:
             require_previous(root, args.verify_through, identity, config.pilot_tasks, list(tasks), include_current=True)
+            refresh_index(root.parent)
             print(f"Verified retained evidence through {args.verify_through}: {root}")
             return
-        asyncio.run(execute(config, tasks, identity, root, stage, bool(args.through)))
+        try:
+            asyncio.run(execute(config, tasks, identity, root, stage, bool(args.through)))
+        except StageFailedError as exc:
+            raise SystemExit(str(exc)) from None
 
 
 if __name__ == "__main__":

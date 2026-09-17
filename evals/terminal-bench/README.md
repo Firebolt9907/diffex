@@ -5,6 +5,7 @@ Execution uses explicit model and harness policies, fresh trial state, and retai
 Execution outcomes include native stream completion, terminal assistant state, retries, process status, configuration, and cleanup verification.
 ATIF export and usage accounting run after evidence recovery, including interrupted trials.
 The [staged benchmark release gate](RELEASE_GATE.md) pins dataset inputs and verifies retained evidence before larger Daytona runs.
+Use the [offline job exporter](RELEASE_GATE.md#export-retained-trials-for-harbor-hub) to package existing stage results for Harbor Hub without rerunning evaluations.
 This integration is not yet ready for leaderboard runs.
 
 ## Host setup
@@ -159,7 +160,7 @@ uv run --locked harbor run --config execution.yaml \
 
 [execution.yaml](execution.yaml) records the default policy and allows 630 seconds for Harbor setup, encompassing the installer's 600-second deadline and transport overhead.
 The task's agent timeout remains in effect.
-Use `--ak thinking=medium`, `--ak tools=read,bash,edit,write`, or `--ak subagents=enabled` to change the corresponding policy explicitly.
+Use `--ak thinking=medium`, `--ak tools=read,bash,edit,write`, or `--ak subagents=disabled` to change the corresponding policy explicitly.
 Inspect accepted options with `uv run --locked harbor agent schema diffex_terminal_bench.adapter:DiffexAgent`.
 Unknown options, arbitrary native config, prompt templates, injected skills, and MCP servers are rejected.
 Model IDs must include a supported provider prefix; fuzzy patterns and thinking suffixes are rejected.
@@ -204,8 +205,11 @@ The pinned npm `0.2.4` release includes `dist/AGENTS.md`, which matches the adap
 The adapter retains that packaged context without adding a global duplicate.
 The effective system prompt must contain the release instructions, and their SHA-256 is recorded.
 
-Subagents are disabled by omitting coordination tools from the explicit tool allowlist.
-Enabling them adds `spawn_agent`, `agent_action`, and `agents`; the pinned CLI owns child scheduling and its default concurrency limit.
+The checked-in `benchmark.toml` and `execution.yaml` enable subagents, adding `spawn_agent`, `agent_action`, and `agents` to the explicit tool allowlist.
+Diffex decides whether to call those tools; enabling them does not require a child on every task.
+Children share their trial's sandbox, and the pinned CLI owns child scheduling and its default concurrency limit.
+The staged runner's `-n/--concurrency` controls simultaneous trials and sandboxes separately.
+An adapter invocation that omits the subagent policy still defaults to disabled, omitting coordination tools.
 Root and child sessions are retained together beneath `run-<uuid>/sessions/`, including the parent-owned child session directories.
 
 ### Execution evidence
@@ -225,7 +229,7 @@ Each run directory retains:
 
 Harbor collects the agent log tree after the run; avoid log filters that exclude these paths.
 `trajectory.json` sits directly under Harbor's agent log directory, with embedded child trajectories and optional `trajectory-media/` image files.
-Provider usage fields in `AgentContext` contain reconciled totals when the evidence establishes them.
+Provider usage fields in `AgentContext` contain reconciled sums of recorded usage, with accounting completeness recorded separately.
 `AgentContext.metadata.diffex_outcome` contains the execution outcome, and `diffex_run_dir` identifies its artifacts.
 
 ### Execution outcomes and interruption recovery
@@ -298,6 +302,9 @@ Repeated roster snapshots do not duplicate children or their usage.
 Nested child trajectories are embedded with resolvable `trajectory_id` references so uploading the root JSON also uploads their steps.
 Missing child sessions, missing observations, and incomplete child execution are explicit accounting gaps.
 Recoverable orphan child histories are embedded with an unresolved-link diagnostic.
+A child marked `interrupted` in the parent roster is a valid terminal state when a successful parent `agent_action` interrupt call establishes intent.
+An intentional stop can end during a model response or tool execution; it does not require an additional final assistant reply.
+Child provider errors and interruptions without that evidence remain invalid.
 
 | Native Diffex usage | ATIF step metric | Harbor `AgentContext` |
 | --- | --- | --- |
@@ -315,16 +322,21 @@ The root context totals visit each native session exactly once, without summing 
 
 Compaction and branch-summary entries contribute their `usage` when available, without dropping the earlier responses they summarize.
 Their model attribution is `unattributed` because those entries do not identify the model that produced the summary.
-Missing summary usage or a compaction start without a persisted summary marks accounting incomplete.
-Work with no native telemetry cannot be reconstructed, and interrupted runs cannot establish a complete total.
+Missing summary usage marks accounting incomplete; a compaction start without a persisted summary also leaves an evidence gap.
+Work with no native telemetry cannot be reconstructed; an aborted request without telemetry prevents a complete total.
 An all-zero native usage object is treated as unverified because Diffex initializes those fields before receiving provider usage.
-Missing or invalid individual usage fields remain unknown; other measured fields can still have totals when the rest of the execution evidence is complete.
+Missing individual usage fields remain unknown; invalid values are evidence errors.
 
 `AgentContext.metadata.diffex_accounting` and `accounting.json` retain observed lower bounds, missing fields, and structural gaps.
-Unknown context totals are `null`, and unknown ATIF totals are omitted.
+When execution evidence is valid, totals retain the known usage across the root and all children even if individual requests lack telemetry.
+Such totals are partial lower bounds, with `complete: false` in accounting and `accounting_complete: false` in ATIF final-metric metadata.
+Fields with no known observations remain `null` in context totals and are omitted from ATIF totals.
+Structural evidence gaps still invalidate totals and fail qualification.
 `model_usage` contains per-model totals when accounting is complete; otherwise it is empty to prevent Harbor from backfilling incomplete token data as zero.
+Per-model observations remain available in `observed_model_usage` even when accounting is partial.
 `diffex_trajectory.validated` records successful export, and `accounting_complete` separately records accounting completeness.
 Verifier reward is independent of accounting completeness.
+The internal qualification gate accepts valid executions with partial accounting, records `usage_complete` and `usage_missing_fields`, and continues the stage.
 
 For leaderboard validation, require a validated trajectory and complete accounting for every rewarded trial, then upload the entire agent log tree including `trajectory.json` and `trajectory-media/`.
 Validate the downloaded/uploaded artifact copy using the command below; a local export alone is not proof of remote upload.

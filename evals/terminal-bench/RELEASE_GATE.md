@@ -27,7 +27,9 @@ The preparation command writes `results/release-gate/dataset.json` without creat
 
 Harbor 0.23.0 and Daytona SDK 0.210.0 are locked in the benchmark's private Python environment.
 Node 22.23.2, Diffex 0.2.4, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
-The default is `openai/gpt-5`, `high` thinking, tools `read,bash,edit,write,update_plan`, disabled subagents, disabled evolution, and `context-only` project resources.
+The default is `openai/gpt-5.5`, `xhigh` thinking, tools `read,bash,edit,write,update_plan`, enabled subagents, disabled evolution, and `context-only` project resources.
+Enabled subagents add `spawn_agent`, `agent_action`, and `agents` to the model's tools; Diffex chooses whether to use them.
+Children execute inside the parent trial's sandbox and their sessions and usage remain in the trial evidence.
 Change and commit the configuration before starting a new qualification sequence.
 Every subsequent stage must match the exact recorded identity, including the adapter commit and dependency lock.
 The earlier TB 2.0 / Diffex 0.2.2 oracle evidence cannot qualify this configuration.
@@ -49,7 +51,116 @@ Provision quota and network access in the account instead of changing benchmark 
 Record the created sandbox IDs, snapshots, and actual CPU, memory, and disk from `sandbox-created.json` when diagnosing backend differences.
 The pinned dataset includes upstream image tags and network-installed dependencies; archive verification does not make those external services immutable.
 
+## Run five random tasks
+
+Use `--sample 5` for a standalone run of five distinct tasks selected uniformly from all 89 pinned tasks, with one trial per task and no prerequisite stages.
+Use a clean committed checkout and load the Daytona and model credentials described above.
+The command verifies the full dataset automatically, preserves task limits and the configured agent policy, and uses the same bounded concurrency, evidence collection, cleanup, and continue-on-trial-failure behavior as the staged runner.
+
+```zsh
+TB_SAMPLE_OUTPUT="results/sample-tb21-$(date +%Y%m%d-%H%M%S)"
+TB_SAMPLE_CONCURRENCY=1
+
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --sample 5 -n "$TB_SAMPLE_CONCURRENCY" --output "$TB_SAMPLE_OUTPUT"
+```
+
+The runner prints the seed and selected task names, then saves them in `$TB_SAMPLE_OUTPUT/sample/gate.json` under `identity.sample` before creating sandboxes.
+Omitting `--seed` generates a new seed; add `--seed 42` to repeat a selection with the same dataset and pinned Python runtime.
+A repeated selection still requires a fresh output directory and produces new model executions, which can have different outcomes.
+The count can be any integer from 1 to 89; `-n` controls simultaneous trials, not the sample size.
+Sample runs appear in the local results index and never qualify prerequisite stages.
+
+After `sample: passed`, verify using the same checkout, configuration, and concurrency:
+
+```zsh
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --verify-sample -n "$TB_SAMPLE_CONCURRENCY" --output "$TB_SAMPLE_OUTPUT"
+
+open "$TB_SAMPLE_OUTPUT/sample"
+```
+
+Verification reads the retained selection, reproduces it from the saved seed, and rechecks all selected trial evidence without creating sandboxes or calling a model.
+It uses the shared verified dataset cache and may download the pinned archive if that cache is missing.
+Export a passing sample as a Harbor job using the same exporter as qualification stages:
+
+```zsh
+TB_SAMPLE_JOB="results/harbor-exports/$(basename "$TB_SAMPLE_OUTPUT")-sample"
+uv run --locked python -m diffex_terminal_bench.export_job \
+  "$TB_SAMPLE_OUTPUT/sample" --output "$TB_SAMPLE_JOB"
+```
+
+If trials fail, the remaining selected tasks still run before the command exits nonzero.
+Skip `--verify-sample` for a failed run; it requires a passing sample and reports the retained failure without rerunning any tasks.
+Use `--allow-partial` on the export command to retain failed terminal results for diagnosis; every started trial still needs its terminal result and lock.
+Use `python -m diffex_terminal_bench.recover "$TB_SAMPLE_OUTPUT"` for sandbox recovery after an interruption.
+The Harbor authentication and upload commands below also apply to the exported sample job.
+
 ## Ordered stages
+
+### Refresh and restart with parallel trials
+
+The adapter runs from the local uv project, and a newly started command reads the current Python source and `benchmark.toml`.
+An already running command keeps its loaded code and policy; let it finish or interrupt it once with Ctrl-C and wait for cleanup before restarting.
+No Diffex npm release or product rebuild is needed for these runner and policy changes; new sandboxes install the existing pinned release with the updated tool allowlist.
+
+After updating the checkout, run the following in your Mac's zsh terminal with `DAYTONA_API_KEY` and `OPENAI_API_KEY` exported.
+`git status --short` must produce no output.
+Use a fresh output directory because the adapter commit, concurrency, and subagent policy must match across the entire sequence; old prerequisites cannot qualify the new configuration.
+
+```zsh
+cd /Users/jialeyu/Projects/diffex-new/evals/terminal-bench
+git status --short
+uv sync --locked
+
+TB_OUTPUT="results/qualification-tb21-$(date +%Y%m%d-%H%M%S)"
+
+# Step 3: verify all dataset inputs.
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --prepare -n 3 --output "$TB_OUTPUT"
+
+# Step 4: oracle, single trial, then three concurrent integration trials.
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --through integration -n 3 --output "$TB_OUTPUT"
+
+# Step 5: after step 4 passes, ten total trials with at most three active.
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --stage pilot -n 3 --output "$TB_OUTPUT"
+
+# Step 6: verify using the same checkout, output, and concurrency.
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --verify-through pilot -n 3 --output "$TB_OUTPUT"
+open "$TB_OUTPUT/pilot"
+```
+
+Keep the same terminal or restore the exact `TB_OUTPUT` value when continuing later.
+Do not change the checkout, configuration, or concurrency between steps 4-6.
+The recorded `gate.json` identity shows `concurrency: 3` and `policy.subagents: enabled`.
+Each Diffex run's `requested.json` and `effective.json` show the coordination tool allowlist; native sessions and `trajectory.json` show actual calls and child execution.
+
+### Shared dataset cache and run index
+
+All runs share content-addressed archives in `results/dataset-cache/` by default, including runs with a custom `--output` directory.
+Use `--dataset-cache /path/to/cache` to choose another shared cache.
+Each use verifies the pinned SHA-256 and extracts independent temporary task files.
+Concurrent preparation uses a per-digest file lock and atomic publication so another run cannot read a partial download.
+Locks cover preparation only; benchmark execution proceeds independently.
+Existing per-run caches remain untouched and can be deleted when no older benchmark process is using them.
+
+The runner updates `index.md` in the output directory's parent after preparation, stage start, each completed trial, and stage completion or failure.
+It links each qualification run and its stage reports, showing the model, thinking level, dataset, recorded gate status, completed-trial counts, checked-trial counts, failure counts, and full-reward counts.
+Smoke-test directories are excluded because they use separate report formats.
+The index summarizes recorded reports and does not replace `--verify-through` evidence verification.
+An unfinished stage may be running or may have stopped without writing a final report.
+Neither caching nor index generation adds model calls.
+Rebuild the index from existing local reports without credentials, dataset downloads, or a clean checkout:
+
+```bash
+uv run --locked python -m diffex_terminal_bench.benchmark --refresh-index --results-dir results
+open results/index.md
+```
+
+### Stage sequence
 
 | Stage | Trials | Required evidence |
 | --- | ---: | --- |
@@ -64,7 +175,12 @@ The pilot task order is declared before observing model results.
 The first trial uses TB 2.1's updated `fix-git` task, followed by `openssl-selfsigned-cert` and `log-summary-date-ranges` for integration.
 The remaining pilot tasks are `nginx-request-logging`, `sanitize-git-repo`, `db-wal-recovery`, `build-cython-ext`, `multi-source-data-merger`, `polyglot-c-py`, and `sqlite-db-truncate`, all from the same verified 2.1 archive.
 It covers certificates, text processing, Git, service configuration, database recovery, compilation, and data manipulation.
-The runner uses one concurrent trial and no Harbor retries.
+The runner defaults to one concurrent trial and accepts `-n 3` (or `--concurrency 3`) for up to three simultaneous trials.
+The limit includes sandbox creation, installation, execution, verification, and the bounded cleanup attempt; a replacement starts only after that slot finishes.
+Set `concurrency` in `benchmark.toml` to change the checked-in default.
+Use the same concurrency for preparation, every stage, and `--verify-through`, because it is part of the qualification identity.
+Stages remain sequential, so the one-task oracle and trial stages each create only one sandbox even with `-n 3`.
+There are no Harbor retries.
 Task execution and verifier timeouts remain unchanged.
 Only Diffex installation receives the existing 630-second setup allowance.
 
@@ -79,6 +195,7 @@ uv run --locked python -m diffex_terminal_bench.benchmark --stage reliability
 ```
 
 Alternatively, `--through reliability` runs the first five stages in order and stops on the first failed gate.
+Every selected task in that stage is attempted before reporting the failed gate.
 Each stage requires a new output directory and refuses to overwrite an earlier attempt.
 Use `--output results/qualification-NAME` to start a new sequence after investigating a failure or changing configuration.
 Keep failed sequences for diagnosis; do not delete failed trials or edit a report to qualify a stage.
@@ -94,7 +211,30 @@ The gate hashes and revalidates their evidence before allowing progression.
 
 ## Evidence and failure policy
 
-Each stage writes `gate.json` before starting remote work and updates it after every verified trial.
+### Diagnose a stopped trial
+
+Inspect a retained trial without credentials, downloads, a clean checkout, or another evaluation:
+
+```zsh
+uv run --locked python -m diffex_terminal_bench.benchmark \
+  --diagnose-trial "$TB_OUTPUT/pilot/007-build-cython-ext"
+```
+
+The command reports the Harbor exception, a recorded agent deadline, scheduled retry counts, and observed rate-limit retries without printing raw provider errors.
+New live-stage failures also record these diagnostics in `gate.json` and print the evidence directory instead of a generic traceback.
+Scheduled backoff is the sum of requested retry delays, not a measurement of all time spent waiting on the provider.
+
+The retained `qualification-tb21-gpt55-xhigh-20260915-132556` pilot stopped on `build-cython-ext` at its 900-second agent deadline after 68 rate-limit retry events and 210 seconds of scheduled backoff.
+Its sandbox cleanup succeeded and the verifier awarded full reward, but timed-out execution still fails qualification.
+That run already used concurrency 1; lowering concurrency alone cannot resolve a single trial's provider limit.
+Ensure enough available provider token capacity, including other traffic using the same limits, before starting a fresh qualification sequence.
+Use `-n 1` throughout that sequence while capacity remains constrained; task deadlines and resource limits stay unchanged.
+
+### Retained evidence
+
+Each stage writes `gate.json` before starting remote work and updates it after every completed trial, including failures.
+The report separates verified `trials` from `failures`, records `completed_trials` and `expected_trials`, and keeps `failure` as the first observed failure.
+Failure entries identify the task, trial index, evidence directory, error type, and phase; a cleanup error following an execution error is retained in `additional_errors`.
 It records dataset/archive and per-task digests, adapter commit, Harbor/Daytona/Python versions, dependency lock hash, installation pins, model, thinking, tools, subagent policy, and hashes of adapter/harness files and the release instructions.
 Each Diffex trial additionally retains the effective system prompt and its SHA-256.
 Full system prompt hashes can differ between isolated trials because context includes trial-specific paths.
@@ -108,20 +248,30 @@ The gate re-parses native process/stream evidence instead of trusting the outcom
 It regenerates ATIF into a temporary directory, validates it with Harbor, and compares it with retained trajectories and image attachments.
 Native totals, per-model totals, `accounting.json`, and `AgentContext` must reconcile.
 Unknown telemetry remains unknown and cannot satisfy complete accounting.
+Valid executions with missing usage telemetry retain their known usage sums as partial totals and continue qualification.
+Each checked trial records `usage_complete` and `usage_missing_fields` alongside its usage and verifier reward.
+An intentionally interrupted child is valid when its parent roster records `interrupted` and a successful parent interrupt call establishes intent.
+An aborted request without usage telemetry makes accounting partial; it does not invalidate the completed parent trial.
 Verifier reward must agree with the retained reward file.
-A completed, fully accounted Diffex trial with reward zero passes integration checks and remains a zero-reward benchmark result.
+A completed Diffex trial with valid evidence and reward zero passes integration checks and remains a zero-reward benchmark result.
 An oracle with reward zero fails the smoke.
 
-Timeouts, provider errors, missing telemetry, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and stop qualification for investigation.
+Timeouts, unrecovered provider or process errors, unexplained child interruptions, invalid usage values, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and mark the trial as failed.
+The runner continues active peers and queued tasks after these failures, in both serial and concurrent stages.
 The runner does not convert them to successful executions or silently rerun them.
-This conservative integration gate can stop on a legitimate task timeout; the timeout remains a recorded task result and must not be described as an installation failure.
+After every selected task finishes, a stage with any failed trials reports failed qualification and exits nonzero with an evidence summary instead of a trial-error traceback.
+Later prerequisite-dependent stages remain blocked by that failed gate.
+A legitimate task timeout remains a recorded task result and must not be described as an installation failure.
 No failed or interrupted run establishes readiness merely because its process exited zero.
 
 The backend records sandbox IDs before Harbor tears them down.
 Cleanup independently checks known IDs and lists all sandboxes with the trial's unique label, allowing bounded time for asynchronous deletion.
 Only a Daytona not-found response establishes absence; authentication or transport errors do not.
 An orphan is deleted when possible, but needing recovery still fails qualification.
-SIGTERM and cancellation preserve cleanup and reports.
+SIGTERM and explicit stage cancellation stop queued work, cancel active peers, and preserve cleanup and reports.
+Trial failures do not cancel peers; every started trial finishes its bounded cleanup attempt before releasing its slot or closing the clients.
+Stage-wide failures such as an inability to persist `gate.json` can still stop execution.
+Verified trial entries and failure entries stay in declared task order even when they finish out of order.
 After a host crash, forced kill, or interrupted CI job, recheck only the sandboxes belonging to the retained sequence:
 
 ```bash
@@ -131,6 +281,63 @@ uv run --locked python -m diffex_terminal_bench.recover results/release-gate
 Recovery records `sandbox-recovery.json` and preserves the original cleanup report.
 It does not turn a failed sequence into a passing one.
 It requires the original output directory and access to the same Daytona account.
+
+## Export retained trials for Harbor Hub
+
+The staged runner writes individual Harbor trials and `gate.json`, so its stage directories cannot be passed directly to `harbor upload`.
+Export a stage into a new job directory first:
+
+```zsh
+cd /Users/jialeyu/Projects/diffex-new/evals/terminal-bench
+uv sync --locked
+
+TB_JOB="results/harbor-exports/pilot-$(date +%Y%m%d-%H%M%S)"
+uv run --locked python -m diffex_terminal_bench.export_job \
+  "$TB_OUTPUT/pilot" --output "$TB_JOB"
+```
+
+The default requires a stopped stage with recorded passing status and complete trial coverage.
+To share a failed or incomplete stopped stage for diagnosis, explicitly include every retained terminal result:
+
+```zsh
+uv run --locked python -m diffex_terminal_bench.export_job \
+  "$TB_OUTPUT/pilot" --output "$TB_JOB" --allow-partial
+```
+
+Use one of those export commands, not both with the same destination.
+The exporter refuses to overwrite an existing job, copy a running stage, omit a started trial without a terminal result/lock, or accept changed evidence for a checked trial.
+It works offline with old recorded configurations and does not require the original clean checkout, provider credentials, or temporary dataset extraction.
+It neither reruns trials nor changes source results.
+
+The job contains Harbor `config.json`, `result.json`, and `lock.json`, plus independent copies of all trial files.
+Rewards, exception records, trial IDs, native sessions, ATIF trajectories, and media remain unchanged.
+Job totals retain the planned trial count and separately count terminal results, errors, and unrun tasks.
+Unknown usage in failed trials remains unknown in those trials; job usage is an observed sum, not a claim of complete accounting.
+`analysis.md` explains whether the source gate passed, and `export.json` records source hashes and missing trials.
+This packaging check does not requalify the source stage or establish leaderboard eligibility.
+The exported configuration retains original task paths for provenance; use the custom staged runner for future evaluations, not `harbor job resume` on an export.
+
+Harbor's upload archive filters omit custom files at the trial root.
+The exporter also places sandbox lifecycle evidence under each trial's `artifacts/diffex-qualification/`, with the source gate and export manifest under the first trial's artifact directory, so those files survive Hub downloads.
+Hidden child-session directories remain under `agent/` and are included in Harbor's archives.
+Repeated exports of the same source snapshot have a stable job ID; retry an upload from the same exported directory.
+
+Authenticate and upload the exported job privately:
+
+```zsh
+uv run --locked harbor auth login
+uv run --locked harbor upload "$TB_JOB" --private
+```
+
+To publish it publicly instead, use:
+
+```zsh
+uv run --locked harbor upload "$TB_JOB" --public
+```
+
+Harbor prints the Hub viewing link after upload.
+The export command does not upload anything or change visibility.
+See the [Harbor job sharing documentation](https://www.harborframework.com/docs/sharing/jobs) for visibility and download options.
 
 ## CI and remote evidence
 

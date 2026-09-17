@@ -58,7 +58,7 @@ def run_identity(config: BenchmarkConfig, digests: dict) -> dict:
             "daytona_target": os.environ.get("DAYTONA_TARGET", "organization-default"),
             "daytona_api_url": os.environ.get("DAYTONA_API_URL", "https://app.daytona.io/api"),
             "harness_files": {path.name: sha256(path) for path in sorted(Path(__file__).parent.iterdir()) if path.is_file()},
-            "release_agents_sha256": sha256(Path(__file__).with_name("release-agents.md")),
+            "release_agents_sha256": PINS["release_agents_sha256"],
             "timeout_multiplier": 1.0, "resource_overrides": None, "concurrency": config.concurrency, "harbor_retries": 0}
 
 

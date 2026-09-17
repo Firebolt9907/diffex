@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed bugs and improved reliability.
+
 ## [0.2.4] - 2026-09-15
 
 ## [0.2.3] - 2026-09-14

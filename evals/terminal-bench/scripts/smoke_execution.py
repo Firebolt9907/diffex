@@ -91,7 +91,7 @@ async def smoke(platform: str) -> None:
                 assert effective["model"] == "gpt-5" and effective["thinking"] == "high"
                 prompt = (run_dir / "system-prompt.txt").read_text()
                 assert "PRESERVE_TASK_CONTEXT" in prompt and "DO_NOT_LOAD_PROJECT_SYSTEM" not in prompt
-                assert effective["release_agents_sha256"] == hashlib.sha256(Path("../../AGENTS_release.md").read_bytes()).hexdigest()
+                assert effective["release_agents_sha256"] == PINS["release_agents_sha256"]
                 initial = json.loads((run_dir / "fixture-start.json").read_text())
                 assert effective["release_agents_path"] == "/opt/diffex-terminal-bench/cli/node_modules/@diffexai/diffex/dist/AGENTS.md"
                 assert initial == {"state_entries": ["home", "settings.json"], "session_entries": [],

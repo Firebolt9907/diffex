@@ -8,6 +8,9 @@ import { getPublicWorkspacePackages } from "./release-packages.mjs";
 
 test("only the CLI is public and its install manifest never fetches private Diffex packages", () => {
 	const { manifest, bundled } = cliDistribution();
+	assert(!manifest.files.some((file) => file === "docs" || file.startsWith("docs/")));
+	const workspace = JSON.parse(readFileSync("packages/coding-agent/package.json", "utf8"));
+	assert(!workspace.files.some((file) => file === "docs" || file.startsWith("docs/")));
 	assert.deepEqual(
 		getPublicWorkspacePackages().map((pkg) => pkg.name),
 		["@diffexai/diffex"],

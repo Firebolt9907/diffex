@@ -15,9 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { PROJECT_CHANGELOGS } from "./prepare-distribution.mjs";
-import { cliDistribution, distributionDocs } from "./cli-distribution.mjs";
+import { cliDistribution } from "./cli-distribution.mjs";
 
-test("packed CLI exposes the product homepage and preserves referenced documentation", () => {
+test("packed CLI links to online documentation and excludes the docs directory", () => {
 	const root = mkdtempSync(join(tmpdir(), "diffex-cli-presentation-"));
 	try {
 		const copy = (file) => {
@@ -116,21 +116,14 @@ test("packed CLI exposes the product homepage and preserves referenced documenta
 		assert.equal(published.diffexConfig.production, true);
 		assert.match(
 			execFileSync("tar", ["-xOf", archive, "package/README.md"], { encoding: "utf8" }),
-			/docs\/installation\.md/,
+			/https:\/\/diffex\.ai\/docs\/overview\//,
 		);
+		assert(!packed.files.some(({ path }) => path.split("/").includes("docs")));
 		for (const file of readdirSync(join(pkg, "docs"), { recursive: true })) {
 			const source = join(pkg, "docs", file);
 			if (!statSync(source).isFile()) continue;
 			const path = `docs/${file.replaceAll("\\", "/")}`;
-			if (!distributionDocs.includes(path)) {
-				assert(!packed.files.some((entry) => entry.path === path), `${path} must not ship`);
-			} else {
-				assert.deepEqual(
-					execFileSync("tar", ["-xOf", archive, `package/${path}`]),
-					readFileSync(source),
-					`${path} must remain intact`,
-				);
-			}
+			assert(!packed.files.some((entry) => entry.path === path), `${path} must not ship`);
 		}
 		for (const file of excludedDocs) assert(existsSync(join(pkg, "docs", file)), `${file} must remain in source`);
 		for (const { path } of packed.files)

@@ -14,7 +14,8 @@ from harbor.models.job.config import JobConfig
 import yaml
 
 from diffex_terminal_bench.adapter import DiffexAgent
-from diffex_terminal_bench.benchmark import PACKAGE, trial_config
+from diffex_terminal_bench.benchmark import PACKAGE, run_identity, trial_config
+from diffex_terminal_bench.config import PINS
 from diffex_terminal_bench.dataset import load_config
 
 
@@ -50,6 +51,14 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         environment.default_user = None
         environment.exec.return_value = ExecResult(return_code=0, stdout="", stderr="")
         return environment
+
+    def test_run_identity_uses_pinned_release_context(self):
+        config = load_config(PACKAGE / "benchmark.toml")
+        with patch("diffex_terminal_bench.benchmark.subprocess.check_output", side_effect=["", "a" * 40]), \
+                patch("diffex_terminal_bench.benchmark.sha256", return_value="new-source-digest"):
+            identity = run_identity(config, {})
+        self.assertEqual(identity["release_agents_sha256"], PINS["release_agents_sha256"])
+        self.assertEqual(identity["harness_files"]["release-agents.md"], "new-source-digest")
 
     async def test_prompt_environment_and_fresh_trial_paths(self):
         environment = self.make_environment()

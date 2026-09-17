@@ -77,7 +77,6 @@ test("accepts a tarball with readable JavaScript, declarations, and complete not
 		"native/darwin/prebuilds/darwin-arm64/helper.node": Buffer.from("native fixture"),
 		"dist/vendor/evolution/index.js": "export const value = 1;",
 		"dist/vendor/harness-trace/index.d.ts": "export declare const value: number;",
-		"docs/usage.md": "Diffex loads AGENTS.md from the user's project.\n",
 	});
 	assert.equal(result.status, 0, result.stderr);
 });
@@ -102,6 +101,8 @@ test("rejects a separate NOTICE file because attribution is consolidated", () =>
 });
 
 for (const [name, content, reason] of [
+	["docs/usage.md", "Previously published user guide", /unapproved distribution documentation/],
+	["docs/images/interactive-mode.png", Buffer.from("image fixture"), /unapproved distribution documentation/],
 	["docs/development.md", "Private build instructions", /unapproved distribution documentation/],
 	["docs/new-internal-audit.md", "Private evidence", /unapproved distribution documentation/],
 	["dist/internal-handoff.txt", "Private handoff", /unapproved distribution documentation/],
@@ -231,7 +232,7 @@ test("rejects duplicate members before interpreting package metadata", () => {
 	}
 });
 
-for (const guide of ["README.md", "docs/installation.md"]) {
+for (const guide of ["README.md"]) {
 	test(`rejects a CLI artifact missing required user documentation ${guide}`, () => {
 		const result = inspect({}, guide);
 		assert.notEqual(result.status, 0);

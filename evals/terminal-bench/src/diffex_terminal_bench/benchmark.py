@@ -10,6 +10,7 @@ import platform
 import secrets
 import signal
 import subprocess
+import sys
 import uuid
 
 from daytona import AsyncDaytona
@@ -34,6 +35,24 @@ REPOSITORY = PACKAGE.parents[1]
 
 class StageFailedError(RuntimeError):
     """Expected qualification failure after all started trials are cleaned up."""
+
+
+def failure_reason(failure: dict) -> str:
+    try:
+        return describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure["error"]
+    except Exception as exc:
+        # Diagnostics are supplementary; the recorded trial failure is authoritative.
+        return f"{failure.get('error', 'UnknownError')} (diagnostic formatting failed: {type(exc).__name__})"
+
+
+def progress(message: str) -> None:
+    # A detached terminal or broken logging sink must not affect trial execution.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            print(message, file=stream, flush=True)
+            return
+        except Exception:
+            continue
 
 
 def preflight(config: BenchmarkConfig, *, oracle: bool) -> None:
@@ -110,7 +129,7 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                 label = uuid.uuid4().hex
                 trial_dir.mkdir()
                 write_json(trial_dir / "cleanup-request.json", {"label": label})
-                print(f"{stage} {index}/{len(selected)}: {task}", flush=True)
+                progress(f"{stage} {index}/{len(selected)}: {task}")
                 try:
                     if "sha256:" + Packager.compute_content_hash(tasks[task])[0] != identity["task_digests"][task]:
                         raise ValueError("Task content changed after dataset verification")
@@ -164,9 +183,9 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                         if asyncio.current_task().cancelling():
                             raise asyncio.CancelledError from exc
                         failure = next(row for row in report["failures"] if row["trial_index"] == index)
-                        reason = describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure["error"]
-                        print(f"{stage} {index}/{len(selected)}: failed: {reason}. "
-                              f"Evidence: {directory / failure['directory']}. Continuing remaining trials.", flush=True)
+                        reason = failure_reason(failure)
+                        progress(f"{stage} {index}/{len(selected)}: failed: {reason}. "
+                                 f"Evidence: {directory / failure['directory']}. Continuing remaining trials.")
                     report["completed_trials"] += 1
                     write_json(directory / "gate.json", report)
                     refresh_index(root.parent)
@@ -180,7 +199,7 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                 raise RuntimeError("Stage did not complete every selected trial")
         if report["failures"]:
             failure = report["failure"]
-            reason = describe_failure(failure["diagnostics"]) if "diagnostics" in failure else failure["error"]
+            reason = failure_reason(failure)
             raise StageFailedError(f"{stage}: completed {len(selected)} trials with {len(report['failures'])} failed; "
                                    f"qualification failed. First failure: {reason}. "
                                    f"Evidence: {directory / failure['directory']}. All failures: {directory / 'gate.json'}.")
@@ -198,7 +217,7 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
             # writing the final report fails.
             manager = await DaytonaClientManager.get_instance()
             await manager._cleanup()
-    print(f"{stage}: passed; evidence: {directory}", flush=True)
+    progress(f"{stage}: passed; evidence: {directory}")
 
 
 async def execute(config: BenchmarkConfig, tasks: dict, identity: dict, root: Path, stage: str, through: bool) -> None:

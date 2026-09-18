@@ -230,7 +230,27 @@ class ParallelStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure["diagnostics"]["harbor_exception"], "AgentTimeoutError")
         self.assertEqual(failure["diagnostics"]["agent_timeout_sec"], 900)
 
-    async def check_failure(self):
+    async def test_broken_failure_formatter_does_not_cancel_peers(self):
+        self.failure_phase = "timeout"
+        with patch("diffex_terminal_bench.benchmark.describe_failure", side_effect=ValueError("bad diagnostics")):
+            await self.check_failure(formatted=False)
+
+    async def test_broken_progress_streams_do_not_cancel_peers(self):
+        self.failure_phase = "run"
+        with patch("diffex_terminal_bench.benchmark.print", create=True, side_effect=BrokenPipeError):
+            await self.check_failure()
+
+    async def test_broken_progress_streams_do_not_fail_successful_trials(self):
+        for event in (*self.finish_run.values(), *self.finish_cleanup.values()):
+            event.set()
+        with patch("diffex_terminal_bench.benchmark.print", create=True, side_effect=BrokenPipeError):
+            await asyncio.wait_for(self.start_stage(), 5)
+        report = read_json(self.root / "pilot/gate.json")
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["completed_trials"], 10)
+        self.assertEqual(self.cleaned, set(range(1, 11)))
+
+    async def check_failure(self, *, formatted=True):
         task = self.start_stage()
         await self.wait_events(self.started, (1, 2, 3))
         self.finish_run[2].set()
@@ -256,7 +276,9 @@ class ParallelStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["failure"]["directory"], f"002-{self.config.pilot_tasks[1]}")
         if self.failure_phase == "timeout":
             self.assertIn(str(self.root / "pilot" / report["failure"]["directory"]), str(error.exception))
-            self.assertIn("AgentTimeoutError at the 900s task deadline", str(error.exception))
+            self.assertIn("AgentTimeoutError at the 900s task deadline" if formatted else "TrialExecutionFailure",
+                          str(error.exception))
+            self.assertEqual(report["failure"]["diagnostics"]["harbor_exception"], "AgentTimeoutError")
         self.assertEqual(self.cleaned, set(range(1, 11)))
         self.assertEqual(len(report["trials"]), 9)
         self.assertEqual(len(report["failures"]), 1)

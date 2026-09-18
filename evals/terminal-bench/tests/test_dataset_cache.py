@@ -96,7 +96,7 @@ class DatasetCacheTests(unittest.TestCase):
         self.assertIn("[first](first/)", index)
         self.assertIn("[second](second/)", index)
         self.assertIn("openai/gpt-5.6-luna", index)
-        self.assertIn("xhigh", index)
+        self.assertIn("max", index)
 
 
 if __name__ == "__main__":

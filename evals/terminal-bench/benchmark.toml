@@ -26,7 +26,7 @@ archive_sha256 = "aa992a8848a1f3ed5191a34fa72ed5700d67dd9f968413a0e0a567b6188cb5
 task_count = 89
 
 [policy]
-thinking = "xhigh"
+thinking = "max"
 tools = "read,bash,edit,write,update_plan"
 subagents = "enabled"
 project_resources = "context-only"

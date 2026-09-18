@@ -27,7 +27,8 @@ def entry(identifier, message):
             "timestamp": "1970-01-01T00:00:01Z" if message.get("timestamp", 1000) == 1000 else "1970-01-01T00:00:02Z"}
 
 
-def interrupted_child_records(*, status="interrupted", stop_reason="aborted", interrupt_error=False, usage=None):
+def interrupted_child_records(*, status="interrupted", stop_reason="aborted", interrupt_error=False, usage=None,
+                              error_message=None):
     root = [entry("spawn", assistant("spawn", [{"type": "toolCall", "id": "spawn", "name": "spawn_agent",
                                               "arguments": {"name": "helper"}}])),
             entry("spawn-result", {"role": "toolResult", "toolCallId": "spawn", "content": "accepted", "isError": False}),
@@ -39,7 +40,7 @@ def interrupted_child_records(*, status="interrupted", stop_reason="aborted", in
              "data": {"agents": [{"name": "helper", "childSessionId": "child", "status": status}]}},
             entry("done", assistant("done"))]
     child = [entry("child-first", assistant("child-first", model="gpt-4")),
-             entry("child-last", assistant("child-last", model="gpt-4", stopReason=stop_reason,
+             entry("child-last", assistant("child-last", model="gpt-4", stopReason=stop_reason, errorMessage=error_message,
                    usage=usage if usage is not None else {"input": 0, "output": 0, "cacheRead": 0,
                                                          "cacheWrite": 0, "cost": {"total": 0}}))]
     return root, child

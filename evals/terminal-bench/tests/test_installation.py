@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import create_autospec, patch
@@ -79,6 +80,99 @@ class RegistryIntegrityTests(unittest.TestCase):
                         )
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     self.assertFalse(Path(temp, "installation.json").exists())
+
+
+class PackageInstallTests(unittest.TestCase):
+    def run_install(self, *, installed=False, update_failures=0, install_failures=0):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            commands = root / "bin"
+            commands.mkdir()
+            logs = root / "logs"
+            logs.mkdir()
+            stub = root / "command.py"
+            stub.write_text(f"#!{sys.executable}\n" + '''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["INSTALL_TEST_ROOT"])
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+with (root / "calls.jsonl").open("a") as output:
+    output.write(json.dumps([name, *args]) + "\\n")
+if name == "uname":
+    print("Linux" if args == ["-s"] else "x86_64")
+elif name == "dpkg-query":
+    if os.environ["INSTALLED"] == "1" or args[-1] != "xz-utils":
+        print("install ok installed", end="")
+    else:
+        sys.exit(1)
+elif name == "apt-get":
+    operation = "update" if "update" in args else "install"
+    counter = root / (operation + ".count")
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    if count <= int(os.environ[operation.upper() + "_FAILURES"]):
+        print("404 Not Found" if operation == "install" else "Failed to fetch index", file=sys.stderr)
+        sys.exit(100)
+elif name == "wget":
+    # Stop after dependency setup; never download or install real packages.
+    sys.exit(42)
+''')
+            stub.chmod(0o755)
+            for name in ("uname", "dpkg-query", "apt-get", "wget", "sleep"):
+                (commands / name).symlink_to(stub)
+            with as_file(files("diffex_terminal_bench").joinpath("install.sh")) as source:
+                # Redirect installation paths and capture logs without /dev/fd process substitution.
+                script = source.read_text().replace("/opt/diffex-terminal-bench", str(root / "prefix"))
+                script = script.replace("/usr/local/bin/diffex", str(root / "diffex"))
+                script = script.replace('exec > >(tee "$SETUP_LOGS/install.stdout.log")', "")
+                script = script.replace('exec 2> >(tee "$SETUP_LOGS/install.stderr.log" >&2)', "")
+            path = root / "install.sh"
+            path.write_text(script)
+            result = subprocess.run(["bash", str(path)], capture_output=True, text=True, timeout=10, env={
+                "PATH": str(commands) + os.pathsep + os.environ["PATH"], "HOME": str(root / "home"),
+                "SETUP_LOGS": str(logs), "NODE_VERSION": PINS["node_version"],
+                "NODE_SHA256_X64": PINS["node_sha256"]["x64"], "INSTALL_TEST_ROOT": temp,
+                "INSTALLED": str(int(installed)), "UPDATE_FAILURES": str(update_failures),
+                "INSTALL_FAILURES": str(install_failures),
+            })
+            self.assertTrue((root / "calls.jsonl").exists(), result.stderr)
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            return result, calls
+
+    def test_installed_dependencies_do_not_need_package_network(self):
+        result, calls = self.run_install(installed=True, update_failures=99)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertFalse(any(call[0] == "apt-get" for call in calls))
+
+    def test_missing_archive_refreshes_indexes_and_retries(self):
+        result, calls = self.run_install(install_failures=1)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        apt = [call for call in calls if call[0] == "apt-get"]
+        self.assertEqual(["update" if "update" in call else "install" for call in apt],
+                         ["update", "install", "update", "install"])
+        for call in apt:
+            if "install" in call:
+                self.assertIn("xz-utils", call)
+                self.assertNotIn("ca-certificates", call)
+                self.assertNotIn("wget", call)
+
+    def test_index_failure_does_not_install_from_stale_indexes(self):
+        result, calls = self.run_install(update_failures=1)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        apt = [call for call in calls if call[0] == "apt-get"]
+        self.assertEqual(["update" if "update" in call else "install" for call in apt],
+                         ["update", "update", "install"])
+        self.assertTrue(all("APT::Update::Error-Mode=any" in call for call in apt if "update" in call))
+
+    def test_persistent_failure_is_bounded_and_cannot_report_success(self):
+        result, calls = self.run_install(install_failures=99)
+        self.assertEqual(result.returncode, 100, result.stderr)
+        self.assertEqual(sum(call[0] == "apt-get" and "install" in call for call in calls), 3)
+        self.assertFalse(any(call[0] == "wget" for call in calls))
 
 
 if __name__ == "__main__":

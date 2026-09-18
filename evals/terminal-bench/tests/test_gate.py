@@ -139,6 +139,18 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing_child_trajectory"):
             validate_trial(self.directory, "task", self.identity)
 
+    def test_abort_error_requires_a_successful_intentional_interrupt(self):
+        abort = {"stop_reason": "error", "error_message": "This operation was aborted"}
+        self.write_interrupted_child(**abort)
+        report = validate_trial(self.directory, "task", self.identity)
+        self.assertEqual(report["usage"]["prompt_tokens"], 76)
+        for options in ({"status": "running"}, {"interrupt_error": True},
+                        {"error_message": "Provider connection failed"}):
+            with self.subTest(options=options):
+                self.write_interrupted_child(**{**abort, **options})
+                with self.assertRaisesRegex(ValueError, "child_execution_incomplete"):
+                    validate_trial(self.directory, "task", self.identity)
+
     def test_partial_accounting_and_harbor_totals_must_still_reconcile(self):
         self.write_interrupted_child()
         result_path = self.directory / "result.json"

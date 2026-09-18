@@ -525,6 +525,7 @@ describe("subagent actions", () => {
 			settings: { retry: { enabled: false } },
 		});
 		extraHarnesses.push(child);
+		child.session.agent.streamFunction = child.session.modelRuntime.streamSimple.bind(child.session.modelRuntime);
 		child.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
 		const controller = new SubagentController({ maxConcurrent: 1 });
 		extraControllers.push(controller);
@@ -541,6 +542,9 @@ describe("subagent actions", () => {
 			.getEntries()
 			.flatMap((entry) => (entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : []));
 		expect(toolResults.map((message) => getMessageText(message))).toContain("tool aborted");
+		const lastAssistant = [...child.session.messages].reverse().find((message) => message.role === "assistant");
+		expect(lastAssistant?.stopReason).toBe("aborted");
+		expect(child.eventsOfType("auto_retry_start")).toEqual([]);
 	});
 
 	it("shuts down queued and running restarts without late revisions or double disposal", async () => {

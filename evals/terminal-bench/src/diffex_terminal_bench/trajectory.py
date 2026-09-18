@@ -324,6 +324,11 @@ def export_trajectory(directory: Path, destination: Path, context: AgentContext,
             gaps.append("unlinked_child_trajectory")
         assistants = [step for step in session.steps if step.get("extra", {}).get("native_role") == "assistant"]
         stop_reason = assistants[-1]["extra"].get("stop_reason") if assistants else None
+        # Auth/setup cancellation can arrive as an error before streaming starts.
+        # The parent must still prove that it deliberately interrupted this child.
+        if (session.id in interrupted and stop_reason == "error"
+                and assistants[-1]["extra"].get("error_message") == "This operation was aborted"):
+            stop_reason = "aborted"
         if stop_reason != "stop" and not (session.id in interrupted and stop_reason in (None, "aborted", "toolUse")):
             session.gaps.append("child_execution_incomplete")
     for session in sessions:

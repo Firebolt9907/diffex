@@ -29,9 +29,32 @@ if [ -e /usr/local/bin/diffex ] || [ -L /usr/local/bin/diffex ]; then
 fi
 mkdir -p "$HOME" "$prefix/node" "$prefix/cli" "$prefix/work"
 cd "$prefix/work"
-apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true update
-apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true \
-    install -y --no-install-recommends ca-certificates wget xz-utils
+packages=()
+for package in ca-certificates wget xz-utils; do
+    if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then
+        packages+=("$package")
+    fi
+done
+if [ "${#packages[@]}" -gt 0 ]; then
+    apt_options=(-o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true
+        -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o "Dir::State::lists=$prefix/apt-lists")
+    for attempt in 1 2 3; do
+        # A retry must refresh metadata after a mirror returns a stale archive URL.
+        # Keep task-owned indexes untouched and never install from a partial update.
+        rm -rf "$prefix/apt-lists"
+        mkdir -p "$prefix/apt-lists/partial"
+        if apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update &&
+            apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"; then
+            break
+        fi
+        if [ "$attempt" -eq 3 ]; then
+            echo "Failed to install prerequisites after $attempt attempts" >&2
+            exit 100
+        fi
+        echo "Retrying prerequisite installation with fresh package indexes" >&2
+        sleep "$((attempt * 2))"
+    done
+fi
 archive="node-v$NODE_VERSION-linux-$arch.tar.xz"
 wget --https-only --tries=3 --timeout=20 --output-document="$archive" \
     "https://nodejs.org/dist/v$NODE_VERSION/$archive"

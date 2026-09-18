@@ -1,7 +1,7 @@
 import type { Context, SimpleStreamOptions } from "@diffexai/diffex-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@diffexai/diffex-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentSession } from "../../src/core/agent-session.ts";
+import type { AgentSession, AgentSessionEvent } from "../../src/core/agent-session.ts";
 import type { ExtensionContext } from "../../src/core/extensions/types.ts";
 import type { CustomMessage } from "../../src/core/messages.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
@@ -143,6 +143,155 @@ describe("automatic subagent coordination", () => {
 		expect(root.getLastAssistantText()).toBe("automatic final answer");
 		expect(parentContexts).toHaveLength(3);
 		expect(getMessageText(parentContexts[2]?.messages.at(-1))).toContain("CHILD-RESULT-SENTINEL");
+	});
+
+	it.each([false, true])("settles children after exhausted parent retries (queued report: %s)", async (queued) => {
+		const { root, harness } = await createRoot(1);
+		harness.settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+			compaction: { enabled: false },
+		});
+		const childStarted = deferred<void>();
+		const exhausted = deferred<void>();
+		const releaseChildCleanup = deferred<void>();
+		const events: AgentSessionEvent[] = [];
+		let parentCalls = 0;
+		let childCalls = 0;
+		let childAborted = false;
+		root.subscribe((event) => {
+			events.push(event);
+			if (event.type === "auto_retry_end" && !event.success) {
+				if (queued) {
+					void root.sendCustomMessage({
+						customType: "subagent_results",
+						content: "queued child report",
+						display: false,
+					});
+				}
+				exhausted.resolve();
+			}
+		});
+		harness.setResponses(
+			Array.from({ length: 12 }, () => async (context: Context, options?: SimpleStreamOptions) => {
+				if (!hasTool(context, "spawn_agent")) {
+					childCalls += 1;
+					childStarted.resolve();
+					await new Promise<void>((resolve) => {
+						const finish = () => {
+							childAborted = true;
+							resolve();
+						};
+						if (options?.signal?.aborted) finish();
+						else options?.signal?.addEventListener("abort", finish, { once: true });
+					});
+					await releaseChildCleanup.promise;
+					return fauxAssistantMessage("child partial", { stopReason: "aborted" });
+				}
+				parentCalls += 1;
+				if (!hasToolResult(context, "spawn_agent")) {
+					return fauxAssistantMessage(
+						[
+							fauxToolCall("spawn_agent", { name: "running", task: "wait for cancellation" }),
+							fauxToolCall("spawn_agent", { name: "queued", task: "wait for a permit" }),
+						],
+						{ stopReason: "toolUse" },
+					);
+				}
+				await childStarted.promise;
+				return parentCalls <= 5
+					? fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit exhausted" })
+					: fauxAssistantMessage("unexpected continuation");
+			}),
+		);
+
+		const prompt = root.prompt("delegate then exhaust provider retries");
+		try {
+			await exhausted.promise;
+			await waitFor(() => childAborted);
+			await expectPending(prompt);
+			releaseChildCleanup.resolve();
+			await waitFor(() => root.isIdle);
+			await prompt;
+			expect(parentCalls).toBe(5);
+			expect(childCalls).toBe(1);
+			expect(root.getSubagents().map((child) => child.status)).toEqual(["interrupted", "interrupted"]);
+			expect(root.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: "429 rate limit exhausted" });
+			expect(root.state.errorMessage).toBe("429 rate limit exhausted");
+			expect(getHiddenResultMessages(root)).toHaveLength(0);
+			expect(events.filter((event) => event.type === "auto_retry_start")).toHaveLength(3);
+			expect(events.filter((event) => event.type === "auto_retry_end")).toEqual([
+				{ type: "auto_retry_end", success: false, attempt: 3, finalError: "429 rate limit exhausted" },
+			]);
+			expect(events.filter((event) => event.type === "subagent_wait_end")).toEqual([
+				{ type: "subagent_wait_end", names: ["queued", "running"], cancelled: true },
+			]);
+			root.clearQueue();
+			harness.setResponses([fauxAssistantMessage("explicit recovery")]);
+			await root.prompt("try again explicitly");
+			expect(root.getLastAssistantText()).toBe("explicit recovery");
+			expect(getHiddenResultMessages(root)).toHaveLength(0);
+		} finally {
+			releaseChildCleanup.resolve();
+			await root.abort();
+			await prompt;
+		}
+	});
+
+	it("closes a suspended batch and newly spawned children when escalation handling fails", async () => {
+		const { root, harness } = await createRoot(1);
+		const waitStarted = deferred<void>();
+		const childWaiting = deferred<void>();
+		const events: AgentSessionEvent[] = [];
+		let parentCalls = 0;
+		root.subscribe((event) => {
+			events.push(event);
+			if (event.type === "subagent_wait_start") waitStarted.resolve();
+		});
+		harness.setResponses(
+			Array.from({ length: 12 }, () => async (context: Context, options?: SimpleStreamOptions) => {
+				if (!hasTool(context, "spawn_agent")) {
+					if (!hasToolResult(context, "escalate_to_parent")) {
+						await waitStarted.promise;
+						return fauxAssistantMessage(fauxToolCall("escalate_to_parent", { message: "need another worker" }), {
+							stopReason: "toolUse",
+						});
+					}
+					childWaiting.resolve();
+					return await new Promise<ReturnType<typeof fauxAssistantMessage>>((resolve) => {
+						const finish = () => resolve(fauxAssistantMessage("partial", { stopReason: "aborted" }));
+						if (options?.signal?.aborted) finish();
+						else options?.signal?.addEventListener("abort", finish, { once: true });
+					});
+				}
+				parentCalls += 1;
+				const spawned = getToolResultCount(context, "spawn_agent");
+				if (spawned === 0) {
+					return fauxAssistantMessage(fauxToolCall("spawn_agent", { name: "first", task: "report a blocker" }), {
+						stopReason: "toolUse",
+					});
+				}
+				if (!JSON.stringify(context.messages).includes("subagent_escalations")) {
+					return fauxAssistantMessage("wait for the first child");
+				}
+				if (spawned === 1) {
+					return fauxAssistantMessage(fauxToolCall("spawn_agent", { name: "second", task: "help first" }), {
+						stopReason: "toolUse",
+					});
+				}
+				await childWaiting.promise;
+				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" });
+			}),
+		);
+
+		await root.prompt("delegate and handle escalation");
+		expect(parentCalls).toBe(4);
+		expect(root.getSubagents().map((child) => child.status)).toEqual(["interrupted", "interrupted"]);
+		expect(root.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: "invalid_api_key" });
+		expect(getHiddenResultMessages(root)).toHaveLength(0);
+		expect(events.filter((event) => event.type === "subagent_wait_end")).toEqual([
+			{ type: "subagent_wait_end", names: ["first"], cancelled: true },
+			{ type: "subagent_wait_end", names: ["second"], cancelled: true },
+		]);
 	});
 
 	it("notices each completion and delivers one name-sorted batch", async () => {

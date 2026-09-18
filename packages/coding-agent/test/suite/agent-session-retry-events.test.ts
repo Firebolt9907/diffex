@@ -143,6 +143,36 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 	});
 
+	it.each(["steer", "followUp"] as const)(
+		"retains queued %s input without restarting a failed run",
+		async (delivery) => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { enabled: false } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await harness.session[delivery]("queued user input");
+					return fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" });
+				},
+				fauxAssistantMessage("unexpected continuation"),
+			]);
+
+			await harness.session.prompt("fail with pending input");
+
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.session.messages.at(-1)).toMatchObject({
+				stopReason: "error",
+				errorMessage: "invalid_api_key",
+			});
+			expect(harness.session.pendingMessageCount).toBe(1);
+			expect(harness.session.clearQueue()).toEqual({
+				steering: delivery === "steer" ? ["queued user input"] : [],
+				followUp: delivery === "followUp" ? ["queued user input"] : [],
+			});
+		},
+	);
+
 	it("cancels retry sleep when abortRetry is called", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 100 } } });
 		harnesses.push(harness);

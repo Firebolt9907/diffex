@@ -443,6 +443,129 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
+	it("keeps a provider error terminal when threshold compaction queues a report", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 1000 }],
+			settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "threshold summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "compaction_end" && event.result) {
+				harness.session.agent.steer({
+					role: "custom",
+					customType: "subagent_results",
+					content: "queued report",
+					display: false,
+					timestamp: Date.now(),
+				});
+			}
+		});
+		harness.setResponses([
+			() => {
+				harness.settingsManager.applyOverrides({ compaction: { reserveTokens: 999 } });
+				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" });
+			},
+			fauxAssistantMessage("unexpected continuation"),
+		]);
+
+		await harness.session.prompt("fail near the compaction threshold");
+
+		expect(harness.eventsOfType("compaction_end")).toEqual([
+			expect.objectContaining({ reason: "threshold", willRetry: false, aborted: false, result: expect.any(Object) }),
+		]);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.session.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: "invalid_api_key" });
+		expect(harness.session.state.errorMessage).toBe("invalid_api_key");
+	});
+
+	it("restores the original failure when overflow compaction is declined", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async () => ({ cancel: true }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" })]);
+
+		await harness.session.prompt("overflow");
+
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: true,
+			willRetry: false,
+		});
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			stopReason: "error",
+			errorMessage: "prompt is too long",
+		});
+		expect(
+			harness.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(1);
+	});
+
+	it.each([false, true])(
+		"allows overflow recovery before settling a parent error (repeated overflow: %s)",
+		async (repeated) => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", async (event) => ({
+							compaction: {
+								summary: "overflow summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						}));
+					},
+				],
+			});
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			harness.setResponses([
+				() =>
+					fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: "prompt is too long",
+						timestamp: Date.now() + 10_000,
+					}),
+				() =>
+					repeated
+						? fauxAssistantMessage("", {
+								stopReason: "error",
+								errorMessage: "prompt is too long",
+								timestamp: Date.now() + 20_000,
+							})
+						: fauxAssistantMessage("recovered after compaction"),
+			]);
+
+			await harness.session.prompt("overflow once");
+
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(harness.eventsOfType("compaction_start")).toHaveLength(1);
+			expect(harness.session.messages.at(-1)).toMatchObject({ stopReason: repeated ? "error" : "stop" });
+			if (repeated) expect(harness.session.state.errorMessage).toBe("prompt is too long");
+			else expect(harness.session.getLastAssistantText()).toBe("recovered after compaction");
+		},
+	);
+
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },

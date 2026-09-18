@@ -1956,7 +1956,9 @@ export class AgentSession {
 				if (firstRun) await this.agent.prompt(messages);
 				else await this.agent.continue();
 				firstRun = false;
-				if (await this._handlePostAgentRun()) {
+				const next = await this._handlePostAgentRun();
+				if (next === "failed") break;
+				if (next === "continue") {
 					if (this._agentRunAborted) {
 						const coordination = this._subagentCoordination;
 						if (coordination) {
@@ -2134,15 +2136,15 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(): Promise<"continue" | "settled" | "failed"> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
-			return false;
+			return "settled";
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+			return "continue";
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
@@ -2156,12 +2158,26 @@ export class AgentSession {
 		}
 
 		if (await this._checkCompaction(msg)) {
-			return true;
+			return "continue";
+		}
+
+		if (msg.stopReason === "error") {
+			// Recovery may have removed the failed response before giving up.
+			if (!this.agent.state.messages.includes(msg)) this.agent.state.messages.push(msg);
+			while (true) {
+				const coordination = this._getOrCreateSubagentCoordination();
+				if (!coordination) break;
+				this._exitSubagentCoordination("cancellation");
+				await this._waitForSubagentCoordination(coordination);
+			}
+			// Queued reports and input must not bypass an exhausted recovery budget.
+			// Leave them available for an explicit prompt or queue recovery by the caller.
+			return "failed";
 		}
 
 		// Reports already queued by this run must enter context before a new batch is frozen
 		// or an escalation-suspended coordination resumes waiting.
-		if (this.agent.hasQueuedMessages()) return true;
+		if (this.agent.hasQueuedMessages()) return "continue";
 
 		while (true) {
 			const coordination = this._getOrCreateSubagentCoordination();
@@ -2170,19 +2186,19 @@ export class AgentSession {
 				this._exitSubagentCoordination("cancellation");
 			}
 			const delivery = await this._waitForSubagentCoordination(coordination);
-			if (delivery.reason === "cancellation") return false;
+			if (delivery.reason === "cancellation") return "settled";
 			if (delivery.reason === "escalation") {
 				if (coordination.exitReason === "cancellation" || this._agentRunAborted) {
 					this._exitSubagentCoordination("cancellation");
 					await this._waitForSubagentCoordination(coordination);
-					return false;
+					return "settled";
 				}
-				return true;
+				return "continue";
 			}
 			if (delivery.results.length > 0) {
 				const message = this._createSubagentResultMessage(delivery.results);
 				await this.sendCustomMessage(message, { deliverAs: "steer" });
-				return true;
+				return "continue";
 			}
 			// Explicit agents consumption can empty this batch while the same continuation
 			// starts another coordinated child. Freeze that pending run before settling.
@@ -2190,7 +2206,7 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
-		return this.agent.hasQueuedMessages();
+		return this.agent.hasQueuedMessages() ? "continue" : "settled";
 	}
 
 	/**
@@ -3581,7 +3597,9 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false, signal, deferCommit);
+			const queuedContinuation = await this._runAutoCompaction("threshold", false, signal, deferCommit);
+			// Threshold compaction does not recover a provider failure.
+			return assistantMessage.stopReason !== "error" && queuedContinuation;
 		}
 		return false;
 	}

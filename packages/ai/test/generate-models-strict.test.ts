@@ -13,6 +13,63 @@ afterEach(() => {
 });
 
 describe("strict model generation", () => {
+	it("preserves Kimi Coding models from the renamed regional catalog", () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), "diffex-generate-kimi-"));
+		temporaryRoots.push(fixtureRoot);
+		const isolatedPackageRoot = join(fixtureRoot, "package");
+		mkdirSync(isolatedPackageRoot);
+		for (const entry of ["package.json", "scripts", "src"]) {
+			cpSync(join(packageRoot, entry), join(isolatedPackageRoot, entry), { recursive: true });
+		}
+		const modelIds = [
+			"deepseek-v4-flash-0731",
+			"deepseek-v4-pro",
+			"glm-5.2",
+			"qwen3.6-flash",
+			"qwen3.7-max",
+			"qwen3.7-plus",
+			"qwen3.8-max",
+		];
+		const catalog = {
+			"alibaba-token-plan": {
+				models: Object.fromEntries(modelIds.map((id) => [id, { id, name: id, tool_call: true }])),
+			},
+			"kimi-code-plan-cn": {
+				models: {
+					"kimi-for-coding": {
+						id: "kimi-for-coding",
+						name: "Kimi For Coding",
+						tool_call: true,
+						reasoning: true,
+						limit: { context: 1048576, output: 32768 },
+					},
+				},
+			},
+		};
+		const preloadPath = join(fixtureRoot, "mock-catalog.mjs");
+		writeFileSync(
+			preloadPath,
+			`const catalog = ${JSON.stringify(catalog)};\n` +
+				`globalThis.fetch = async (input) => new Response(JSON.stringify(\n` +
+				`  String(input) === "https://models.dev/api.json" ? catalog : { data: [] }\n` +
+				`), { status: 200 });\n`,
+		);
+		const result = spawnSync(
+			process.execPath,
+			["--import", pathToFileURL(preloadPath).href, "scripts/generate-models.ts", "--strict"],
+			{ cwd: isolatedPackageRoot, encoding: "utf8", timeout: 10_000 },
+		);
+		expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+		const models = JSON.parse(readFileSync(join(isolatedPackageRoot, "src/providers/data/kimi-coding.json"), "utf8"));
+		expect(models["anthropic-messages"]["kimi-for-coding"]).toMatchObject({
+			provider: "kimi-coding",
+			baseUrl: "https://api.kimi.com/coding",
+			contextWindow: 1048576,
+			maxTokens: 32768,
+			compat: { forceAdaptiveThinking: true, allowEmptySignature: true },
+		});
+	});
+
 	it("fails before mutating generated data when an Individual model loses tool support", () => {
 		const fixtureRoot = mkdtempSync(join(tmpdir(), "diffex-generate-models-"));
 		temporaryRoots.push(fixtureRoot);

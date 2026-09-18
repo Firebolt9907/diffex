@@ -1,6 +1,6 @@
 # Integration qualification uses the pinned Terminal-Bench 2.1 tasks/ tree.
 # Review this file before spending provider or Daytona credits.
-model = "openai/gpt-5.5"
+model = "openai/gpt-5.6-luna"
 # Maximum simultaneous trials, including cleanup; override with -n/--concurrency.
 concurrency = 1
 pilot_tasks = [

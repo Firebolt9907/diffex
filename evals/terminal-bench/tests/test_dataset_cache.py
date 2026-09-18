@@ -95,7 +95,7 @@ class DatasetCacheTests(unittest.TestCase):
         index = (self.root / "results/index.md").read_text()
         self.assertIn("[first](first/)", index)
         self.assertIn("[second](second/)", index)
-        self.assertIn("openai/gpt-5.5", index)
+        self.assertIn("openai/gpt-5.6-luna", index)
         self.assertIn("xhigh", index)
 
 

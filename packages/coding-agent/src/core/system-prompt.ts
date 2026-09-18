@@ -39,11 +39,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		promptGuidelines,
 		appendSystemPrompt,
 		evolutionMemory,
-		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 	} = options;
-	const promptCwd = cwd.replace(/\\/g, "/");
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 	const evolutionSection = evolutionMemory?.memory
@@ -76,8 +74,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		if (customPromptHasRead && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills);
 		}
-
-		prompt += `\nCurrent working directory: ${promptCwd}`;
 
 		return prompt;
 	}
@@ -117,12 +113,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	}
 	const guidelines = guidelineGroups.length > 0 ? guidelineGroups.join("\n") : "(none)";
 
-	let prompt = `You are Diffex, a coding agent. You help users by reading files, executing commands, editing code, and writing new files.
-
-Available tools:
+	let prompt = `Available tools:
 ${toolsList}
-
-In addition to the tools above, you may have access to other custom project-related tools.
 
 Tool usage guidelines:
 ${guidelines}
@@ -167,8 +159,6 @@ ${existsSync(examplesPath) ? `- Examples: ${examplesPath} (extensions, custom to
 	if (hasRead && skills.length > 0) {
 		prompt += formatSkillsForPrompt(skills);
 	}
-
-	prompt += `\nCurrent working directory: ${promptCwd}`;
 
 	return prompt;
 }

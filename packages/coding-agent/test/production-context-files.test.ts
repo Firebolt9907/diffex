@@ -48,6 +48,7 @@ describe("production default context files", () => {
 		expect(prompt).toContain(`<project_instructions path="${defaultPath}">\n${instructions}`);
 		expect(prompt).not.toContain("AGENTS_release.md");
 		const conversationalStyle = [
+			"When the user asks a question, answer it first before making edits or running implementation commands.",
 			"Keep responses concise and direct, adapting detail and terminology to the user.",
 			"No emojis in commits, issues, PR comments, or code.",
 			'No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!").',

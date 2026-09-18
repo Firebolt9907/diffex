@@ -39,9 +39,7 @@ describe("production system prompt selection", () => {
 			mkdirSync(join(directory, "examples"));
 		}
 		const prompt = buildSystemPrompt({ cwd: "/project" });
-		expect(prompt.slice(prompt.indexOf("Diffex documentation"))).toBe(
-			`${documentation}\nCurrent working directory: /project`,
-		);
+		expect(prompt.slice(prompt.indexOf("Diffex documentation"))).toBe(documentation);
 		expect(prompt.match(/Diffex documentation/g)).toHaveLength(1);
 		expect(prompt).not.toContain(directory);
 	});
@@ -89,7 +87,12 @@ describe("production system prompt selection", () => {
 				expect(production).not.toContain("Diffex documentation");
 			} else {
 				expect(production).toBe(
-					development.replace(/Diffex documentation.*?(?=\n\nAppended instructions\.)/s, documentation),
+					development
+						.replace(/Diffex documentation.*?(?=\n\nAppended instructions\.)/s, documentation)
+						.replace(
+							"Conversational Style:\n",
+							"Conversational Style:\n- When the user asks a question, answer it first before making edits or running implementation commands.\n",
+						),
 				);
 			}
 		},

@@ -15,11 +15,9 @@ export function buildProductionSystemPrompt(options: BuildSystemPromptOptions): 
 		promptGuidelines,
 		appendSystemPrompt,
 		evolutionMemory,
-		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 	} = options;
-	const promptCwd = cwd.replace(/\\/g, "/");
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 	const evolutionSection = evolutionMemory?.memory
@@ -52,8 +50,6 @@ export function buildProductionSystemPrompt(options: BuildSystemPromptOptions): 
 		if (customPromptHasRead && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills);
 		}
-
-		prompt += `\nCurrent working directory: ${promptCwd}`;
 
 		return prompt;
 	}
@@ -89,17 +85,14 @@ export function buildProductionSystemPrompt(options: BuildSystemPromptOptions): 
 	}
 	const guidelines = guidelineGroups.length > 0 ? guidelineGroups.join("\n") : "(none)";
 
-	let prompt = `You are Diffex, a coding agent. You help users by reading files, executing commands, editing code, and writing new files.
-
-Available tools:
+	let prompt = `Available tools:
 ${toolsList}
-
-In addition to the tools above, you may have access to other custom project-related tools.
 
 Tool usage guidelines:
 ${guidelines}
 
 Conversational Style:
+- When the user asks a question, answer it first before making edits or running implementation commands.
 - Keep responses concise and direct, adapting detail and terminology to the user.
 - No emojis in commits, issues, PR comments, or code.
 - No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!").
@@ -131,8 +124,6 @@ Diffex documentation (read the documentation website only when the user asks abo
 	if (hasRead && skills.length > 0) {
 		prompt += formatSkillsForPrompt(skills);
 	}
-
-	prompt += `\nCurrent working directory: ${promptCwd}`;
 
 	return prompt;
 }

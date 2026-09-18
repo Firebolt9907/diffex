@@ -123,9 +123,7 @@ describe("subagent parent messaging foundation", () => {
 		expectNoDelegatedMessageTrustGuidance(defaultRoot.session.systemPrompt);
 
 		const customRoot = await setupRoot({ systemPrompt: () => "Custom root policy" });
-		expect(customRoot.session.systemPrompt).toBe(
-			`Custom root policy\nCurrent working directory: ${customRoot.services.cwd.replace(/\\/g, "/")}`,
-		);
+		expect(customRoot.session.systemPrompt).toBe("Custom root policy");
 		expectNoDelegatedMessageTrustGuidance(customRoot.session.systemPrompt);
 
 		const filteredRoot = await setupRoot({ tools: [] });

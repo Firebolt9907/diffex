@@ -1,16 +1,9 @@
 # Development Rules
 
-## Conversational Style
-
-- When the user asks a question, answer it first before making edits or running implementation commands.
-- Address the user's feedback directly before describing changes.
-
 ## Code Quality
 
 - Before editing or drawing conclusions, read enough surrounding code to understand the relevant behavior and dependencies.
 - Read affected files in full for broad changes; do not rely on search snippets alone for investigations or audits.
-- Ask before removing intentional functionality or code when the removal falls outside the requested scope or its purpose is unclear.
-- Preserve unrelated local changes and keep modifications focused on the requested task.
 
 ## Commands
 

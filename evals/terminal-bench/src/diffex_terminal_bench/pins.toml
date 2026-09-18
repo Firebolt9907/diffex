@@ -3,7 +3,8 @@ node_version = "22.23.2"
 diffex_version = "0.2.5"
 npm_registry = "https://registry.npmjs.org/"
 diffex_integrity = "sha512-sVuxdhOjEERLN3IFemHVeANttzQPDLLJSXqohn5eyVPPmij5mHnHScsigBMquXgyHcwJVHKxgL8c0prcT7zEPw=="
-release_agents_sha256 = "6f194cd7f04d80e08cd3c8b22096de33ba5dbb2ba42176567c466579f8ec26db"
+# Must match the instructions shipped by diffex_version, not the current checkout.
+release_agents_sha256 = "151d63e555215dc3a7edae96e4e2c6405f300c6ec1bfc525704deb5aa185fed2"
 setup_timeout_sec = 600
 
 [node_sha256]

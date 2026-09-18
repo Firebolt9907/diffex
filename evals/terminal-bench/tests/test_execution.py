@@ -38,10 +38,10 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.logs_dir = Path(temporary.name)
 
-    def test_release_context_and_example_config(self):
-        root = Path(__file__).resolve().parents[3]
+    def test_pinned_release_context_and_example_config(self):
+        # This fixture belongs to the pinned npm release. Current source
+        # instructions may change before the benchmark selects a new release.
         release_context = files("diffex_terminal_bench").joinpath("release-agents.md").read_bytes()
-        self.assertEqual(release_context, (root / "AGENTS_release.md").read_bytes())
         self.assertEqual(hashlib.sha256(release_context).hexdigest(), PINS["release_agents_sha256"])
         config = JobConfig.model_validate(yaml.safe_load((Path(__file__).resolve().parents[1] / "execution.yaml").read_text()))
         self.assertEqual(config.agents[0].import_path, DiffexAgent.import_path())

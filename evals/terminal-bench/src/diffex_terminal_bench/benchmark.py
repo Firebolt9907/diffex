@@ -107,6 +107,19 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
               "failures": [], "completed_trials": 0, "expected_trials": len(selected)}
     write_json(directory / "gate.json", report)
     refresh_index(root.parent)
+
+    def checkpoint(*, final: bool = False) -> bool:
+        try:
+            write_json(directory / "gate.json", report)
+        except Exception as exc:
+            report.setdefault("report_write_errors", []).append({
+                "error": type(exc).__name__, "completed_trials": report["completed_trials"], "final": final,
+            })
+            progress(f"{stage}: could not save gate.json ({type(exc).__name__}); retaining results in memory for retry.")
+            return False
+        refresh_index(root.parent)
+        return True
+
     try:
         async with AsyncDaytona() as client:
             pending = iter(enumerate(selected, 1))
@@ -187,8 +200,7 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                         progress(f"{stage} {index}/{len(selected)}: failed: {reason}. "
                                  f"Evidence: {directory / failure['directory']}. Continuing remaining trials.")
                     report["completed_trials"] += 1
-                    write_json(directory / "gate.json", report)
-                    refresh_index(root.parent)
+                    checkpoint()
 
             # Only stage-level failures or explicit cancellation cancel peers.
             # Wait for every started trial's cleanup before closing clients.
@@ -197,26 +209,36 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                     group.create_task(worker())
             if report["completed_trials"] != len(selected):
                 raise RuntimeError("Stage did not complete every selected trial")
-        if report["failures"]:
-            failure = report["failure"]
-            reason = failure_reason(failure)
-            raise StageFailedError(f"{stage}: completed {len(selected)} trials with {len(report['failures'])} failed; "
-                                   f"qualification failed. First failure: {reason}. "
-                                   f"Evidence: {directory / failure['directory']}. All failures: {directory / 'gate.json'}.")
-        report["passed"] = True
+        report["passed"] = not report["failures"]
     except BaseException as exc:
         report.setdefault("failure", {"error": type(exc).__name__})
         raise
     finally:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         try:
-            write_json(directory / "gate.json", report)
-            refresh_index(root.parent)
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(1)
+                persisted = checkpoint(final=True)
+                if persisted:
+                    break
+            if not persisted:
+                report["passed"] = False
+                report["incomplete"] = True
+                progress(f"{stage}: qualification incomplete; final report could not be saved to {directory / 'gate.json'}.")
         finally:
             # Harbor owns a separate singleton HTTP client; close it even if
             # writing the final report fails.
             manager = await DaytonaClientManager.get_instance()
             await manager._cleanup()
+    if report["failures"] or not persisted:
+        reason = ""
+        if report["failures"]:
+            failure = report["failure"]
+            reason = f" First failure: {failure_reason(failure)}. Evidence: {directory / failure['directory']}."
+        status = "failed" if persisted else "incomplete: final report could not be saved"
+        raise StageFailedError(f"{stage}: completed {len(selected)} trials with {len(report['failures'])} failed; "
+                               f"qualification {status}.{reason} Report: {directory / 'gate.json'}.")
     progress(f"{stage}: passed; evidence: {directory}")
 
 

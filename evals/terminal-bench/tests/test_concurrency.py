@@ -250,6 +250,88 @@ class ParallelStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["completed_trials"], 10)
         self.assertEqual(self.cleaned, set(range(1, 11)))
 
+    async def test_checkpoint_failure_preserves_failed_trial_and_continues_peers(self):
+        self.failure_phase = "run"
+        await self.check_report_write_failure()
+
+    async def test_checkpoint_failure_can_recover_without_failing_trials(self):
+        await self.check_report_write_failure()
+
+    async def test_final_report_write_is_retried(self):
+        await self.check_report_write_failure(final_only=True)
+
+    async def test_persistent_checkpoint_failure_finishes_every_trial(self):
+        self.failure_phase = "run"
+        await self.check_report_write_failure(permanent=True)
+
+    async def test_persistent_final_write_cannot_pass_qualification(self):
+        await self.check_report_write_failure(final_only=True, permanent=True)
+
+    async def test_report_write_failure_cannot_mask_stage_cancellation(self):
+        def save(path, value):
+            if path.name == "gate.json" and value.get("finished_at"):
+                raise OSError("disk full")
+            write_json(path, value)
+
+        with patch("diffex_terminal_bench.benchmark.write_json", side_effect=save):
+            task = self.start_stage()
+            await self.wait_events(self.started, (1, 2, 3))
+            task.cancel()
+            for event in self.finish_cleanup.values():
+                event.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+        self.assertEqual(self.cleaned, {1, 2, 3})
+        self.assertFalse(self.started[4].is_set())
+        self.manager._cleanup.assert_awaited_once()
+
+    async def check_report_write_failure(self, *, final_only=False, permanent=False):
+        failures = 0
+
+        def save(path, value):
+            nonlocal failures
+            if path.name == "gate.json" and value["completed_trials"] > 0:
+                if (not final_only or value.get("finished_at")) and (permanent or failures == 0):
+                    failures += 1
+                    raise OSError("disk full")
+            write_json(path, value)
+
+        with patch("diffex_terminal_bench.benchmark.write_json", side_effect=save):
+            task = self.start_stage()
+            await self.wait_events(self.started, (1, 2, 3))
+            self.finish_run[2].set()
+            self.finish_cleanup[2].set()
+            await self.wait_events(self.started, (4,))
+            self.assertFalse(self.cleaning[1].is_set())
+            self.assertFalse(self.cleaning[3].is_set())
+            for event in (*self.finish_run.values(), *self.finish_cleanup.values()):
+                event.set()
+            if permanent or self.failure_phase:
+                with self.assertRaises(StageFailedError) as error:
+                    await asyncio.wait_for(task, 5)
+                self.assertIn("completed 10", str(error.exception))
+                if permanent:
+                    self.assertIn("incomplete", str(error.exception))
+                if self.failure_phase:
+                    self.assertIn("ValueError", str(error.exception))
+            else:
+                await asyncio.wait_for(task, 5)
+        self.assertEqual(self.cleaned, set(range(1, 11)))
+        self.assertEqual(self.peak, 3)
+        self.manager._cleanup.assert_awaited_once()
+        report = read_json(self.root / "pilot/gate.json")
+        if permanent:
+            self.assertFalse(report["passed"])
+            self.assertNotIn("finished_at", report)
+            self.assertGreaterEqual(failures, 3)
+        else:
+            self.assertEqual(failures, 1)
+            self.assertEqual(report["passed"], self.failure_phase is None)
+            self.assertEqual(report["completed_trials"], 10)
+            self.assertEqual(len(report["trials"]), 9 if self.failure_phase else 10)
+            self.assertEqual(len(report["failures"]), 1 if self.failure_phase else 0)
+            self.assertEqual(report["report_write_errors"][0]["error"], "OSError")
+
     async def check_failure(self, *, formatted=True):
         task = self.start_stage()
         await self.wait_events(self.started, (1, 2, 3))

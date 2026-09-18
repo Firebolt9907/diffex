@@ -121,5 +121,8 @@ def refresh_index(results: Path) -> None:
     # A navigation failure must never hide a trial exception or skip cleanup.
     try:
         write_index(results)
-    except OSError as exc:
-        print(f"Could not refresh run index ({type(exc).__name__}); use --refresh-index to retry.", file=sys.stderr)
+    except Exception as exc:
+        try:
+            print(f"Could not refresh run index ({type(exc).__name__}); use --refresh-index to retry.", file=sys.stderr)
+        except Exception:
+            pass  # The warning stream is also optional navigation output.

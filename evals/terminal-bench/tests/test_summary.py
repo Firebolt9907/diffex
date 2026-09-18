@@ -79,6 +79,17 @@ class SummaryTests(unittest.TestCase):
             refresh_index(self.root)
         self.assertTrue(stderr.write.called)
 
+    def test_unexpected_index_error_and_broken_warning_stream_are_nonfatal(self):
+        with patch("diffex_terminal_bench.summary.write_index", side_effect=ValueError("malformed index")), \
+             patch("sys.stderr") as stderr:
+            stderr.write.side_effect = BrokenPipeError
+            refresh_index(self.root)
+
+    def test_index_refresh_preserves_explicit_interruption(self):
+        with patch("diffex_terminal_bench.summary.write_index", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                refresh_index(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,10 +23,11 @@ if (action === "health") {
 } else if (action === "verify-service") {
 	(async () => {
 		const runDir = process.argv[3];
-		const service = JSON.parse(readFileSync(join(runDir, "service.json"), "utf8"));
+		const evidence = JSON.parse(process.env.DIFFEX_TB_SERVICE_EVIDENCE);
+		const service = evidence.service;
 		assert.equal(identity(service.pid), service.start);
 		for (const name of ["launcher", "cli"]) {
-			const control = JSON.parse(readFileSync(join(runDir, `${name}.json`), "utf8"));
+			const control = evidence[name];
 			assert.notEqual(identity(control.pid), control.start);
 		}
 		const socket = connect(service.port, "127.0.0.1");

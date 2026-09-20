@@ -128,8 +128,15 @@ async def smoke(platform, source_image=None, grpc_fixture=False):
                     if scenario == "recovered":
                         assert outcome["recovered_retries"] == 1, outcome
                     if scenario in ("success", "timeout", "service-failure", "forced-death", "grpc"):
+                        # Harbor transfers mounted log ownership to the host on
+                        # Linux. Verify as the task user using collected evidence.
+                        verification_env = {"DIFFEX_TB_SERVICE_EVIDENCE": json.dumps({
+                            name: json.loads((run_dir / f"{name}.json").read_text())
+                            for name in ("service", "launcher", "cli")
+                        })}
                         verification = await agent.exec_as_agent(environment, command=
-                            f"/opt/diffex-terminal-bench/node/bin/node /tmp/faux-outcomes.cjs verify-service {context.metadata['diffex_run_dir']}")
+                            f"/opt/diffex-terminal-bench/node/bin/node /tmp/faux-outcomes.cjs verify-service {context.metadata['diffex_run_dir']}",
+                            env=verification_env)
                         (run_dir / "service-verification.json").write_text(verification.stdout)
                         assert json.loads(verification.stdout)["verified"] is True
                         before = json.loads((run_dir / "service-before-exit.json").read_text())
@@ -142,7 +149,8 @@ async def smoke(platform, source_image=None, grpc_fixture=False):
                         assert "7 passed" in verifier.stdout, verifier.stdout
                         # Check the same process again after all verifier RPCs.
                         await agent.exec_as_agent(environment, command=
-                            f"/opt/diffex-terminal-bench/node/bin/node /tmp/faux-outcomes.cjs verify-service {context.metadata['diffex_run_dir']}")
+                            f"/opt/diffex-terminal-bench/node/bin/node /tmp/faux-outcomes.cjs verify-service {context.metadata['diffex_run_dir']}",
+                            env=verification_env)
                     report["outcomes"].append({"scenario": scenario, "user": user, "outcome": outcome,
                                                "trajectory_validated": True, "accounting": context.metadata["diffex_accounting"]})
                     print(f"{scenario} user={user}: {outcome['status']}, cleanup confirmed", flush=True)

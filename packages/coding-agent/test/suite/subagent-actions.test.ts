@@ -62,9 +62,45 @@ describe("subagent actions", () => {
 		return fixture;
 	}
 
+	it("delivers ordinary agent_action messages before the child's next tool turn", async () => {
+		const { harness, controller, createSession } = await setup();
+		controller.bindParent(harness.session, () => []);
+		const first = deferred<AssistantMessage>();
+		harness.setResponses([
+			() => first.promise,
+			(context) => {
+				expect(getLastUserText(context)).toBe("The build is solved; stop investigating.");
+				return fauxAssistantMessage("Stopped obsolete investigation.");
+			},
+		]);
+		const child = spawnTracked(controller, "worker", "Investigate the build", createSession);
+		await waitForStatus(controller, "worker", "running");
+		const tool = controller.createToolDefinitions().find((tool) => tool.name === "agent_action")!;
+		const result = await tool.execute(
+			"steer-child",
+			{
+				target: "worker",
+				action: "message",
+				message: "The build is solved; stop investigating.",
+			},
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		first.resolve(
+			fauxAssistantMessage(fauxToolCall("read", { path: "missing-test-file" }), { stopReason: "toolUse" }),
+		);
+		await waitForStatus(controller, "worker", "idle");
+		expect(result.details).toMatchObject({ delivery: "steer" });
+		expect(child.session?.getLastAssistantText()).toBe("Stopped obsolete investigation.");
+	});
+
 	it("defines strict actions, normalizes wake, and returns private stable details", async () => {
 		const privateMessage = "private child instructions";
 		const action = vi.fn(async (request: AgentActionRequest): Promise<SubagentActionResult> => {
+			if (request.action === "renew") {
+				return { target: request.target, action: "renew", status: "running", deadline: 1234 };
+			}
 			if (request.action === "interrupt") {
 				return { target: request.target, action: "interrupt", status: "interrupted" };
 			}
@@ -78,7 +114,7 @@ describe("subagent actions", () => {
 			additionalProperties: false,
 			properties: {
 				target: { type: "string" },
-				action: { type: "string", enum: ["message", "interrupt"] },
+				action: { type: "string", enum: ["message", "interrupt", "renew"] },
 				message: { type: "string" },
 				wake: { type: "boolean" },
 			},
@@ -99,6 +135,7 @@ describe("subagent actions", () => {
 			action: "message",
 			message: privateMessage,
 			wake: false,
+			delivery: "steer",
 		});
 		expect(result.details).toEqual({
 			target: "worker",
@@ -106,6 +143,15 @@ describe("subagent actions", () => {
 			status: "idle",
 			delivery: "follow_up",
 		});
+		await expect(
+			executeAction(tool, { target: "worker", action: "renew", reason: "Build progressing", lease_ms: 1000 }),
+		).resolves.toMatchObject({ details: { action: "renew", deadline: 1234 } });
+		await expect(executeAction(tool, { target: "worker", action: "renew", reason: " " })).rejects.toThrow(
+			"justification",
+		);
+		await expect(
+			executeAction(tool, { target: "worker", action: "renew", reason: "Build", lease_ms: 0 }),
+		).rejects.toThrow("lease_ms");
 		const serialized = JSON.stringify(result);
 		expect(serialized).not.toContain(privateMessage);
 		for (const key of ["task", "output", "error", "usage"]) {
@@ -149,7 +195,7 @@ describe("subagent actions", () => {
 			return originalSteer(message);
 		});
 
-		const followResult = controller.message("worker", "later message");
+		const followResult = controller.message("worker", "later message", false, false, "follow_up");
 		const steerResult = controller.message("worker", "urgent message", true);
 		await expect(followResult).resolves.toMatchObject({ delivery: "follow_up", status: "running" });
 		await expect(steerResult).resolves.toMatchObject({ delivery: "steer", status: "running" });
@@ -177,9 +223,9 @@ describe("subagent actions", () => {
 		});
 		const secondFollowUp = vi.spyOn(second.session!, "followUp").mockResolvedValue();
 
-		const firstAction = controller.message("first", "blocked");
+		const firstAction = controller.message("first", "blocked", false, false, "follow_up");
 		await firstStarted.promise;
-		const secondAction = controller.message("second", "independent");
+		const secondAction = controller.message("second", "independent", false, false, "follow_up");
 		await expect(secondAction).resolves.toMatchObject({ target: "second", delivery: "follow_up" });
 		expect(secondFollowUp).toHaveBeenCalledOnce();
 		firstGate.resolve();
@@ -197,8 +243,11 @@ describe("subagent actions", () => {
 		await waitForStatus(controller, "worker", "idle");
 		const session = record.session;
 		const revision = controller.snapshot().revision;
+		await expect(controller.message("worker", "stale correction")).rejects.toThrow(
+			"Cannot steer idle subagent without wake",
+		);
 
-		await expect(controller.message("worker", "older follow-up")).resolves.toMatchObject({
+		await expect(controller.message("worker", "older follow-up", false, false, "follow_up")).resolves.toMatchObject({
 			status: "idle",
 			delivery: "follow_up",
 		});
@@ -284,7 +333,7 @@ describe("subagent actions", () => {
 		harness.setResponses([fauxAssistantMessage("idle")]);
 		const record = spawnTracked(controller, "worker", "initial", createSession);
 		await waitForStatus(controller, "worker", "idle");
-		await controller.message("worker", "pending follow-up");
+		await controller.message("worker", "pending follow-up", false, false, "follow_up");
 		expect(record.session?.pendingMessageCount).toBe(1);
 
 		await expect(controller.interrupt("worker")).resolves.toEqual({
@@ -454,9 +503,9 @@ describe("subagent actions", () => {
 		await expect(secondWake).resolves.toMatchObject({ status: "running", delivery: "steer" });
 		await waitForStatus(controller, "worker", "running");
 
-		const message = controller.message("worker", "queued follow-up");
+		const message = controller.message("worker", "queued follow-up", false, false, "follow_up");
 		const interrupt = controller.interrupt("worker");
-		await expect(message).resolves.toMatchObject({ delivery: "follow_up" });
+		await expect(message).rejects.toThrow("Subagent interrupted");
 		await expect(interrupt).resolves.toMatchObject({ status: "interrupted" });
 		expect(record.session?.pendingMessageCount).toBe(0);
 		await expect(controller.interrupt("worker")).resolves.toMatchObject({ status: "interrupted" });
@@ -475,7 +524,7 @@ describe("subagent actions", () => {
 		controller.trackRun("worker", run);
 		const followUp = vi.spyOn(session, "followUp").mockResolvedValue();
 
-		const action = controller.message("worker", "boundary message");
+		const action = controller.message("worker", "boundary message", false, false, "follow_up");
 		expect(followUp).not.toHaveBeenCalled();
 		completion.resolve();
 		await expect(action).resolves.toMatchObject({ status: "idle", delivery: "follow_up" });
@@ -532,7 +581,7 @@ describe("subagent actions", () => {
 		controller.spawn("worker", "run tool", async () => child.session);
 		await toolStarted.promise;
 		await controller.message("worker", "steer pending", true);
-		await controller.message("worker", "follow pending");
+		await controller.message("worker", "follow pending", false, false, "follow_up");
 		expect(child.session.pendingMessageCount).toBe(2);
 
 		await controller.interrupt("worker");

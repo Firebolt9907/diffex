@@ -24,18 +24,49 @@ Harbor is pinned to `0.23.0` in `pyproject.toml` and `uv.lock`.
 The adapter follows that release's `BaseInstalledAgent.install(environment)` interface.
 See [Harbor's installed-agent documentation](https://www.harborframework.com/docs/agents).
 
+## Full evaluation with additional sandbox storage
+
+The native full job uses [full.yaml](full.yaml): 89 tasks, five attempts each, three concurrent trials, and no automatic retries.
+It requests 20 GiB of disk per sandbox so task files and Harbor's temporary log archive have more room than the failing 10 GiB allocation.
+This is an explicit resource override, not an evaluation with the official task resource limits unchanged.
+Daytona must allow the requested per-sandbox allocation and enough total storage for concurrent sandboxes.
+The extra disk reduces the risk of archive failures; it does not guarantee that an unbounded task cannot fill the disk.
+
+After exporting `DAYTONA_API_KEY` and `OPENAI_API_KEY`, prepare and inspect a fresh job in zsh:
+
+```zsh
+TB_OUTPUT="results/full-89x5-tb21-$(date +%Y%m%d-%H%M%S)-$(uuidgen)"
+TB_STORAGE_MB=20480
+mkdir -p "$TB_OUTPUT"
+git rev-parse HEAD > "$TB_OUTPUT/adapter-commit.txt"
+TB_RUN=(uv run --locked harbor run --config full.yaml
+  --override-storage-mb "$TB_STORAGE_MB"
+  --jobs-dir "$TB_OUTPUT" --job-name full)
+"${TB_RUN[@]}" --print-config > "$TB_OUTPUT/planned-config.json"
+cat "$TB_OUTPUT/planned-config.json"
+```
+
+Start only after reviewing the resolved configuration:
+
+```zsh
+"${TB_RUN[@]}"
+```
+
+Use a new output directory when changing disk allocation; do not mix results from different resource limits.
+The adapter installs the published version in `pins.toml`, so local runtime fixes require a new published release and a reviewed pin update before they are exercised by this job.
+
 ## Installation contract
 
 The task container must provide Debian/Ubuntu Linux with glibc, root access, Bash, GNU coreutils, and network access to its apt mirrors, nodejs.org, and registry.npmjs.org.
 Linux x86_64 and aarch64 have separate pinned Node archive checksums.
 The installer fails explicitly on unsupported platforms and refuses to reuse an existing installation.
 
-[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.2.6`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
+[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.2.7`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
 The deadline includes apt prerequisites, Node download, npm installation, and all three CLI checks.
 GNU `timeout` terminates the installer process group at the deadline and kills it after a ten-second grace period.
 Harbor's command transport allows another five seconds to collect the result.
 
-Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.2.6` with a private prefix.
+Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.2.7` with a private prefix.
 An isolated home and npm cache prevent host or task npm settings from changing installation.
 Node archive SHA-256, registry metadata, installed package version, and npm lockfile integrity must match the checked-in pins.
 The `/usr/local/bin/diffex` wrapper always invokes the pinned Node binary.

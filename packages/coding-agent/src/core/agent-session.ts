@@ -57,6 +57,7 @@ import type {
 	HarnessWorkspaceIdentity,
 } from "@diffexai/diffex-harness-state";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
+import { OwnedShellProcesses } from "../utils/owned-shell-processes.ts";
 import { canonicalizePath, resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
@@ -423,6 +424,7 @@ interface SubagentCoordination {
 	currentWaitAbortController?: AbortController;
 	exitReason?: "escalation" | "cancellation";
 	waitStarted: boolean;
+	completionChecked?: boolean;
 }
 
 interface PromptReservation {
@@ -518,6 +520,8 @@ export class AgentSession {
 	private readonly _bashAbortControllers = new Set<AbortController>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
 	private readonly _ownedOperations = new Set<Promise<unknown>>();
+	private readonly _shellProcesses = new OwnedShellProcesses();
+	private readonly _bashOperations = new Set<Promise<BashResult>>();
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -802,11 +806,26 @@ export class AgentSession {
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
 			const previousContext = previousSnapshot?.context ?? turn.context;
+			let messages = previousContext.messages;
+			// Tool output is part of the next request even though the model's usage
+			// only describes the request before that output. Check every complete batch.
+			if (turn.toolResults.length > 0 && !signal?.aborted && this.model) {
+				const settings = this.settingsManager.getCompactionSettings();
+				if (shouldCompact(estimateContextTokens(messages).tokens, this.model.contextWindow, settings)) {
+					const beforeCompaction = this.agent.state.messages;
+					await this._runAutoCompaction("threshold", true, signal);
+					if (this.agent.state.messages !== beforeCompaction) {
+						messages = this.agent.state.messages;
+					}
+				}
+			}
 
+			signal?.throwIfAborted();
 			return {
 				...previousSnapshot,
 				context: {
 					...previousContext,
+					messages,
 					systemPrompt:
 						this._activeRunCollaborationState?.effectiveSystemPrompt ??
 						this._deriveEffectivePrompt(
@@ -1273,7 +1292,7 @@ export class AgentSession {
 		const ownedOperationsIdle = this._waitForOwnedOperations();
 
 		const cleanupResults = await Promise.allSettled(
-			[childCleanup, rootIdle, ownedOperationsIdle].filter(
+			[childCleanup, rootIdle, ownedOperationsIdle, this.terminateOwnedShellProcesses()].filter(
 				(promise): promise is Promise<void> => promise !== undefined,
 			),
 		);
@@ -2184,6 +2203,28 @@ export class AgentSession {
 			if (!coordination) break;
 			if (coordination.exitReason === "cancellation" || this._agentRunAborted) {
 				this._exitSubagentCoordination("cancellation");
+			} else if (!coordination.completionChecked) {
+				coordination.completionChecked = true;
+				const active = this.getSubagents().filter(
+					(child) =>
+						coordination.names.includes(child.name) && (child.status === "running" || child.status === "queued"),
+				);
+				if (active.length > 0) {
+					await this.sendCustomMessage(
+						{
+							customType: "subagent_completion_check",
+							content: JSON.stringify({
+								type: "subagent_completion_check",
+								agents: active,
+								instruction:
+									"Resolve active children before declaring completion. If the parent task is solved or their work is obsolete, cancel them now with agent_action interrupt. For work still needed, use wait_for_agents and inspect the results. Renew only justified long-running work; do not prolong a solved task.",
+							}),
+							display: false,
+						},
+						{ deliverAs: "steer" },
+					);
+					return "continue";
+				}
 			}
 			const delivery = await this._waitForSubagentCoordination(coordination);
 			if (delivery.reason === "cancellation") return "settled";
@@ -3034,10 +3075,22 @@ export class AgentSession {
 
 	private async _abort(): Promise<void> {
 		this.abortRetry();
+		this.abortCompaction();
+		this.abortBranchSummary();
+		this.abortBash();
 		if (this._isAgentRunActive) this._agentRunAborted = true;
 		this._exitSubagentCoordination("cancellation");
 		this.agent.abort();
-		await this.waitForIdle();
+		await Promise.all([this.waitForIdle(), this.terminateOwnedShellProcesses(), ...this._bashOperations]);
+	}
+
+	/** Stop and verify all shell processes owned by this session, including background jobs. */
+	async terminateOwnedShellProcesses(): Promise<void> {
+		await this._shellProcesses.terminateAll();
+	}
+
+	get ownedShellProcessCount(): number {
+		return this._shellProcesses.count;
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -3653,6 +3706,9 @@ export class AgentSession {
 			}
 
 			this._autoCompactionAbortController = new AbortController();
+			const compactionSignal = signal
+				? AbortSignal.any([signal, this._autoCompactionAbortController.signal])
+				: this._autoCompactionAbortController.signal;
 			this._emit({ type: "compaction_start", reason });
 			started = true;
 
@@ -3667,7 +3723,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
-					signal: this._autoCompactionAbortController.signal,
+					signal: compactionSignal,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
@@ -3708,7 +3764,7 @@ export class AgentSession {
 					apiKey,
 					headers,
 					undefined,
-					this._autoCompactionAbortController.signal,
+					compactionSignal,
 					this.thinkingLevel,
 					this.agent.streamFunction,
 					env,
@@ -3723,7 +3779,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
-			if (this._autoCompactionAbortController.signal.aborted) {
+			if (compactionSignal.aborted) {
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -4135,7 +4191,7 @@ export class AgentSession {
 			: {
 					...createAllToolDefinitions(this._cwd, {
 						read: { autoResizeImages },
-						bash: { commandPrefix: shellCommandPrefix, shellPath },
+						bash: { commandPrefix: shellCommandPrefix, shellPath, owner: this._shellProcesses },
 					}),
 					update_plan: createSessionUpdatePlanToolDefinition(this.sessionManager),
 				};
@@ -4383,7 +4439,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
-		return this._runOwnedOperation(() =>
+		const operation = this._runOwnedOperation(() =>
 			this._traceOperation("bash", () =>
 				startCodingAgentSpan(
 					this.agent.telemetryContext,
@@ -4402,6 +4458,12 @@ export class AgentSession {
 				),
 			),
 		);
+		this._bashOperations.add(operation);
+		void operation.then(
+			() => this._bashOperations.delete(operation),
+			() => this._bashOperations.delete(operation),
+		);
+		return operation;
 	}
 
 	private async _executeBash(
@@ -4421,7 +4483,7 @@ export class AgentSession {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
 				this.sessionManager.getCwd(),
-				options?.operations ?? createLocalBashOperations({ shellPath }),
+				options?.operations ?? createLocalBashOperations({ shellPath, owner: this._shellProcesses }),
 				{
 					onChunk: (delta) => {
 						onChunk?.(delta);

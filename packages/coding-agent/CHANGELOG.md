@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### New Features
+
+- Added opt-in background services that survive CLI and subagent exit, with explicit environment ownership.
+  See [Background process lifetime](docs/background-processes.md) ([#242](https://github.com/diffexai/diffex/pull/242)).
+
+### Added
+
+- Added CLI and SDK options for environment-owned background processes on Linux and macOS, with durable ownership records and inherited policy for child sessions.
+  See [Background process lifetime](docs/background-processes.md) ([#242](https://github.com/diffexai/diffex/pull/242)).
+
+### Fixed
+
+- Fixed successful background services being terminated after ownership transfers to the environment, including on later failures, interruption, session replacement, and disposal ([#242](https://github.com/diffexai/diffex/pull/242)).
+- Fixed print-mode shutdown to await shared runtime disposal and handle SIGINT cleanup ([#242](https://github.com/diffexai/diffex/pull/242)).
+
 ## [0.3.0] - 2026-09-20
 
 ### New Features

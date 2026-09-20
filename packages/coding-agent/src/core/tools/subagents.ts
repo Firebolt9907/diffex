@@ -20,7 +20,8 @@ const spawnAgentSchema = Type.Object({
 const escalateToParentSchema = Type.Object(
 	{
 		message: Type.String({
-			description: "Material blocker, risk, contradiction, or decision requiring parent attention",
+			description:
+				"Material blocker, risk, contradiction, decision, or allowance extension requiring parent attention",
 			minLength: 1,
 			maxLength: 1_000,
 		}),
@@ -38,16 +39,9 @@ const agentActionSchema = Type.Object(
 		target: targetSchema,
 		reason: Type.Optional(
 			Type.String({
-				description: "Justification for extending needed work, with evidence of progress",
-				minLength: 1,
-			}),
-		),
-		lease_ms: Type.Optional(
-			Type.Integer({
 				description:
-					"Renewable allowance from now; defaults to configured 15 minutes and is capped by the parent deadline",
-				minimum: 1,
-				maximum: 2_147_483_647,
+					"Justification for extending needed work based on current progress, remaining work, and the goal",
+				minLength: 1,
 			}),
 		),
 		action: Type.Unsafe<AgentActionRequest["action"]>({
@@ -67,22 +61,13 @@ const agentActionSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-const agentsSchema = Type.Object(
+const agentStatusSchema = Type.Object(
 	{
-		timeout_ms: Type.Integer({
-			description: "Maximum time to wait in milliseconds, or zero to return immediately",
-			minimum: 0,
-		}),
 		targets: Type.Optional(
 			Type.Array(targetSchema, {
-				description: "Child agent names to inspect, frozen when the call starts",
+				description: "Child agent names to inspect; omit to inspect all children",
 				minItems: 1,
 				uniqueItems: true,
-			}),
-		),
-		until: Type.Optional(
-			Type.Union([Type.Literal("any"), Type.Literal("all")], {
-				description: "Wait until any or all selected agents reach a terminal status",
 			}),
 		),
 	},
@@ -98,21 +83,18 @@ export type AgentActionRequest =
 			readonly delivery?: "steer" | "follow_up";
 	  }
 	| { readonly target: string; readonly action: "interrupt" }
-	| { readonly target: string; readonly action: "renew"; readonly reason: string; readonly lease_ms?: number };
+	| { readonly target: string; readonly action: "renew"; readonly reason: string };
 
 export interface SpawnAgentDetails {
 	readonly name: string;
 	readonly status: "queued";
 }
 
-export interface AgentsRequest {
-	readonly timeout_ms: number;
+export interface AgentStatusRequest {
 	readonly targets?: string[];
-	readonly until?: "any" | "all";
 }
 
-export interface AgentsDetails {
-	readonly timed_out: boolean;
+export interface AgentStatusDetails {
 	readonly agents: readonly SubagentResultView[];
 }
 
@@ -127,10 +109,10 @@ export function createEscalateToParentTool(
 		name: "escalate_to_parent",
 		label: "Escalate to Parent",
 		description:
-			"Report a material blocker, risk, contradiction, or decision that may require the parent to redirect or interrupt work.",
-		promptSnippet: "Report blockers, risks, or uncertainties to the parent agent",
+			"Report a material blocker, risk, contradiction, decision, or needed allowance extension to the parent.",
+		promptSnippet: "Report blockers, risks, decisions, or needed extensions to the parent agent",
 		promptGuidelines: [
-			"Provide concise decision checkpoints with evidence of progress, remaining work, expected duration, and the decision or extension needed. Use escalate_to_parent only for material information that could change the parent's plan. Do not send routine progress or tool logs, and still provide a complete final response.",
+			"Provide concise decision checkpoints with current progress, remaining work, the goal, and the decision or extension needed. When more time is needed, request an extension. Use escalate_to_parent only for material information that could change the parent's plan. Do not send routine progress or tool logs, and still provide a complete final response.",
 		],
 		parameters: escalateToParentSchema,
 		executionMode: "parallel",
@@ -150,20 +132,17 @@ export function createEscalateToParentTool(
 	};
 }
 
-function assertAgentsRequest(request: unknown): asserts request is AgentsRequest {
+function assertAgentStatusRequest(request: unknown): asserts request is AgentStatusRequest {
 	if (typeof request !== "object" || request === null || Array.isArray(request)) {
-		throw new Error("Agents request must be an object");
+		throw new Error("Agent status request must be an object");
 	}
 	for (const key of Object.keys(request)) {
-		if (key !== "timeout_ms" && key !== "targets" && key !== "until") {
-			throw new Error(`Unknown agents request field: ${key}`);
+		if (key !== "targets") {
+			throw new Error(`Unknown agent status request field: ${key}`);
 		}
 	}
 
-	const { timeout_ms, targets, until } = request as Partial<AgentsRequest>;
-	if (!Number.isInteger(timeout_ms) || timeout_ms === undefined || timeout_ms < 0) {
-		throw new RangeError("timeout_ms must be a non-negative integer");
-	}
+	const { targets } = request as AgentStatusRequest;
 	if (targets !== undefined) {
 		if (!Array.isArray(targets) || targets.length === 0) {
 			throw new Error("targets must be a non-empty array");
@@ -179,9 +158,6 @@ function assertAgentsRequest(request: unknown): asserts request is AgentsRequest
 			uniqueTargets.add(target);
 		}
 	}
-	if (until !== undefined && until !== "any" && until !== "all") {
-		throw new Error(`Invalid agents wait condition: ${String(until)}`);
-	}
 }
 
 export function createSpawnAgentTool(
@@ -196,7 +172,7 @@ export function createSpawnAgentTool(
 		promptSnippet: "Delegate a focused task to an independent child agent",
 		promptGuidelines: [
 			"Use for focused subtasks that can run independently alongside other work. Request file references and supporting evidence for research or audits, and assign non-overlapping file ownership for edit and write operations.",
-			"Continue independent work while child agents run. Before declaring completion, resolve every active child: wait for needed work with wait_for_agents, or cancel obsolete work immediately with agent_action interrupt. The session checks unresolved children before the parent task finishes.",
+			"Continue independent work while child agents run. When only needed child work remains, end your current response; the runtime keeps the task open, waits automatically, and resumes you with child reports or results. Cancel obsolete work with agent_action interrupt before declaring completion.",
 		],
 		parameters: spawnAgentSchema,
 		executionMode: "parallel",
@@ -224,12 +200,12 @@ export function createAgentActionTool(
 		name: "agent_action",
 		label: "Agent Action",
 		description:
-			"Send a message to drive an existing child agent, optionally waking it to resume work, or interrupt its current work.",
+			"Steer an existing child agent, queue follow-up work, wake it, approve an allowance extension, or interrupt its current work.",
 		promptSnippet: "Steer, follow up, wake, renew, or interrupt an existing child agent",
 		promptGuidelines: [
 			"Messages steer current work at the next tool boundary by default. Set delivery: 'follow_up' only for new work that should wait until the child finishes. Set wake: true to resume an idle child; steering an idle child otherwise fails instead of silently queueing stale instructions.",
-			"Child runs have a renewable 15-minute backstop by default, capped by the parent deadline. Use action: 'renew' with a reason and optional lease_ms for justified long builds. Cancel obsolete work immediately. Let child agents complete delegated work that is still needed. Interrupt only when the work is no longer needed, is proceeding in the wrong direction, or must stop because of a user request or material risk.",
-			"When waiting for needed child results, continue independent work or use wait_for_agents to wait. A wait timeout does not mean the child has failed and is not by itself a reason to interrupt it.",
+			"Child runs have a renewable time limit. Approve a needed extension with action: 'renew' and a reason based on the child's current progress, remaining work, and goal. Each approval adds one configured allowance (15 minutes by default) to the existing deadline, capped by the parent deadline. Cancel obsolete work immediately. Let child agents complete delegated work that is still needed. Interrupt only when the work is no longer needed, is proceeding in the wrong direction, or must stop because of a user request or material risk.",
+			"Use agent_status for an immediate inspection when needed. When only needed child work remains, end your current response and let the runtime wait automatically. Waiting does not renew a child allowance; approve needed extensions with agent_action renew.",
 		],
 		parameters: agentActionSchema,
 		executionMode: "parallel",
@@ -240,21 +216,15 @@ export function createAgentActionTool(
 			let normalized: AgentActionRequest;
 			if (request.action === "renew") {
 				if (!request.reason?.trim()) throw new Error("Lease renewal requires a justification");
-				if (
-					request.lease_ms !== undefined &&
-					(!Number.isInteger(request.lease_ms) || request.lease_ms <= 0 || request.lease_ms > 2_147_483_647)
-				)
-					throw new RangeError("Invalid lease_ms");
 				if ("message" in request || "wake" in request || "delivery" in request)
 					throw new Error("Renew actions do not accept message fields");
 				normalized = {
 					target: request.target,
 					action: "renew",
 					reason: request.reason,
-					lease_ms: request.lease_ms,
 				};
-			} else if ("reason" in request || "lease_ms" in request) {
-				throw new Error("Only renew actions accept lease fields");
+			} else if ("reason" in request) {
+				throw new Error("Only renew actions accept a reason");
 			} else if (request.action === "interrupt") {
 				if ("message" in request || "wake" in request || "delivery" in request) {
 					throw new Error("Interrupt actions do not accept message fields");
@@ -287,31 +257,28 @@ export function createAgentActionTool(
 	};
 }
 
-export function createAgentsTool(
-	query: (options: SubagentQueryOptions) => Promise<SubagentQueryResult>,
-): ToolDefinition<typeof agentsSchema, AgentsDetails> {
+export function createAgentStatusTool(
+	query: (options: Pick<SubagentQueryOptions, "targets" | "signal">) => Promise<SubagentQueryResult>,
+): ToolDefinition<typeof agentStatusSchema, AgentStatusDetails> {
 	return {
-		name: "wait_for_agents",
-		label: "Wait For Agents",
+		name: "agent_status",
+		label: "Agent Status",
 		description:
-			"Check child agent statuses or wait for status changes. Returns statuses and any recorded output or errors.",
-		promptSnippet: "Wait for delegated work",
+			"Immediately inspect child agent statuses and any recorded output or errors. Does not wait for completion.",
+		promptSnippet: "Inspect child agent status and results",
 		promptGuidelines: [
-			"Use wait_for_agents when further progress depends on child results. When waiting for completion, explicitly set until to 'any' or 'all' and select the relevant targets. Without until, the call may return before a child finishes.",
-			"A wait timeout does not stop child agents or mean they have failed. If their work is still needed, continue other work or wait again rather than interrupting them.",
+			"Use agent_status for an immediate snapshot of selected children, or omit targets to inspect all children. Terminal results returned here are consumed and will not be delivered again automatically.",
+			"Do not repeatedly poll for completion. Continue independent work, or end your current response when only needed child work remains; the runtime waits automatically and resumes you with child reports or results.",
 		],
-		parameters: agentsSchema,
+		parameters: agentStatusSchema,
 		executionMode: "parallel",
 		execute: async (_toolCallId, request, signal) => {
-			assertAgentsRequest(request);
+			assertAgentStatusRequest(request);
 			const result = await query({
-				timeoutMs: request.timeout_ms,
 				...(request.targets === undefined ? {} : { targets: request.targets }),
-				...(request.until === undefined ? {} : { until: request.until }),
 				...(signal === undefined ? {} : { signal }),
 			});
-			const details: AgentsDetails = Object.freeze({
-				timed_out: result.timedOut,
+			const details: AgentStatusDetails = Object.freeze({
 				agents: Object.freeze(
 					result.agents.map((agent) =>
 						Object.freeze({

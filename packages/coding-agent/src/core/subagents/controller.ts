@@ -3,7 +3,7 @@ import type { AssistantMessage } from "@diffexai/diffex-ai";
 import type { AgentSession } from "../agent-session.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { startCodingAgentSpan } from "../telemetry.ts";
-import { createAgentActionTool, createAgentsTool, createSpawnAgentTool } from "../tools/subagents.ts";
+import { createAgentActionTool, createAgentStatusTool, createSpawnAgentTool } from "../tools/subagents.ts";
 import type { ChildSnapshotV1 } from "./persistence.ts";
 import { reportSubagentRuntimeWarning } from "./runtime-diagnostics.ts";
 import type {
@@ -89,11 +89,6 @@ interface Supervision {
 	deadline: number;
 	startedAt: number;
 	lastActivityAt: number;
-	responses: number;
-	tokens: number;
-	cost: number;
-	toolCalls: number;
-	activeTools: Map<string, string>;
 	leaseTimer?: ReturnType<typeof setTimeout>;
 	reportTimer?: ReturnType<typeof setInterval>;
 	checkpointRequested: boolean;
@@ -225,7 +220,7 @@ export class SubagentController {
 		}
 		this.#maxConcurrent = options.maxConcurrent;
 		this.#leaseMs = options.leaseMs ?? 15 * 60_000;
-		this.#supervisionIntervalMs = options.supervisionIntervalMs ?? 60_000;
+		this.#supervisionIntervalMs = options.supervisionIntervalMs ?? 120_000;
 		for (const [name, value] of [
 			["leaseMs", this.#leaseMs],
 			["supervisionIntervalMs", this.#supervisionIntervalMs],
@@ -263,13 +258,13 @@ export class SubagentController {
 			),
 			createAgentActionTool((request) => {
 				const parent = this.#getBoundParent();
-				if (request.action === "renew") return this.renew(request.target, request.reason, request.lease_ms);
+				if (request.action === "renew") return this.renew(request.target, request.reason);
 				return request.action === "message"
 					? this.message(request.target, request.message, request.wake, parent.isStreaming, request.delivery)
 					: this.interrupt(request.target);
 			}),
-			createAgentsTool(async (options) => {
-				const result = await this.queryAgents(options);
+			createAgentStatusTool(async (options) => {
+				const result = await this.queryAgents({ ...options, timeoutMs: 0 });
 				this.#consumeTerminalQueryResults(result);
 				return result;
 			}),
@@ -442,11 +437,9 @@ export class SubagentController {
 		return this.#traceAction(name, "interrupt", () => this.#interrupt(name));
 	}
 
-	async renew(name: string, reason: string, leaseMs = this.#leaseMs): Promise<SubagentActionResult> {
+	async renew(name: string, reason: string): Promise<SubagentActionResult> {
 		const record = this.#getRecordForAction(name);
 		if (!reason.trim()) throw new Error("Lease renewal requires a justification");
-		if (!Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > MAX_TIMER_MS)
-			throw new RangeError("Invalid lease_ms");
 		const supervision = record.supervision;
 		if (
 			!supervision ||
@@ -456,12 +449,12 @@ export class SubagentController {
 		) {
 			throw new Error(`Cannot renew inactive or expired subagent: ${name}`);
 		}
-		supervision.deadline = Math.min(
-			Math.max(supervision.deadline, Date.now() + leaseMs),
-			this.#parentDeadline ?? Infinity,
-		);
-		supervision.checkpointRequested = false;
-		this.#armLease(record);
+		const deadline = Math.min(supervision.deadline + this.#leaseMs, this.#parentDeadline ?? Infinity);
+		if (deadline > supervision.deadline) {
+			supervision.deadline = deadline;
+			supervision.checkpointRequested = false;
+			this.#armLease(record);
+		}
 		return { target: name, action: "renew", status: record.status, deadline: supervision.deadline };
 	}
 
@@ -472,12 +465,16 @@ export class SubagentController {
 		supervision.leaseTimer = setTimeout(
 			() => {
 				if (record.supervision !== supervision || isTerminalStatus(record.status)) return;
+				if (supervision.deadline > Date.now()) {
+					this.#armLease(record);
+					return;
+				}
 				record.runtimeWarning = "Subagent lease or parent deadline expired; cancellation requested";
 				void this.interrupt(record.name).catch((error: unknown) => {
 					record.runtimeWarning = `Subagent cancellation failed: ${normalizeError(error)}`;
 				});
 			},
-			Math.max(0, supervision.deadline - Date.now()),
+			Math.min(MAX_TIMER_MS, Math.max(0, supervision.deadline - Date.now())),
 		);
 		supervision.leaseTimer.unref();
 	}
@@ -501,14 +498,7 @@ export class SubagentController {
 					status: record.status,
 					elapsed_ms: now - supervision.startedAt,
 					inactive_ms: now - supervision.lastActivityAt,
-					model_responses: supervision.responses,
-					tokens: supervision.tokens,
-					cost_usd: supervision.cost,
-					tool_calls: supervision.toolCalls,
-					active_tools: [...supervision.activeTools.values()].slice(0, 8),
-					shell_groups: record.session?.ownedShellProcessCount ?? 0,
-					remaining_ms: remaining,
-				})}. Cancel obsolete work immediately. Renew only when remaining work is needed and progress justifies it.`,
+				})}`,
 			);
 			if (
 				!supervision.checkpointRequested &&
@@ -517,7 +507,7 @@ export class SubagentController {
 			) {
 				supervision.checkpointRequested = true;
 				await record.session?.steer(
-					"Your renewable work allowance is nearly exhausted. If work remains necessary, use escalate_to_parent now with a concise checkpoint: evidence of progress, remaining work, expected duration, and the decision or extension needed. Stop if the task is solved.",
+					"Your renewable work allowance is nearly exhausted. If work remains necessary, use escalate_to_parent now with a concise checkpoint: current progress, remaining work, the goal, and the decision or extension needed. If more time is needed, request an extension. Stop if the task is solved.",
 				);
 			}
 		} catch (error) {
@@ -1491,11 +1481,6 @@ export class SubagentController {
 			deadline: Math.min(now + this.#leaseMs, this.#parentDeadline ?? Infinity),
 			startedAt: now,
 			lastActivityAt: now,
-			responses: 0,
-			tokens: 0,
-			cost: 0,
-			toolCalls: 0,
-			activeTools: new Map(),
 			checkpointRequested: false,
 			reporting: false,
 		};
@@ -1590,16 +1575,6 @@ export class SubagentController {
 						].includes(event.type)
 					)
 						supervision.lastActivityAt = Date.now();
-					if (event.type === "tool_execution_start") {
-						supervision.toolCalls++;
-						supervision.activeTools.set(event.toolCallId, event.toolName);
-					}
-					if (event.type === "tool_execution_end") supervision.activeTools.delete(event.toolCallId);
-					if (event.type === "message_end" && event.message.role === "assistant") {
-						supervision.responses++;
-						supervision.tokens += event.message.usage.totalTokens;
-						supervision.cost += event.message.usage.cost.total;
-					}
 				}
 				if (event.type === "agent_start" && !running) {
 					running = true;

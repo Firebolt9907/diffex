@@ -260,11 +260,14 @@ Valid executions with missing usage telemetry retain their known usage sums as p
 Each checked trial records `usage_complete` and `usage_missing_fields` alongside its usage and verifier reward.
 An intentionally interrupted child is valid when its parent roster records `interrupted` and a successful parent interrupt call establishes intent.
 An aborted request without usage telemetry makes accounting partial; it does not invalidate the completed parent trial.
+A child whose final parent roster records `failed` with a nonempty error is a terminal failure that the parent can recover from.
+The exported child trajectory preserves its failed status and error, while missing telemetry remains partial and missing or corrupt evidence still fails validation.
+This local adapter policy requires no new Diffex release; commit the change and use a fresh output directory for subsequent staged runs.
 Verifier reward must agree with the retained reward file.
 A completed Diffex trial with valid evidence and reward zero passes integration checks and remains a zero-reward benchmark result.
 An oracle with reward zero fails the smoke.
 
-Timeouts, unrecovered provider or process errors, unexplained child interruptions, invalid usage values, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and mark the trial as failed.
+Timeouts, unrecovered root provider or process errors, unexplained child interruptions, invalid usage values, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and mark the trial as failed.
 The runner continues active peers and queued tasks after these failures, in both serial and concurrent stages.
 The runner does not convert them to successful executions or silently rerun them.
 After every selected task finishes, a stage with any failed trials reports failed qualification and exits nonzero with an evidence summary instead of a trial-error traceback.

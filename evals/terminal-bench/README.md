@@ -409,7 +409,13 @@ Missing child sessions, missing observations, and incomplete child execution are
 Recoverable orphan child histories are embedded with an unresolved-link diagnostic.
 A child marked `interrupted` in the parent roster is a valid terminal state when a successful parent `agent_action` interrupt call establishes intent.
 An intentional stop can end during a model response or tool execution; it does not require an additional final assistant reply.
-Child provider errors and interruptions without that evidence remain invalid.
+A child marked `failed` in the final parent roster with a nonempty error is also a recorded terminal outcome.
+Its trajectory retains `execution_status: failed`, the scheduler's `execution_error`, and native response errors; it does not require a successful final assistant reply.
+The parent can finish normally despite that child failure, and the verifier independently determines the task reward.
+Missing child sessions, malformed records, unresolved tool calls, unproven interruptions, root execution failures, and cleanup failures still fail qualification.
+Missing usage telemetry remains explicitly incomplete and does not erase known usage.
+This policy runs in the local Python adapter and needs no new Diffex npm release.
+The staged runner requires a clean committed checkout and fresh output for the changed adapter identity; existing runs and retained reports are not rewritten.
 
 | Native Diffex usage | ATIF step metric | Harbor `AgentContext` |
 | --- | --- | --- |

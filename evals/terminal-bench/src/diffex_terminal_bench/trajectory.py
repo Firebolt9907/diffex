@@ -273,6 +273,7 @@ def export_trajectory(directory: Path, destination: Path, context: AgentContext,
     root_document = documents[root.id]
     linked = set()
     interrupted = set()
+    failed = set()
     for session in sessions:
         document = documents[session.id]
         children = []
@@ -285,6 +286,13 @@ def export_trajectory(directory: Path, destination: Path, context: AgentContext,
                 raise ValueError("cyclic or multiply-owned child session")
             linked.add(child_id)
             children.append(child_document)
+            # A recorded scheduler failure is terminal even when the child
+            # never produced a final answer. Keep the error in its trajectory;
+            # session integrity and tool-result checks still apply below.
+            error = child.get("error")
+            if child.get("status") == "failed" and isinstance(error, str) and error.strip():
+                failed.add(child_id)
+                child_document["extra"].update(execution_status="failed", execution_error=error)
             # Shutdown can also mark children interrupted. Accept a deliberate
             # stop only when the parent retained a successful interrupt call.
             if child.get("status") == "interrupted" and any(
@@ -329,7 +337,8 @@ def export_trajectory(directory: Path, destination: Path, context: AgentContext,
         if (session.id in interrupted and stop_reason == "error"
                 and assistants[-1]["extra"].get("error_message") == "This operation was aborted"):
             stop_reason = "aborted"
-        if stop_reason != "stop" and not (session.id in interrupted and stop_reason in (None, "aborted", "toolUse")):
+        if (stop_reason != "stop" and session.id not in failed
+                and not (session.id in interrupted and stop_reason in (None, "aborted", "toolUse"))):
             session.gaps.append("child_execution_incomplete")
     for session in sessions:
         last_assistant = next((step for step in reversed(session.steps)

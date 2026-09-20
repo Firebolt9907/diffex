@@ -8,7 +8,7 @@ The [staged benchmark release gate](RELEASE_GATE.md) pins dataset inputs and ver
 Use the [offline job exporter](RELEASE_GATE.md#export-retained-trials-for-harbor-hub) to package existing stage results for Harbor Hub without rerunning evaluations.
 This integration is not yet ready for leaderboard runs.
 The adapter now requires a release with `--background-process-lifetime` and `--background-process-ownership-dir` support.
-The checked-in Diffex 0.3.0 pin predates these flags; installation deliberately fails its capability check until a corrected release and integrity are published and pinned.
+The checked-in Diffex 0.3.1 pin supports these flags; installation verifies their availability alongside the release integrity.
 Source-only lifecycle tests do not qualify the installed release or a live benchmark trial.
 
 ## Host setup
@@ -64,12 +64,12 @@ The task container must provide Debian/Ubuntu Linux with glibc, root access, Bas
 Linux x86_64 and aarch64 have separate pinned Node archive checksums.
 The installer fails explicitly on unsupported platforms and refuses to reuse an existing installation.
 
-[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.3.0`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
+[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.3.1`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
 The deadline includes apt prerequisites, Node download, npm installation, and all three CLI checks.
 GNU `timeout` terminates the installer process group at the deadline and kills it after a ten-second grace period.
 Harbor's command transport allows another five seconds to collect the result.
 
-Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.3.0` with a private prefix.
+Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.3.1` with a private prefix.
 An isolated home and npm cache prevent host or task npm settings from changing installation.
 Node archive SHA-256, registry metadata, installed package version, and npm lockfile integrity must match the checked-in pins.
 The `/usr/local/bin/diffex` wrapper always invokes the pinned Node binary.
@@ -136,7 +136,7 @@ Run `npm run check` from the repository root after changing code.
 
 ### Source lifecycle validation
 
-Until the corrected release is published, build the development-only image from the repository root:
+To validate unpublished lifecycle changes, build the development-only image from the repository root:
 
 ```bash
 docker build --platform linux/arm64 -f evals/terminal-bench/tests/fixtures/Dockerfile.source -t diffex-adapter-tests:arm64 .
@@ -152,7 +152,7 @@ The development image installs dependencies without lifecycle scripts and runs t
 The gRPC fixture uses a known-correct implementation and all seven unmodified verifier tests extracted from the SHA-256-verified dataset archive.
 It checks the original process identity before and after verifier RPCs and confirms container deletion afterward.
 Every development smoke report is marked `qualification: source-only`.
-After publication, update `pins.toml`, rerun both pinned-release Linux smokes, and start a fresh live benchmark trial before declaring integration qualification complete.
+After changing `pins.toml`, rerun both pinned-release Linux smokes and start a fresh live benchmark trial before declaring integration qualification complete.
 
 On 2026-09-20, source-only validation passed 16 controlled outcome cases on each architecture, including root and UID 65534 execution.
 Both architectures also passed all seven pinned gRPC verifier tests with unchanged service identity and confirmed container deletion.
@@ -164,7 +164,7 @@ These local source checks leave pinned-release smokes and a fresh live benchmark
 ### Recorded validation
 
 The following historical smoke records used Diffex 0.2.2.
-They do not qualify the updated Diffex 0.3.0 / Terminal-Bench 2.1 configuration.
+They do not qualify the updated Diffex 0.3.1 / Terminal-Bench 2.1 configuration.
 
 On 2026-09-14, both pinned Ubuntu images passed through Harbor 0.23.0 on Docker Desktop with an arm64 host.
 
@@ -229,6 +229,16 @@ The packaged OpenAI catalog supports `gpt-5.6-luna` with `max` thinking, now sel
 All 120 adapter tests and `npm run check` passed.
 These checks did not call a live model; Daytona qualification requires a fresh sequence for the updated identity.
 
+### Diffex 0.3.1 pin validation
+
+On 2026-09-20, the published Diffex 0.3.1 tarball matched its npm integrity and the checked-in release instructions.
+Four execution trials and 16 outcome trials passed on each pinned Linux image (arm64 native and amd64 emulated), including root and UID 65534 execution, enabled subagents, validated trajectories, and confirmed container cleanup.
+The lifecycle cases verified environment-owned service retention after successful execution, provider failure, and forced agent death.
+All 142 adapter tests and `npm run check` passed.
+The retained execution reports are `results/diffex-execution-a6196c0988e3/smoke.json` (arm64) and `results/diffex-execution-91c70a4694a1/smoke.json` (amd64).
+The retained outcome reports are `results/diffex-outcomes-dea6f3573741/smoke.json` (arm64) and `results/diffex-outcomes-94cec6443269/smoke.json` (amd64).
+These checks used a loopback provider; live Daytona qualification requires a fresh sequence for the updated pins and adapter identity.
+
 ## Execute a controlled task
 
 Start Docker and make the selected provider credential available in the host environment through your normal secret-loading mechanism.
@@ -282,7 +292,7 @@ Startup network updates are disabled with the supported offline setting so the p
 
 The `context-only` project policy retains ancestor `AGENTS.md`/`CLAUDE.md` context and disables project trust, discovered extensions, skills, prompt templates, and themes.
 It does not pass `--no-context-files` or replace the system prompt.
-The pinned npm `0.3.0` release includes `dist/AGENTS.md`, which matches the adapter's checked-in release instructions.
+The pinned npm `0.3.1` release includes `dist/AGENTS.md`, which matches the adapter's checked-in release instructions.
 The adapter retains that packaged context without adding a global duplicate.
 The effective system prompt must contain the release instructions, and their SHA-256 is recorded.
 
@@ -340,7 +350,7 @@ Tool errors alone do not fail execution: the assistant can inspect and recover f
 `DiffexExecutionError` subclasses Harbor's `NonZeroAgentExitCodeError`, so infrastructure failures retain exception information rather than becoming ordinary zero-reward results.
 The adapter never sets or infers verifier reward.
 A completed assistant that produces an incorrect solution returns normally and can earn zero from the verifier.
-The pinned `0.3.0` release returns nonzero for terminal assistant errors and aborts in JSON mode as well as text mode.
+The pinned `0.3.1` release returns nonzero for terminal assistant errors and aborts in JSON mode as well as text mode.
 The adapter also parses native events to classify provider failures and reject incomplete output independently of process exit status.
 
 The launcher writes stdout and stderr directly to files and retains native sessions during execution.

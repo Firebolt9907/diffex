@@ -3,7 +3,7 @@
 This gate qualifies a specific Diffex adapter, dataset, model, and harness configuration for a larger benchmark run.
 It does not publish a product release or submit a leaderboard entry.
 The implementation supports all qualification stages; live Diffex qualification requires provider credentials and a published release with environment-owned process support.
-The checked-in Diffex 0.3.0 pin lacks that support and deliberately fails installation capability validation until a corrected release and integrity are pinned.
+The checked-in Diffex 0.3.1 pin includes that support; installation validates the required capabilities and release integrity.
 
 ## Configuration and prerequisites
 
@@ -27,7 +27,7 @@ Each invocation extracts a fresh copy of the verified archive; it does not reuse
 The preparation command writes `results/release-gate/dataset.json` without creating sandboxes or calling a model.
 
 Harbor 0.23.0 and Daytona SDK 0.210.0 are locked in the benchmark's private Python environment.
-Node 22.23.2, Diffex 0.3.0, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
+Node 22.23.2, Diffex 0.3.1, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
 The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, enabled subagents, disabled evolution, and `context-only` project resources.
 Enabled subagents add `spawn_agent`, `agent_action`, and `agent_status` to the model's tools; Diffex chooses whether to use them.
 Children execute inside the parent trial's sandbox and their sessions and usage remain in the trial evidence.
@@ -103,7 +103,7 @@ The Harbor authentication and upload commands below also apply to the exported s
 
 The adapter runs from the local uv project, and a newly started command reads the current Python source and `benchmark.toml`.
 An already running command keeps its loaded code and policy; let it finish or interrupt it once with Ctrl-C and wait for cleanup before restarting.
-The environment-owned process policy requires a corrected Diffex npm release and a reviewed pin update before new sandboxes can qualify.
+The environment-owned process policy uses the published Diffex release and integrity recorded in `pins.toml`.
 Development source images exercise the lifecycle without qualifying the installed release.
 
 After updating the checkout, run the following in your Mac's zsh terminal with `DAYTONA_API_KEY` and `OPENAI_API_KEY` exported.

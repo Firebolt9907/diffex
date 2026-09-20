@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### New Features
+
+- Added nonblocking `agent_status` for immediate child-status and result inspection, with automatic coordination for child completion. See [Automatic Sub-agent Coordination](docs/usage.md#automatic-sub-agent-coordination) ([#234](https://github.com/diffexai/diffex/pull/234)).
+- Added automatic subagent supervision with renewable work allowances and parent-deadline bounds. See [SDK tools](docs/sdk.md#tools) ([#233](https://github.com/diffexai/diffex/pull/233)).
+
+### Breaking Changes
+
+- Replaced the blocking `wait_for_agents` tool with nonblocking `agent_status`; rely on automatic child-result coordination instead of tool-managed waits ([#234](https://github.com/diffexai/diffex/pull/234)).
+
+### Fixed
+
+- Fixed automatic compaction to check complete tool-result batches ([#233](https://github.com/diffexai/diffex/pull/233)).
+- Fixed subagent completion and cancellation, including renewable work-allowance supervision ([#233](https://github.com/diffexai/diffex/pull/233)).
+- Fixed session and subagent cancellation to terminate owned background shell processes ([#233](https://github.com/diffexai/diffex/pull/233)).
+
 ## [0.2.7] - 2026-09-18
 
 ### Fixed

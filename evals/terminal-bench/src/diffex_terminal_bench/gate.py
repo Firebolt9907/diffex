@@ -178,6 +178,7 @@ def validate_trial(directory: Path, task: str, identity: dict, *, oracle: bool =
     agent = directory / "agent"
     installation = read_json(agent / "setup/installation.json")
     expected = {"verified": True, "harbor_version": PINS["harbor_version"],
+                "background_process_lifetime": "environment",
                 "node_version": f"v{PINS['node_version']}", "diffex_version": PINS["diffex_version"],
                 "npm_integrity": PINS["diffex_integrity"], "npm_registry": PINS["npm_registry"]}
     if any(installation.get(key) != value for key, value in expected.items()):
@@ -195,14 +196,19 @@ def validate_trial(directory: Path, task: str, identity: dict, *, oracle: bool =
     outcome = read_json(run / "outcome.json")
     if outcome.get("status") != "completed" or outcome.get("recovery_errors"):
         raise ValueError("Diffex did not complete cleanly")
-    if parse_outcome(run, launcher_exit_code=outcome.get("launcher_exit_code"))["status"] != "completed":
+    native_outcome = parse_outcome(run, launcher_exit_code=outcome.get("launcher_exit_code"))
+    if native_outcome["status"] != "completed":
         raise ValueError("Native execution evidence does not establish completion")
+    if any(outcome.get(key) != native_outcome.get(key) for key in (
+            "agent_execution_stopped", "cleanup_confirmed", "retained_processes")):
+        raise ValueError("Outcome differs from process ownership evidence")
     requested, effective = read_json(run / "requested.json"), read_json(run / "effective.json")
     provider, model = identity["model"].split("/", 1)
     policy = identity["policy"]
     tools = policy["tools"].split(",") + (list(SUBAGENT_TOOLS) if policy["subagents"] == "enabled" else [])
     for key, value in {"provider": provider, "model": model, "thinking": policy["thinking"],
                        "subagents": policy["subagents"], "project_resources": policy["project_resources"],
+                       "background_process_lifetime": policy["background_process_lifetime"],
                        "pins": PINS, "tools": tools, "evolution": {"enabled": False}, "state_policy": "fresh-per-run"}.items():
         if requested.get(key) != value:
             raise ValueError(f"Requested configuration differs from gate identity: {key}")

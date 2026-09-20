@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import create_autospec
+from unittest.mock import Mock, create_autospec
 from unittest.mock import patch
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
+from harbor.trial.single_step import SingleStepTrial
 
 from diffex_terminal_bench.adapter import DiffexAgent
-from diffex_terminal_bench.outcome import DiffexExecutionError
+from diffex_terminal_bench.outcome import DiffexControlStopError, DiffexExecutionError
 from test_outcome import write_evidence
 from test_trajectory import assistant, entry
 
@@ -135,17 +136,40 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             return ExecResult(return_code=1 if "cleanup.cjs" in kwargs["command"] else 0, stdout="", stderr="")
 
         self.environment.exec.side_effect = execute
-        with self.assertRaises(DiffexExecutionError):
+        with self.assertRaises(DiffexControlStopError):
             await self.agent.run("Task", self.environment, self.context)
         self.environment.download_dir.assert_awaited_once()
         self.assertEqual(self.context.metadata["diffex_outcome"]["status"], "infrastructure_failure")
 
     async def test_log_collection_failure_is_recorded_locally(self):
         self.environment.download_dir.side_effect = ConnectionError("fixture")
-        with self.assertRaises(DiffexExecutionError):
+        with self.assertRaises(DiffexControlStopError):
             await self.agent.run("Task", self.environment, self.context)
         record = json.loads(next(self.logs.glob("run-*/outcome.json")).read_text())
         self.assertEqual(record["recovery_errors"][0]["phase"], "log_collection")
+
+    async def test_deadline_with_failed_cleanup_blocks_real_harbor_verifier_path(self):
+        async def execute(**kwargs):
+            if "run.cjs" in kwargs["command"]:
+                await asyncio.Event().wait()
+            return ExecResult(return_code=1 if "cleanup.cjs" in kwargs["command"] else 0, stdout="", stderr="")
+
+        self.environment.exec.side_effect = execute
+        trial = create_autospec(SingleStepTrial, instance=True)
+        trial._agent_timeout_sec = 1
+        trial._load_trajectory = None
+        trial.result = self.context
+        trial.task = Mock()
+
+        async def agent_phase(**kwargs):
+            await asyncio.wait_for(self.agent.run("Task", self.environment, self.context), 0.05)
+
+        trial._run_agent_phase.side_effect = agent_phase
+        with self.assertRaises(DiffexControlStopError):
+            await SingleStepTrial._run_agent(trial)
+        trial._record_exception.assert_not_called()
+        trial._sync_agent_output.assert_awaited_once()
+        self.assertEqual(self.context.metadata["diffex_outcome"]["status"], "cancelled")
 
 
 if __name__ == "__main__":

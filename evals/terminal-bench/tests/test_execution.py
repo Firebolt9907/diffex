@@ -117,12 +117,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                                             "spawn_agent", "agent_action", "agent_status"])
         self.assertTrue(any("chown -R 1000" in call.kwargs["command"] for call in environment.exec.call_args_list))
 
-    async def test_checked_in_eval_policies_expose_subagent_tools(self):
+    async def test_checked_in_eval_policies_match_launch_tools(self):
         benchmark = load_config(PACKAGE / "benchmark.toml")
         staged = trial_config(benchmark, Path("/task"), Path("/runs/one"), "unique", oracle=False).agent
         controlled = JobConfig.model_validate(yaml.safe_load((PACKAGE / "execution.yaml").read_text())).agents[0]
-        for config in (staged, controlled):
-            with self.subTest(model=config.model_name):
+        base_tools = ["read", "bash", "edit", "write", "update_plan"]
+        for config, subagents, tools in (
+            (staged, "disabled", base_tools),
+            (controlled, "enabled", [*base_tools, "spawn_agent", "agent_action", "agent_status"]),
+        ):
+            with self.subTest(model=config.model_name, subagents=subagents):
                 environment = self.make_environment()
                 requested = []
 
@@ -134,9 +138,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 agent = DiffexAgent(logs_dir=self.logs_dir, model_name=config.model_name, **config.kwargs,
                                     extra_env={"OPENAI_API_KEY": "test-only"})
                 await agent.run("Task", environment, AgentContext())
-                self.assertEqual(requested[0]["subagents"], "enabled")
-                self.assertEqual(requested[0]["tools"], ["read", "bash", "edit", "write", "update_plan",
-                                                       "spawn_agent", "agent_action", "agent_status"])
+                self.assertEqual(requested[0]["subagents"], subagents)
+                self.assertEqual(requested[0]["tools"], tools)
 
     async def test_missing_credentials_and_ambiguous_models_fail_before_exec(self):
         with patch.dict(os.environ, {}, clear=True):

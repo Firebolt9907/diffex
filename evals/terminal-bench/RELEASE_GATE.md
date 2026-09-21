@@ -28,7 +28,7 @@ The preparation command writes `results/release-gate/dataset.json` without creat
 
 Harbor 0.23.0 and Daytona SDK 0.210.0 are locked in the benchmark's private Python environment.
 Node 22.23.2, Diffex 0.3.1, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
-The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, enabled subagents, disabled evolution, and `context-only` project resources.
+The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, disabled subagents, disabled evolution, and `context-only` project resources.
 Enabled subagents add `spawn_agent`, `agent_action`, and `agent_status` to the model's tools; Diffex chooses whether to use them.
 Children execute inside the parent trial's sandbox and their sessions and usage remain in the trial evidence.
 Change and commit the configuration before starting a new qualification sequence.
@@ -137,8 +137,8 @@ open "$TB_OUTPUT/pilot"
 
 Keep the same terminal or restore the exact `TB_OUTPUT` value when continuing later.
 Do not change the checkout, configuration, or concurrency between steps 4-6.
-The recorded `gate.json` identity shows `concurrency: 3` and `policy.subagents: enabled`.
-Each Diffex run's `requested.json` and `effective.json` show the coordination tool allowlist; native sessions and `trajectory.json` show actual calls and child execution.
+The recorded `gate.json` identity shows `concurrency: 3` and `policy.subagents: disabled`.
+Each Diffex run's `requested.json` and `effective.json` show only the configured base tools; native sessions and `trajectory.json` show actual calls.
 
 ### Shared dataset cache and run index
 

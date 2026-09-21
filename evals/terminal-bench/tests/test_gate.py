@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -189,6 +190,11 @@ class GateTests(unittest.TestCase):
 
     def test_stage_continues_after_partial_usage_with_real_gate_validation(self):
         self.write_interrupted_child()
+        cache = self.run / "state/home/.cache/huggingface/hub/model"
+        (cache / "blobs").mkdir(parents=True)
+        (cache / "blobs/weights").write_bytes(b"weights")
+        (cache / "snapshots/revision").mkdir(parents=True)
+        (cache / "snapshots/revision/model.safetensors").symlink_to("../../blobs/weights")
         pilot = ["task", *[f"task-{index}" for index in range(2, 11)]]
         identity = {**self.identity, "task_digests": {name: "sha256:task" for name in pilot}}
         config = BenchmarkConfig.model_validate({**load_config(PACKAGE / "benchmark.toml").model_dump(),
@@ -199,11 +205,7 @@ class GateTests(unittest.TestCase):
         async def create(config):
             calls.append(config.trial_name)
             destination = config.trials_dir / config.trial_name
-            for path in self.directory.rglob("*"):
-                if path.is_file():
-                    target = destination / path.relative_to(self.directory)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(path.read_bytes())
+            shutil.copytree(self.directory, destination, dirs_exist_ok=True, symlinks=True)
             return Mock(run=AsyncMock())
 
         manager = Mock(_cleanup=AsyncMock())
@@ -220,6 +222,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(calls), 10)
         self.assertEqual([trial["task"] for trial in report["trials"]], pilot)
         for trial in report["trials"]:
+            self.assertTrue(any(value.startswith("symlink:") for value in trial["files"].values()))
             self.assertEqual(trial["evidence"]["rewards"], {"reward": 0})
             self.assertFalse(trial["evidence"]["usage_complete"])
             self.assertEqual(trial["evidence"]["usage"]["prompt_tokens"], 76)

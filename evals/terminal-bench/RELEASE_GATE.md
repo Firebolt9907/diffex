@@ -246,6 +246,13 @@ Trial directories contain Harbor `config.json`, `lock.json`, `result.json`, veri
 Diffex installation evidence includes the three CLI checks and verified npm/Node pins.
 The oracle does not install Diffex or call a model, so its Diffex installation, model usage, and ATIF checks are not applicable.
 
+Evidence inventories preserve relative symlinks that point directly to regular files within the same trial, including Hugging Face cache snapshot links.
+Link targets have a separate `symlink:` fingerprint; regular-file content hashes still detect changes to the referenced files.
+Absolute, escaping, dangling, chained, and directory symlinks are rejected, including paths that leave the trial and then reenter it.
+Exports preserve accepted links and validate containment even for failed trials that have no checked inventory.
+This evidence policy runs in the local Python eval harness and requires no new Diffex npm release.
+Start subsequent runs from the committed checkout with a fresh output directory; previously recorded failures remain unchanged.
+
 The gate re-parses native process/stream evidence instead of trusting the outcome summary alone.
 The execution policy includes `background_process_lifetime: environment` in the requested/effective configuration and benchmark identity.
 Pre-verifier evidence must establish that all agent execution stopped, with every retained task service backed by a durable environment ownership record.

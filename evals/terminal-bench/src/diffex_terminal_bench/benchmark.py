@@ -24,7 +24,8 @@ from diffex_terminal_bench.config import PINS
 from diffex_terminal_bench.dataset import BenchmarkConfig, load_config, prepare_dataset
 from diffex_terminal_bench.daytona_backend import confirm_cleanup
 from diffex_terminal_bench.diagnostics import TrialExecutionFailure, describe_failure, diagnose_trial
-from diffex_terminal_bench.execution import PROVIDER_ENV
+from diffex_terminal_bench.execution import PROVIDER_ENV, SYSTEM_PROMPT_SHA256
+from diffex_terminal_bench.retention import cleanup_trial_volume
 from diffex_terminal_bench.gate import STAGES, fingerprint, inventory, read_json, require_previous, sample_tasks, sha256, stage_tasks, validate_trial, verify_stage, write_json
 from diffex_terminal_bench.summary import refresh_index, write_index
 
@@ -77,7 +78,7 @@ def run_identity(config: BenchmarkConfig, digests: dict) -> dict:
             "daytona_target": os.environ.get("DAYTONA_TARGET", "organization-default"),
             "daytona_api_url": os.environ.get("DAYTONA_API_URL", "https://app.daytona.io/api"),
             "harness_files": {path.name: sha256(path) for path in sorted(Path(__file__).parent.iterdir()) if path.is_file()},
-            "release_agents_sha256": PINS["release_agents_sha256"],
+            "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
             "timeout_multiplier": 1.0, "resource_overrides": None, "concurrency": config.concurrency, "harbor_retries": 0}
 
 
@@ -174,6 +175,7 @@ async def run_stage(config: BenchmarkConfig, tasks: dict[str, Path], identity: d
                         if cancelled:
                             raise asyncio.CancelledError
                 evidence = validate_trial(trial_dir, task, identity, oracle=stage == "oracle")
+                await cleanup_trial_volume(client, trial_dir)
                 report["trials"].append({"task": task, "directory": trial_dir.name,
                                          "evidence": evidence, "files": inventory(trial_dir)})
                 report["trials"].sort(key=lambda row: row["directory"])

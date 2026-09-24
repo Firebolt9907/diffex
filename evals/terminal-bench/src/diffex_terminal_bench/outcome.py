@@ -7,6 +7,7 @@ import re
 from harbor.agents.installed.base import AgentAuthenticationError, NonZeroAgentExitCodeError
 
 from diffex_terminal_bench.lifecycle import read_cleanup
+from diffex_terminal_bench.execution import SYSTEM_PROMPT_SHA256, USER_MESSAGE_SUFFIX
 
 
 class DiffexExecutionError(NonZeroAgentExitCodeError):
@@ -18,7 +19,7 @@ class DiffexControlStopError(RuntimeError):
 
 
 def parse_outcome(directory: Path, interruption: str | None = None,
-                  launcher_exit_code: int | None = None) -> dict:
+                  launcher_exit_code: int | None = None, *, shutdown_directory: Path | None = None) -> dict:
     result = {"status": "incomplete", "reason": "missing_evidence", "stream_complete": False,
               "assistant_stop_reason": None, "retry_attempts": 0, "recovered_retries": 0,
               "launcher_exit_code": launcher_exit_code, "interruption": interruption}
@@ -30,7 +31,7 @@ def parse_outcome(directory: Path, interruption: str | None = None,
     except (OSError, ValueError):
         process = {}
     try:
-        cleanup = read_cleanup(directory)
+        cleanup = read_cleanup(shutdown_directory if shutdown_directory is not None else directory)
         result.update(cleanup_confirmed=True, agent_execution_stopped=True,
                       retained_processes=cleanup["retained_processes"])
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -140,9 +141,11 @@ def parse_outcome(directory: Path, interruption: str | None = None,
             effective = json.loads((directory / "effective.json").read_text())
             if not isinstance(requested, dict) or not isinstance(effective, dict):
                 raise ValueError("invalid_configuration")
-            matches = all(effective.get(key) == requested[key] for key in ("provider", "model", "thinking", "instruction_sha256", "background_process_lifetime"))
+            matches = all(effective.get(key) == requested[key] for key in ("provider", "model", "thinking", "instruction_sha256", "background_process_lifetime", "user_message_suffix", "system_prompt_sha256"))
+            matches = matches and requested["user_message_suffix"] == USER_MESSAGE_SUFFIX
+            matches = matches and requested["system_prompt_sha256"] == SYSTEM_PROMPT_SHA256
             matches = matches and requested.get("background_process_lifetime") == "environment"
-            matches = matches and effective.get("release_agents_loaded") is True and effective.get("instruction_delivered") is True
+            matches = matches and effective.get("context_files_disabled") is True and effective.get("instruction_delivered") is True
             matches = matches and sorted(effective["tools"]) == sorted(requested["tools"])
         except (OSError, ValueError, KeyError, TypeError):
             matches = False

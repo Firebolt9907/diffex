@@ -30,6 +30,9 @@ See [Harbor's installed-agent documentation](https://www.harborframework.com/doc
 ## Full evaluation with additional sandbox storage
 
 The native full job uses [full.yaml](full.yaml): 89 tasks, five attempts each, three concurrent trials, and no automatic retries.
+It selects `RecordedDaytonaEnvironment` to retain logs and transcripts in one shared Daytona volume with isolated sandbox subpaths.
+For an existing command that uses `--env daytona` without this config, replace that option with `--env diffex_terminal_bench.daytona_backend:RecordedDaytonaEnvironment` to enable volume storage.
+See [artifact collection and retention](ARTIFACTS.md) for recovery records, retry bounds, and Tier 4 quota considerations.
 It requests 20 GiB of disk per sandbox so task files and Harbor's temporary log archive have more room than the failing 10 GiB allocation.
 This is an explicit resource override, not an evaluation with the official task resource limits unchanged.
 Daytona must allow the requested per-sandbox allocation and enough total storage for concurrent sandboxes.
@@ -43,6 +46,7 @@ TB_STORAGE_MB=20480
 mkdir -p "$TB_OUTPUT"
 git rev-parse HEAD > "$TB_OUTPUT/adapter-commit.txt"
 TB_RUN=(uv run --locked harbor run --config full.yaml
+  --plugin diffex_terminal_bench.retention:VolumeCleanupPlugin
   --override-storage-mb "$TB_STORAGE_MB"
   --jobs-dir "$TB_OUTPUT" --job-name full)
 "${TB_RUN[@]}" --print-config > "$TB_OUTPUT/planned-config.json"
@@ -105,6 +109,7 @@ These are installation checks, not Terminal-Bench task scores.
 
 ```bash
 uv run --locked python -m unittest discover -s tests -v
+node --test tests/launcher.test.cjs
 uv run --locked python scripts/smoke_execution.py --platform linux/arm64
 uv run --locked python scripts/smoke_execution.py --platform linux/amd64
 uv run --locked python scripts/smoke_outcomes.py --platform linux/arm64
@@ -116,12 +121,13 @@ The unit checks cover installation pins, configuration validation, explicit cred
 They also cover outcome parsing, incomplete streams, transport failures, log-collection failures, and repeated cancellation during recovery.
 Converter checks cover deduplication, tool observations, nested child trajectories, auxiliary usage, unknown telemetry, images, and partial messages.
 The execution smoke installs the real npm release, then redirects a fixture model to a loopback faux provider with a test-only wrapper.
-It exercises shell and file tools, multiline instructions with shell metacharacters and Unicode, repeated trials, enabled child agents, and non-root execution without paid API calls.
+It exercises shell and file tools, multiline instructions with shell metacharacters and Unicode, repeated trials, and non-root execution without paid API calls.
 The fixture checks the actual request credentials without storing their values, verifies empty initial sessions and state, and scans retained artifacts for the fixture secrets.
-It also checks that task context and the exact release instructions reach the system prompt while project settings, extensions, and `SYSTEM.md` are ignored.
+It checks the supplied eval system prompt and the anti-cheating sentence in the user message against actual provider requests.
+Automatic project context, packaged release instructions, project settings, extensions, and `SYSTEM.md` are excluded from the system prompt.
 Only the agent log directory is mounted, and each invocation removes its container in a `finally` block.
 Generated evidence is retained under `results/diffex-execution-*/`.
-Each execution smoke validates ATIF with Harbor's validator and reconciles nonzero input, output, cached-token, and cost totals against every root and child response.
+Each execution smoke validates ATIF with Harbor's validator and reconciles nonzero input, output, cached-token, and cost totals against every response.
 The outcome smoke exercises success, authentication failure, exhausted retry, recovered retry, interrupted JSON output, and a Harbor-style execution timeout as both root and a non-root user.
 It uses the pinned npm release with a loopback provider and checks nonzero terminal-error exits and rejection of truncated output even when the process exits zero.
 Success, provider-failure, forced-CLI-death, and timeout cases create a TERM-resistant background service and verify that its PID and start time are unchanged across adapter cleanup.
@@ -251,7 +257,8 @@ uv run --locked harbor run --config execution.yaml \
 
 [execution.yaml](execution.yaml) records the default policy and allows 630 seconds for Harbor setup, encompassing the installer's 600-second deadline and transport overhead.
 The task's agent timeout remains in effect.
-Use `--ak thinking=medium`, `--ak tools=read,bash,edit,write`, or `--ak subagents=disabled` to change the corresponding policy explicitly.
+Use `--ak thinking=medium` or `--ak tools=read,bash,edit,write` to change the corresponding policy explicitly.
+Subagents must remain disabled; `--ak subagents=enabled` is rejected during preflight.
 Inspect accepted options with `uv run --locked harbor agent schema diffex_terminal_bench.adapter:DiffexAgent`.
 Unknown options, arbitrary native config, prompt templates, injected skills, and MCP servers are rejected.
 Model IDs must include a supported provider prefix; fuzzy patterns and thinking suffixes are rejected.
@@ -282,44 +289,48 @@ The adapter uploads the complete UTF-8 instruction and runs `diffex --mode json 
 The CLI receives stdin EOF through `/dev/null` and the launcher's ignored stdin.
 Native `@file` transport adds Diffex's standard `<file name="...">` wrapper while retaining all instruction bytes, including leading/trailing whitespace and CRLF line endings.
 Instruction contents never become shell command text or command-line flags.
-The observer extension checks that the first user message contains exactly that wrapper and the original instruction.
-It registers only a `message_start` observer, preserving compatibility with child agents.
+The launcher appends `Do not cheat by using online solutions or hints specific to this task.` after the native file wrapper, separated by a blank line, in the same user message.
+The original instruction file and its hash remain unchanged.
+The observer extension checks that the first user message contains exactly the wrapper, original instruction, and anti-cheating suffix.
+It registers only a `message_start` observer and does not rewrite provider requests.
 
 Each invocation creates an exclusive `run-<uuid>/` under Harbor's agent logs.
-Its fresh `state/` is the `DIFFEX_CODING_AGENT_DIR`, with a fresh home and global `settings.json` containing `{"evolution":{"enabled":false}}` before startup.
+Its `DIFFEX_CODING_AGENT_DIR` is a fresh private `/tmp/diffex-tb-state-*` directory on sandbox disk, with a fresh home and global `settings.json` containing `{"evolution":{"enabled":false}}` before startup.
+Packages and caches remain outside the exported logs and survive until sandbox teardown so retained task services can use them during verification.
 No prior settings, credentials, sessions, or evolved harness selections are copied into it.
 Startup network updates are disabled with the supported offline setting so the pinned model catalog remains stable.
 
-The `context-only` project policy retains ancestor `AGENTS.md`/`CLAUDE.md` context and disables project trust, discovered extensions, skills, prompt templates, and themes.
-It does not pass `--no-context-files` or replace the system prompt.
-The pinned npm `0.3.1` release includes `dist/AGENTS.md`, which matches the adapter's checked-in release instructions.
-The adapter retains that packaged context without adding a global duplicate.
-The effective system prompt must contain the release instructions, and their SHA-256 is recorded.
+The eval adapter passes `--system-prompt` with the checked-in [eval prompt](src/diffex_terminal_bench/eval-system-prompt.txt) and `--no-context-files`.
+The entire automatic `<project_context>` section is omitted, including packaged release instructions and ancestor `AGENTS.md`/`CLAUDE.md` files and their paths.
+Task files remain on disk and can be read explicitly by the agent.
+The `context-only` project resource setting continues to disable project trust, discovered extensions, skills, prompt templates, and themes; eval launches additionally suppress automatic context files.
+The effective system prompt must match the checked-in prompt's SHA-256, and execution evidence must confirm context files are disabled.
+This uses supported flags in the pinned Diffex release and requires no product code or release changes.
 
-The checked-in `benchmark.toml` disables subagents, omitting `spawn_agent`, `agent_action`, and `agent_status` from the explicit tool allowlist.
-The separate controlled smoke configuration in `execution.yaml` enables subagents and includes those tools.
-Diffex decides whether to call those tools; enabling them does not require a child on every task.
-Children share their trial's sandbox, and the pinned CLI owns child scheduling and its default concurrency limit.
-The staged runner's `-n/--concurrency` controls simultaneous trials and sandboxes separately.
-An adapter invocation that omits the subagent policy still defaults to disabled, omitting coordination tools.
-Root and child sessions are retained together beneath `run-<uuid>/sessions/`, including the parent-owned child session directories.
+All eval configurations require disabled subagents and omit `spawn_agent`, `agent_action`, and `agent_status` from the tool allowlist.
+The pinned Diffex 0.3.1 CLI does not propagate `--system-prompt` or `--no-context-files` to child agents, so enabled subagents cannot satisfy this prompt policy.
+The adapter rejects attempts to enable them before setup or execution.
+The staged runner's `-n/--concurrency` still controls simultaneous independent trials and sandboxes.
+Native sessions remain beneath `run-<uuid>/sessions/`; trajectory conversion continues to support retained child sessions from earlier evaluations.
 
 ### Execution evidence
 
 Each run directory retains:
 
-- `requested.json`: pins, model, thinking, tools, subagent policy, project policy, credential variable names, and instruction hash.
+- `requested.json`: pins, model, thinking, tools, subagent policy, project policy, credential variable names, instruction hash, user-message suffix, and system prompt hash.
 - `instruction.txt`: the original instruction.
-- `effective.json`: resolved model, thinking, tools, working directory, session path, prompt hashes, and release-context verification.
-- `system-prompt.txt`: the effective system prompt, including release and task context.
+- `eval-system-prompt.txt`: the requested eval system prompt.
+- `effective.json`: resolved model, thinking, tools, working directory, session path, prompt hashes, user-message verification, and context-file suppression.
+- `system-prompt.txt`: the observed system prompt, without automatic project context.
 - `stdout.jsonl`, `stderr.log`, and `process.json`: native JSON events, diagnostics, and process status.
 - `launcher.json` and `cli.json`: launcher and root CLI PID/start-time identities.
 - `ownership/*.json`: durable shell ownership records published by the CLI.
 - `stop-requested` and `cleanup.json`: the launch barrier, verified control shutdown, and explicitly retained environment-owned processes.
 - `launcher.stdout.log` and `launcher.stderr.log`: launcher diagnostics, including failures before CLI startup.
-- `outcome.json`: execution classification, stream completeness, final assistant stop reason, retry counts, interruption state, and recovery errors.
+- `outcome.json`: execution classification, stream completeness, final assistant stop reason, retry counts, interruption state, shutdown recovery errors, and separate artifact errors.
 - `accounting.json`: observed usage, nullable totals, per-model observations, and reasons accounting is incomplete.
-- `sessions/` and `state/`: native root/child history and isolated harness state.
+- `sessions/`: native root/child history.
+- `state.json`: sandbox-local harness state and home paths, without exporting their contents.
 
 Harbor collects the agent log tree after the run; avoid log filters that exclude these paths.
 `trajectory.json` sits directly under Harbor's agent log directory, with embedded child trajectories and optional `trajectory-media/` image files.
@@ -343,8 +354,8 @@ Tool errors alone do not fail execution: the assistant can inspect and recover f
 | Nonzero process, signal, or spawn error | `process_failure` | Raise `DiffexExecutionError` |
 | Missing, truncated, or unfinished native stream | `incomplete` | Raise `DiffexExecutionError` |
 | Effective configuration mismatch | `configuration_failure` | Raise `DiffexExecutionError` |
-| Unverified agent shutdown or missing shutdown evidence | `cleanup_failure` / `infrastructure_failure` | Raise `DiffexControlStopError`; block verification |
-| Failed evidence collection with verified shutdown | `infrastructure_failure` | Raise `DiffexExecutionError` |
+| Unverified agent shutdown or missing shutdown evidence | `cleanup_failure` | Raise `DiffexControlStopError`; block verification |
+| Failed artifact collection with verified shutdown | `artifact_collection_failure`, or preserve an existing failure | Record `artifact_errors`; permit verification |
 | Harbor task deadline cancels `run()` | `cancelled` | Preserve cancellation; Harbor raises `AgentTimeoutError` |
 | Environment transport timeout or failure | `timeout` / `transport_failure` | Preserve the original exception |
 
@@ -374,7 +385,9 @@ Harbor stops the shared environment after verification, including verifier failu
 The benchmark runner independently confirms sandbox deletion after every trial, including abandonment and transport failures.
 
 Recovery is shielded against repeated cancellation and runs before `run()` returns or re-raises the interruption.
-It allows up to 15 seconds for the cleanup transport and 15 seconds for mounted-log preparation or 30 seconds for remote log download.
+It allows up to 15 seconds for cleanup transport, then retrieves and validates only shutdown evidence with three bounded attempts within 90 seconds.
+After shutdown validation, it allows 15 seconds for mounted-log preparation or 30 seconds for bulk remote log download.
+Bulk download and local artifact persistence failures cannot invalidate independently confirmed shutdown.
 The final summary is written directly to host agent logs after recovery, so later remote log collection cannot overwrite a cancellation classification.
 These bounded recovery operations can extend the task deadline; they do not grant the agent additional task execution time.
 If the sandbox transport becomes unavailable, available host logs and recovery diagnostics remain, cleanup is not reported as successful, and Harbor's environment teardown remains necessary.
@@ -385,7 +398,7 @@ Avoid log filters that discard the retained evidence.
 The converter emits `ATIF-v1.8` using the models and validator shipped with pinned Harbor 0.23.0.
 See [Harbor's ATIF documentation](https://www.harborframework.com/docs/agents/trajectory-format) for the schema and validation command.
 It writes the final trajectory atomically after cleanup and evidence collection, before returning to Harbor.
-Export failure changes an otherwise completed execution to `infrastructure_failure`; it preserves an existing provider failure or cancellation.
+Export failure changes an otherwise completed execution to `artifact_collection_failure`; it preserves an existing provider failure or cancellation.
 An empty run with no recoverable steps retains accounting diagnostics without fabricating a trajectory.
 
 Native session message entries are authoritative, including history retained before compaction.

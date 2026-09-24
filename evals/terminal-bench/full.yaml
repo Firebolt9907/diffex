@@ -7,7 +7,7 @@ environment:
   import_path: diffex_terminal_bench.daytona_backend:RecordedDaytonaEnvironment
   kwargs:
     artifact_volume: diffex-terminal-bench-logs
-  override_storage_mb: 20480
+  override_storage_mb: 10240
 agents:
   - name: diffex_terminal_bench.adapter:DiffexAgent
     model_name: openai/gpt-5.6-luna

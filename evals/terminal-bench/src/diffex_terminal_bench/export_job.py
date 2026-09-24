@@ -52,9 +52,12 @@ def export_job(source: Path, output: Path, *, allow_partial: bool = False) -> Pa
     locks = []
     common = None
     for directory in directories:
+        # Even failed/unchecked trials must have links confined to this trial,
+        # not merely to the encompassing stage scanned above.
+        trial_files = inventory(directory)
         if directory.name in checked:
             row = checked[directory.name]
-            if row["task"] != planned[directory.name] or inventory(directory) != row["files"]:
+            if row["task"] != planned[directory.name] or trial_files != row["files"]:
                 raise ValueError(f"{directory.name}: retained checked evidence changed")
         # Never silently omit a started trial, including failed or cancelled work.
         result = TrialResult.model_validate_json((directory / "result.json").read_text())

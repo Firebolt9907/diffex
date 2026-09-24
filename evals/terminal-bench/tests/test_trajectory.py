@@ -46,6 +46,15 @@ def interrupted_child_records(*, status="interrupted", stop_reason="aborted", in
     return root, child
 
 
+def failed_child_records(*, error="Rate limit reached", stop_reason="error", usage=None):
+    root, child = interrupted_child_records(status="failed", stop_reason=stop_reason, usage=usage,
+                                            error_message=error)
+    # A failure is recorded by the scheduler without a parent interrupt call.
+    del root[2:4]
+    root[-2]["data"]["agents"][0]["error"] = error
+    return root, child
+
+
 class TrajectoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -153,6 +162,62 @@ class TrajectoryTests(unittest.TestCase):
                 _, accounting = self.export()
                 self.assertIn("child:child_execution_incomplete", accounting["gaps"])
                 self.assertIsNone(self.context.n_input_tokens)
+
+    def test_recorded_child_failure_retains_error_and_partial_usage(self):
+        root, child = failed_child_records()
+        self.session(root)
+        self.session(child, "child", "root")
+        document, accounting = self.export()
+        self.assertEqual(accounting["gaps"], [])
+        self.assertFalse(accounting["complete"])
+        self.assertEqual(accounting["totals"]["prompt_tokens"], 57)
+        self.assertEqual(self.context.n_input_tokens, 57)
+        failed = document["subagent_trajectories"][0]
+        self.assertEqual(failed["extra"]["execution_status"], "failed")
+        self.assertEqual(failed["extra"]["execution_error"], "Rate limit reached")
+        self.assertEqual(failed["steps"][-1]["extra"]["error_message"], "Rate limit reached")
+        self.assertNotIn("prompt_tokens", failed["steps"][-1]["metrics"])
+        self.assertFalse(failed["final_metrics"]["extra"]["accounting_complete"])
+        self.assertEqual(document["extra"]["execution_status"], "completed")
+
+    def test_recorded_runtime_failure_can_follow_a_completed_tool_call(self):
+        root, child = failed_child_records(error="Cannot continue from message role: assistant",
+                                          stop_reason="toolUse", usage=USAGE)
+        child[-1]["message"]["content"] = [{"type": "toolCall", "id": "read", "name": "read", "arguments": {}}]
+        child.append(entry("read-result", {"role": "toolResult", "toolCallId": "read", "content": "file", "isError": False}))
+        self.session(root)
+        self.session(child, "child", "root")
+        document, accounting = self.export()
+        self.assertEqual(accounting["gaps"], [])
+        self.assertTrue(accounting["complete"])
+        self.assertEqual(document["subagent_trajectories"][0]["extra"]["execution_error"],
+                         "Cannot continue from message role: assistant")
+        child.pop()
+        self.session(child, "child", "root")
+        _, accounting = self.export()
+        self.assertIn("child:missing_tool_result", accounting["gaps"])
+
+    def test_child_failure_requires_terminal_roster_evidence(self):
+        for status, error in (("running", "Rate limit reached"), ("queued", "Rate limit reached"),
+                              ("failed", None), ("failed", ""), ("failed", " "), ("failed", {})):
+            with self.subTest(status=status, error=error):
+                root, child = failed_child_records()
+                root[-2]["data"]["agents"][0].update(status=status, error=error)
+                self.session(root)
+                self.session(child, "child", "root")
+                _, accounting = self.export()
+                self.assertIn("child:child_execution_incomplete", accounting["gaps"])
+
+    def test_failed_child_does_not_hide_missing_or_corrupt_evidence(self):
+        root, child = failed_child_records()
+        self.session(root)
+        path = self.session(child, "child", "root")
+        path.write_text(path.read_text() + '{"type":\n')
+        _, accounting = self.export()
+        self.assertIn("child:invalid_record:child.jsonl", accounting["gaps"])
+        path.unlink()
+        _, accounting = self.export()
+        self.assertIn("root:missing_child_trajectory", accounting["gaps"])
 
     def test_intentional_abort_can_end_during_tool_call_generation(self):
         for call in ({"type": "toolCall", "id": "pending", "name": "bash", "arguments": {}},

@@ -28,7 +28,7 @@ The preparation command writes `results/release-gate/dataset.json` without creat
 
 Harbor 0.23.0 and Daytona SDK 0.210.0 are locked in the benchmark's private Python environment.
 Node 22.23.2, Diffex 0.3.1, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
-The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, enabled subagents, disabled evolution, and `context-only` project resources.
+The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, disabled subagents, disabled evolution, and `context-only` project resources.
 Enabled subagents add `spawn_agent`, `agent_action`, and `agent_status` to the model's tools; Diffex chooses whether to use them.
 Children execute inside the parent trial's sandbox and their sessions and usage remain in the trial evidence.
 Change and commit the configuration before starting a new qualification sequence.
@@ -137,8 +137,8 @@ open "$TB_OUTPUT/pilot"
 
 Keep the same terminal or restore the exact `TB_OUTPUT` value when continuing later.
 Do not change the checkout, configuration, or concurrency between steps 4-6.
-The recorded `gate.json` identity shows `concurrency: 3` and `policy.subagents: enabled`.
-Each Diffex run's `requested.json` and `effective.json` show the coordination tool allowlist; native sessions and `trajectory.json` show actual calls and child execution.
+The recorded `gate.json` identity shows `concurrency: 3` and `policy.subagents: disabled`.
+Each Diffex run's `requested.json` and `effective.json` show only the configured base tools; native sessions and `trajectory.json` show actual calls.
 
 ### Shared dataset cache and run index
 
@@ -246,6 +246,13 @@ Trial directories contain Harbor `config.json`, `lock.json`, `result.json`, veri
 Diffex installation evidence includes the three CLI checks and verified npm/Node pins.
 The oracle does not install Diffex or call a model, so its Diffex installation, model usage, and ATIF checks are not applicable.
 
+Evidence inventories preserve relative symlinks that point directly to regular files within the same trial, including Hugging Face cache snapshot links.
+Link targets have a separate `symlink:` fingerprint; regular-file content hashes still detect changes to the referenced files.
+Absolute, escaping, dangling, chained, and directory symlinks are rejected, including paths that leave the trial and then reenter it.
+Exports preserve accepted links and validate containment even for failed trials that have no checked inventory.
+This evidence policy runs in the local Python eval harness and requires no new Diffex npm release.
+Start subsequent runs from the committed checkout with a fresh output directory; previously recorded failures remain unchanged.
+
 The gate re-parses native process/stream evidence instead of trusting the outcome summary alone.
 The execution policy includes `background_process_lifetime: environment` in the requested/effective configuration and benchmark identity.
 Pre-verifier evidence must establish that all agent execution stopped, with every retained task service backed by a durable environment ownership record.
@@ -260,11 +267,14 @@ Valid executions with missing usage telemetry retain their known usage sums as p
 Each checked trial records `usage_complete` and `usage_missing_fields` alongside its usage and verifier reward.
 An intentionally interrupted child is valid when its parent roster records `interrupted` and a successful parent interrupt call establishes intent.
 An aborted request without usage telemetry makes accounting partial; it does not invalidate the completed parent trial.
+A child whose final parent roster records `failed` with a nonempty error is a terminal failure that the parent can recover from.
+The exported child trajectory preserves its failed status and error, while missing telemetry remains partial and missing or corrupt evidence still fails validation.
+This local adapter policy requires no new Diffex release; commit the change and use a fresh output directory for subsequent staged runs.
 Verifier reward must agree with the retained reward file.
 A completed Diffex trial with valid evidence and reward zero passes integration checks and remains a zero-reward benchmark result.
 An oracle with reward zero fails the smoke.
 
-Timeouts, unrecovered provider or process errors, unexplained child interruptions, invalid usage values, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and mark the trial as failed.
+Timeouts, unrecovered root provider or process errors, unexplained child interruptions, invalid usage values, missing logs, invalid ATIF, altered configuration, and cleanup failures retain their original evidence and mark the trial as failed.
 The runner continues active peers and queued tasks after these failures, in both serial and concurrent stages.
 The runner does not convert them to successful executions or silently rerun them.
 After every selected task finishes, a stage with any failed trials reports failed qualification and exits nonzero with an evidence summary instead of a trial-error traceback.

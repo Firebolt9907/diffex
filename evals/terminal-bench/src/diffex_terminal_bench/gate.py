@@ -4,8 +4,10 @@ from collections import Counter
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
+import stat
 import tempfile
 
 from harbor.models.agent.context import AgentContext
@@ -79,12 +81,40 @@ def stage_tasks(stage: str, pilot: list[str], all_tasks: list[str], *, sample: d
 
 
 def inventory(directory: Path) -> dict[str, str]:
+    """Hash retained files and portable links without following link targets.
+
+    Cache snapshots may link directly to regular files inside the evidence root.
+    Bind the link text separately from file contents so retargeting, replacing a
+    link with a file, and editing its target all change the inventory.
+    """
+    if directory.is_symlink():
+        raise ValueError("Evidence root must not be a symlink")
+    directory = directory.resolve(strict=True)
     result = {}
     for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
         if path.is_symlink():
-            raise ValueError("Evidence must not contain symlinks")
-        if path.is_file():
-            result[path.relative_to(directory).as_posix()] = sha256(path)
+            link = os.readlink(path)
+            target = path.parent
+            if Path(link).is_absolute():
+                raise ValueError(f"Evidence symlinks must be relative: {relative}")
+            # Walk the original components, including '..', before resolving.
+            # Normalizing first could hide traversal through an external path
+            # or a directory symlink. Chained links are deliberately rejected.
+            try:
+                for part in Path(link).parts:
+                    if not stat.S_ISDIR(target.lstat().st_mode):
+                        raise ValueError(f"Evidence symlinks must not traverse other links or files: {relative}")
+                    target = target.parent if part == ".." else target / part
+                    if not target.is_relative_to(directory):
+                        raise ValueError(f"Evidence symlinks must stay inside their root: {relative}")
+                if not stat.S_ISREG(target.lstat().st_mode) or not path.is_file():
+                    raise ValueError(f"Evidence symlinks must point directly to regular files: {relative}")
+            except OSError as exc:
+                raise ValueError(f"Evidence symlinks must have existing regular-file targets: {relative}") from exc
+            result[relative] = "symlink:" + fingerprint({"target": link})
+        elif path.is_file():
+            result[relative] = sha256(path)
     return result
 
 

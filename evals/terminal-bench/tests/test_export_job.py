@@ -15,7 +15,7 @@ from harbor.models.job.lock import TaskLock, TrialLock, VerifierLock
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
 # These private APIs define the upload contract of the pinned Harbor release.
-from harbor.upload.uploader import _create_job_archive_file, _load_job_from_disk, _read_trial_lock_for_upload
+from harbor.upload.uploader import _create_job_archive_file, _create_trial_archive_file, _load_job_from_disk, _read_trial_lock_for_upload
 
 from diffex_terminal_bench.benchmark import PACKAGE, trial_config
 from diffex_terminal_bench.config import PINS
@@ -115,6 +115,59 @@ class ExportJobTests(unittest.TestCase):
         self.assertEqual(trials[6].exception_info.exception_type, "AgentTimeoutError")
         self.assertIsNone(trials[6].agent_result)
         self.assertEqual(len(read_json(self.output / "export.json")["missing_trials"]), 3)
+
+    def test_cli_preserves_cache_links_through_harbor_archives(self):
+        directory = self.directories[0]
+        cache = directory / "agent/state/home/.cache/huggingface/hub/model"
+        (cache / "blobs").mkdir(parents=True)
+        (cache / "blobs/weights").write_bytes(b"model weights")
+        link = cache / "snapshots/revision/model.safetensors"
+        link.parent.mkdir(parents=True)
+        link.symlink_to("../../blobs/weights")
+        self.report["trials"][0]["files"] = inventory(directory)
+        write_json(self.source / "gate.json", self.report)
+        before = inventory(self.source)
+        command = subprocess.run([sys.executable, "-m", "diffex_terminal_bench.export_job", str(self.source),
+                                  "--output", str(self.output)], capture_output=True, text=True)
+        self.assertEqual(command.returncode, 0, command.stderr)
+        self.assertEqual(inventory(self.source), before)
+        relative = link.relative_to(directory)
+        exported = self.output / directory.name
+        self.assertTrue((exported / relative).is_symlink())
+        self.assertEqual((exported / relative).readlink(), Path("../../blobs/weights"))
+        for kind in ("trial", "job"):
+            with self.subTest(kind=kind):
+                archive = self.root / f"{kind}.tar.gz"
+                if kind == "trial":
+                    _create_trial_archive_file(exported, archive)
+                    prefix = Path()
+                else:
+                    _create_job_archive_file(self.output, archive)
+                    prefix = Path(self.output.name) / directory.name
+                restored = self.root / f"restored-{kind}"
+                with tarfile.open(archive) as tar:
+                    self.assertTrue(tar.getmember((prefix / relative).as_posix()).issym())
+                    tar.extractall(restored, filter="data")
+                restored_link = restored / prefix / relative
+                self.assertTrue(restored_link.is_symlink())
+                self.assertEqual(restored_link.read_bytes(), b"model weights")
+                self.assertEqual(inventory(restored / prefix / "agent"), inventory(exported / "agent"))
+
+        link.unlink()
+        link.symlink_to("../../blobs/./weights")
+        with self.assertRaisesRegex(ValueError, "checked evidence changed"):
+            export_job(self.source, self.root / "retargeted-export")
+
+    def test_failed_trial_cannot_link_to_another_trial(self):
+        directory = self.directories[0]
+        (directory / "agent/link").symlink_to(f"../../{self.directories[1].name}/agent/trajectory.json")
+        self.report.update(passed=False, trials=self.report["trials"][1:])
+        write_json(self.source / "gate.json", self.report)
+        # A stage-wide check alone would accept this link.
+        inventory(self.source)
+        with self.assertRaisesRegex(ValueError, "symlinks must stay inside"):
+            export_job(self.source, self.output, allow_partial=True)
+        self.assertFalse(self.output.exists())
 
     def test_sample_exports_only_selected_tasks_with_one_attempt_each(self):
         source = self.root / "sample-run/sample"

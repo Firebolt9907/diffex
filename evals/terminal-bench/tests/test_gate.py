@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -21,7 +22,7 @@ from diffex_terminal_bench.gate import inventory, require_previous, sha256, stag
 from diffex_terminal_bench.outcome import parse_outcome
 from diffex_terminal_bench.trajectory import export_trajectory
 from test_outcome import retain_service, write_cleanup
-from test_trajectory import USAGE, assistant, entry, interrupted_child_records
+from test_trajectory import USAGE, assistant, entry, failed_child_records, interrupted_child_records
 
 
 class GateTests(unittest.TestCase):
@@ -90,7 +91,7 @@ class GateTests(unittest.TestCase):
         data[key] = value
         write_json(path, data)
 
-    def write_interrupted_child(self, **options):
+    def write_interrupted_child(self, *, records=None, **options):
         self.identity["policy"]["subagents"] = "enabled"
         for name in ("requested.json", "effective.json"):
             self.mutate(self.run / name, "subagents", "enabled")
@@ -99,7 +100,7 @@ class GateTests(unittest.TestCase):
             document = json.loads((self.directory / name).read_text())
             document["agent"]["kwargs"] = self.identity["policy"].copy()
             write_json(self.directory / name, document)
-        root, child = interrupted_child_records(**options)
+        root, child = records if records is not None else interrupted_child_records(**options)
         # Keep the final root response identical to the completed stdout stream.
         root[-1] = entry("one", assistant("response"))
         for name, records in (("root", root), ("child", child)):
@@ -121,6 +122,20 @@ class GateTests(unittest.TestCase):
         self.assertEqual(report["usage"]["prompt_tokens"], 76)
         self.assertFalse(report["usage_complete"])
         self.assertEqual(report["usage_missing_fields"], ["cached_tokens", "completion_tokens", "cost_usd", "prompt_tokens"])
+
+    def test_recorded_child_failure_passes_with_zero_reward_and_partial_usage(self):
+        self.write_interrupted_child(records=failed_child_records())
+        report = validate_trial(self.directory, "task", self.identity)
+        self.assertEqual(report["rewards"], {"reward": 0})
+        self.assertEqual(report["usage"]["prompt_tokens"], 57)
+        self.assertFalse(report["usage_complete"])
+        self.mutate(self.directory / "sandbox-cleanup.json", "confirmed", False)
+        with self.assertRaisesRegex(ValueError, "Sandbox cleanup"):
+            validate_trial(self.directory, "task", self.identity)
+        self.mutate(self.directory / "sandbox-cleanup.json", "confirmed", True)
+        self.mutate(self.run / "process.json", "exit_code", 1)
+        with self.assertRaisesRegex(ValueError, "Native execution evidence"):
+            validate_trial(self.directory, "task", self.identity)
 
     def test_partial_accounting_still_rejects_corruption_and_execution_errors(self):
         cases = [{"status": "running"}, {"interrupt_error": True}, {"stop_reason": "error"},
@@ -175,6 +190,11 @@ class GateTests(unittest.TestCase):
 
     def test_stage_continues_after_partial_usage_with_real_gate_validation(self):
         self.write_interrupted_child()
+        cache = self.run / "state/home/.cache/huggingface/hub/model"
+        (cache / "blobs").mkdir(parents=True)
+        (cache / "blobs/weights").write_bytes(b"weights")
+        (cache / "snapshots/revision").mkdir(parents=True)
+        (cache / "snapshots/revision/model.safetensors").symlink_to("../../blobs/weights")
         pilot = ["task", *[f"task-{index}" for index in range(2, 11)]]
         identity = {**self.identity, "task_digests": {name: "sha256:task" for name in pilot}}
         config = BenchmarkConfig.model_validate({**load_config(PACKAGE / "benchmark.toml").model_dump(),
@@ -185,11 +205,7 @@ class GateTests(unittest.TestCase):
         async def create(config):
             calls.append(config.trial_name)
             destination = config.trials_dir / config.trial_name
-            for path in self.directory.rglob("*"):
-                if path.is_file():
-                    target = destination / path.relative_to(self.directory)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(path.read_bytes())
+            shutil.copytree(self.directory, destination, dirs_exist_ok=True, symlinks=True)
             return Mock(run=AsyncMock())
 
         manager = Mock(_cleanup=AsyncMock())
@@ -206,6 +222,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(calls), 10)
         self.assertEqual([trial["task"] for trial in report["trials"]], pilot)
         for trial in report["trials"]:
+            self.assertTrue(any(value.startswith("symlink:") for value in trial["files"].values()))
             self.assertEqual(trial["evidence"]["rewards"], {"reward": 0})
             self.assertFalse(trial["evidence"]["usage_complete"])
             self.assertEqual(trial["evidence"]["usage"]["prompt_tokens"], 76)

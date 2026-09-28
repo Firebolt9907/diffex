@@ -886,7 +886,10 @@ describe("AgentSession prompt characterization", () => {
 			const reason = new Error("cancel saved compaction");
 			const prompt = harness.session.prompt("new prompt", { signal: controller.signal });
 			await compactHookStarted.promise;
-			expect(sessionManager.getLeafEntry()).toMatchObject({ type: "compaction", summary: "temporarily recorded" });
+			expect(sessionManager.getLeafEntry()).toMatchObject({
+				type: "compaction",
+				summary: `temporarily recorded\n\nCurrent task context (latest plan):\n${JSON.stringify({ plan: [] }, null, 2)}`,
+			});
 			controller.abort(reason);
 			releaseCompactHook.resolve();
 
@@ -988,7 +991,9 @@ describe("AgentSession prompt characterization", () => {
 		expect(harness.eventsOfType("compaction_end")).toEqual([
 			expect.objectContaining({
 				aborted: false,
-				result: expect.objectContaining({ summary: "completed before acceptance" }),
+				result: expect.objectContaining({
+					summary: `completed before acceptance\n\nCurrent task context (latest plan):\n${JSON.stringify({ plan: [] }, null, 2)}`,
+				}),
 			}),
 		]);
 		expect(harness.faux.state.callCount).toBe(0);
@@ -1022,7 +1027,7 @@ describe("AgentSession prompt characterization", () => {
 		const model = harness.getModel();
 		harness.sessionManager.appendMessage({ role: "user", content: "previous", timestamp: now - 1000 });
 		harness.sessionManager.appendCustomEntry("diffex.current-plan", {
-			plan: [{ step: "continue", status: "in_progress" }],
+			plan: [{ id: "continue", step: "continue", status: "in_progress" }],
 		});
 		harness.sessionManager.appendMessage({
 			...fauxAssistantMessage("previous response", { stopReason: "length", timestamp: now - 500 }),
@@ -1042,7 +1047,9 @@ describe("AgentSession prompt characterization", () => {
 			}),
 		).rejects.toBe(callbackError);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([
-			expect.objectContaining({ summary: "committed before notification failure" }),
+			expect.objectContaining({
+				summary: `committed before notification failure\n\nCurrent task context (latest plan):\n${JSON.stringify({ plan: [{ id: "continue", step: "continue", status: "in_progress" }] }, null, 2)}`,
+			}),
 		]);
 
 		let restoredPlan = false;
@@ -1050,7 +1057,7 @@ describe("AgentSession prompt characterization", () => {
 		harness.setResponses([
 			(context) => {
 				restoredPlan = context.messages.some((message) =>
-					getMessageText(message).includes("Restored unfinished update_plan checklist"),
+					getMessageText(message).includes("Current task context (latest plan):"),
 				);
 				return fauxAssistantMessage("done");
 			},

@@ -1,7 +1,7 @@
 import type { SessionManager } from "./session-manager.ts";
 import {
 	createUpdatePlanToolDefinition,
-	parseUpdatePlanOperation,
+	resolveUpdatePlanOperation,
 	type UpdatePlanToolDetails,
 } from "./tools/update-plan.ts";
 
@@ -17,11 +17,14 @@ export function appendCurrentPlanRecord(
 	sessionManager: Pick<SessionManager, "appendCustomEntry">,
 	operation: UpdatePlanToolDetails,
 ): string {
-	return sessionManager.appendCustomEntry(CURRENT_PLAN_CUSTOM_ENTRY_TYPE, parseUpdatePlanOperation(operation));
+	return sessionManager.appendCustomEntry(CURRENT_PLAN_CUSTOM_ENTRY_TYPE, resolveUpdatePlanOperation(operation));
 }
 
-export function resolveCurrentPlanState(sessionManager: Pick<SessionManager, "getBranch">): CurrentPlanState {
-	const branch = sessionManager.getBranch();
+export function resolveCurrentPlanState(
+	sessionManager: Pick<SessionManager, "getBranch">,
+	fromId?: string | null,
+): CurrentPlanState {
+	const branch = fromId === null ? [] : sessionManager.getBranch(fromId);
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type !== "custom" || entry.customType !== CURRENT_PLAN_CUSTOM_ENTRY_TYPE) {
@@ -30,7 +33,7 @@ export function resolveCurrentPlanState(sessionManager: Pick<SessionManager, "ge
 
 		let operation: UpdatePlanToolDetails;
 		try {
-			operation = parseUpdatePlanOperation(entry.data);
+			operation = resolveUpdatePlanOperation(entry.data);
 		} catch {
 			return { status: "corrupt" };
 		}
@@ -43,10 +46,29 @@ export function resolveCurrentPlanState(sessionManager: Pick<SessionManager, "ge
 	return { status: "absent" };
 }
 
+export function formatCurrentPlanSnapshot(
+	sessionManager: Pick<SessionManager, "getBranch">,
+	fromId?: string | null,
+): string {
+	const state = resolveCurrentPlanState(sessionManager, fromId);
+	const plan =
+		state.status === "active"
+			? state.operation.plan
+			: state.status === "inactive" && "plan" in state.operation
+				? state.operation.plan
+				: [];
+	return `Current task context (latest plan):\n${JSON.stringify({ plan }, null, 2)}`;
+}
+
 export function createSessionUpdatePlanToolDefinition(
-	sessionManager: Pick<SessionManager, "appendCustomEntry">,
+	sessionManager: Pick<SessionManager, "appendCustomEntry" | "getBranch">,
 ): ReturnType<typeof createUpdatePlanToolDefinition> {
-	const definition = createUpdatePlanToolDefinition();
+	const definition = createUpdatePlanToolDefinition(undefined, () => {
+		const state = resolveCurrentPlanState(sessionManager);
+		if (state.status === "active") return state.operation.plan;
+		if (state.status === "inactive" && "plan" in state.operation) return state.operation.plan;
+		return undefined;
+	});
 	const execute = definition.execute;
 	return {
 		...definition,

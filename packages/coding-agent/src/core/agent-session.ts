@@ -87,7 +87,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
-import { createSessionUpdatePlanToolDefinition, resolveCurrentPlanState } from "./current-plan-state.ts";
+import { createSessionUpdatePlanToolDefinition, formatCurrentPlanSnapshot } from "./current-plan-state.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -459,9 +459,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
-const CURRENT_PLAN_RESTORATION_CUSTOM_TYPE = "diffex.current-plan-restoration";
-const CURRENT_PLAN_RESTORATION_REMINDER =
-	"Reminder: restored context is not proof of completion. Verify current state before claiming work is done.";
 const MAX_PENDING_SUBAGENT_ESCALATION_CHARACTERS = 8_000;
 const INCOMPATIBLE_SUBAGENT_PARENT_HOOKS = [
 	"resources_discover",
@@ -501,7 +498,6 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
-	private _pendingCurrentPlanRestoration = false;
 	private readonly _skillReferenceSnapshots = new Map<string, SkillReferenceSnapshot>();
 	private readonly _skillEnablementOverrides = new Map<string, boolean>();
 	private _activeSkillTrace: ActiveSkillTrace | undefined;
@@ -613,13 +609,10 @@ export class AgentSession {
 		this._telemetryContext = config.telemetryContext ?? NOOP_TELEMETRY_CONTEXT;
 		this._lifecycleObserver = config.lifecycleObserver;
 
-		this._armInitialCurrentPlanRestoration();
-
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
-		this._installAgentContextRestoration();
 		this._installAgentNextTurnRefresh();
 
 		this._buildRuntime({
@@ -841,62 +834,6 @@ export class AgentSession {
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
 		};
-	}
-
-	private _installAgentContextRestoration(): void {
-		const previousTransformContext = this.agent.transformContext;
-		this.agent.transformContext = async (messages, signal) => {
-			const transformedMessages = previousTransformContext
-				? await previousTransformContext(messages, signal)
-				: messages;
-			return this._consumePendingCurrentPlanRestoration(transformedMessages);
-		};
-	}
-
-	private _armInitialCurrentPlanRestoration(): void {
-		if (this._sessionStartEvent.reason !== "startup" && this._sessionStartEvent.reason !== "resume") {
-			return;
-		}
-		this._armCurrentPlanRestorationIfActive();
-	}
-
-	private _armCurrentPlanRestorationIfActive(): void {
-		if (resolveCurrentPlanState(this.sessionManager).status === "active") {
-			this._pendingCurrentPlanRestoration = true;
-		}
-	}
-
-	private _consumePendingCurrentPlanRestoration(messages: AgentMessage[]): AgentMessage[] {
-		if (!this._pendingCurrentPlanRestoration) {
-			return messages;
-		}
-
-		const state = resolveCurrentPlanState(this.sessionManager);
-		this._pendingCurrentPlanRestoration = false;
-		if (state.status !== "active") {
-			return messages;
-		}
-
-		const lines = [
-			"Restored unfinished update_plan checklist from the current session. Use this hidden context to continue the work.",
-		];
-		if (state.operation.explanation !== undefined) {
-			lines.push("", "Explanation:", state.operation.explanation);
-		}
-		lines.push("", "Checklist:");
-		for (const [index, item] of state.operation.plan.entries()) {
-			lines.push(`${index + 1}. [${item.status}] ${item.step}`);
-		}
-		lines.push("", CURRENT_PLAN_RESTORATION_REMINDER);
-
-		const restoredContext: CustomMessage = {
-			role: "custom",
-			customType: CURRENT_PLAN_RESTORATION_CUSTOM_TYPE,
-			content: [{ type: "text", text: lines.join("\n") }],
-			display: false,
-			timestamp: Date.now(),
-		};
-		return [...messages, restoredContext];
 	}
 
 	// =========================================================================
@@ -2378,7 +2315,6 @@ export class AgentSession {
 			if (!pendingCompaction) return;
 			pendingCompaction.commit();
 			pendingCompaction = undefined;
-			this._armCurrentPlanRestorationIfActive();
 		};
 		const rollbackPendingCompaction = (): void => {
 			if (!pendingCompaction) return;
@@ -3500,9 +3436,10 @@ export class AgentSession {
 		signal?: AbortSignal;
 		deferCommit?: (transaction: CompactionAppendTransaction) => void;
 	}): Promise<CompactionResult> {
+		const summary = `${options.summary}\n\n${formatCurrentPlanSnapshot(this.sessionManager)}`;
 		const transaction = appendCompactionTransaction(
 			this.sessionManager,
-			options.summary,
+			summary,
 			options.firstKeptEntryId,
 			options.tokensBefore,
 			options.details,
@@ -3541,14 +3478,13 @@ export class AgentSession {
 		else transaction.commit();
 
 		const compactionResult: CompactionResult = {
-			summary: options.summary,
+			summary,
 			firstKeptEntryId: options.firstKeptEntryId,
 			tokensBefore: options.tokensBefore,
 			estimatedTokensAfter,
 			usage: options.usage,
 			details: options.details,
 		};
-		if (!options.deferCommit) this._armCurrentPlanRestorationIfActive();
 		return compactionResult;
 	}
 
@@ -4761,9 +4697,10 @@ export class AgentSession {
 			let summaryEntry: BranchSummaryEntry | undefined;
 			const mutateLeaf = (): void => {
 				if (summaryText) {
+					const summary = `${summaryText}\n\nThe plan below is authoritative for the selected conversation branch. Plan references in the exploration summary above are historical.\n${formatCurrentPlanSnapshot(this.sessionManager, newLeafId)}`;
 					const summaryId = this.sessionManager.branchWithSummary(
 						newLeafId,
-						summaryText,
+						summary,
 						summaryDetails,
 						fromExtension,
 						summaryUsage,

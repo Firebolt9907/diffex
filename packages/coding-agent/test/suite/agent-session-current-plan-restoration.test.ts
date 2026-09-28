@@ -1,111 +1,16 @@
-import type { AgentMessage } from "@diffexai/diffex-agent-core";
-import { fauxAssistantMessage, type Message, type TextContent } from "@diffexai/diffex-ai";
+import { fauxAssistantMessage, fauxToolCall, type Message } from "@diffexai/diffex-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	appendCurrentPlanRecord,
-	CURRENT_PLAN_CUSTOM_ENTRY_TYPE,
-	resolveCurrentPlanState,
-} from "../../src/core/current-plan-state.ts";
-import type { SessionStartEvent } from "../../src/core/extensions/index.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
-import { createUpdatePlanToolDefinition, type UpdatePlanToolDetails } from "../../src/core/tools/update-plan.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { appendCurrentPlanRecord, CURRENT_PLAN_CUSTOM_ENTRY_TYPE } from "../../src/core/current-plan-state.ts";
+import type { UpdatePlanItem } from "../../src/core/tools/update-plan.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
-type PlanUpdateDetails = Extract<UpdatePlanToolDetails, { plan: unknown }>;
-type SessionWithCompactionInternals = {
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-};
+const plan: UpdatePlanItem[] = [
+	{ id: "inspect", step: "Inspect state", status: "completed" },
+	{ id: "implement", step: "Implement change", status: "in_progress", success_criteria: ["Resume retains the plan"] },
+];
 
-const RESTORED_CONTEXT_HEADER = "Restored unfinished update_plan checklist from the current session.";
-const RESTORED_CONTEXT_REMINDER =
-	"Reminder: restored context is not proof of completion. Verify current state before claiming work is done.";
-
-function activeOperation(): PlanUpdateDetails {
-	return {
-		plan: [
-			{ step: "Read existing state", status: "completed" },
-			{ step: "  Implement exact restore  ", status: "in_progress" },
-			{ step: "Verify once", status: "pending" },
-		],
-		explanation: "  keep this exact explanation  ",
-	};
-}
-
-function operationWithoutExplanation(): PlanUpdateDetails {
-	return {
-		plan: [{ step: "Continue unfinished work", status: "in_progress" }],
-	};
-}
-
-function expectedRestoredText(operation: PlanUpdateDetails): string {
-	const lines = [
-		"Restored unfinished update_plan checklist from the current session. Use this hidden context to continue the work.",
-	];
-	if (operation.explanation !== undefined) {
-		lines.push("", "Explanation:", operation.explanation);
-	}
-	lines.push("", "Checklist:");
-	for (const [index, item] of operation.plan.entries()) {
-		lines.push(`${index + 1}. [${item.status}] ${item.step}`);
-	}
-	lines.push("", RESTORED_CONTEXT_REMINDER);
-	return lines.join("\n");
-}
-
-function createPlanSessionManager(operation: PlanUpdateDetails = activeOperation()): SessionManager {
-	const sessionManager = SessionManager.inMemory();
-	sessionManager.appendMessage({
-		role: "user",
-		content: [{ type: "text", text: "existing session prompt" }],
-		timestamp: Date.now() - 10_000,
-	});
-	appendCurrentPlanRecord(sessionManager, operation);
-	return sessionManager;
-}
-
-function messageText(message: Message): string {
-	const content = message.content;
-	if (typeof content === "string") {
-		return content;
-	}
-	return content
-		.filter((part): part is TextContent => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
-}
-
-function findRestoredText(messages: Message[]): string | undefined {
-	return messages.map(messageText).find((text) => text.includes(RESTORED_CONTEXT_HEADER));
-}
-
-function findRestoredContextText(texts: string[]): string | undefined {
-	return texts.find((text) => text.includes(RESTORED_CONTEXT_HEADER));
-}
-
-async function submitAndCaptureContextTexts(harness: Harness, prompt = "continue"): Promise<string[]> {
-	const capturedContexts: Message[][] = [];
-	harness.setResponses([
-		(context) => {
-			capturedContexts.push(context.messages);
-			return fauxAssistantMessage("done");
-		},
-	]);
-
-	await harness.session.prompt(prompt);
-
-	expect(capturedContexts).toHaveLength(1);
-	return (capturedContexts[0] ?? []).map(messageText);
-}
-
-function createUsage(totalTokens: number) {
-	return {
-		input: totalTokens,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
+function planSnapshot(items: readonly UpdatePlanItem[]): string {
+	return `Current task context (latest plan):\n${JSON.stringify({ plan: items }, null, 2)}`;
 }
 
 function seedCompactableSession(harness: Harness): void {
@@ -117,274 +22,169 @@ function seedCompactableSession(harness: Harness): void {
 		timestamp: now - 1000,
 	});
 	harness.sessionManager.appendMessage({
-		...fauxAssistantMessage("assistant response to compact", { timestamp: now - 500 }),
-		usage: createUsage(100),
+		...fauxAssistantMessage("response to compact", { timestamp: now - 500 }),
+		usage: {
+			input: 100,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 100,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
 	});
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
-describe("AgentSession current-plan restoration", () => {
+describe("AgentSession durable plan restoration", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
-		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+	afterEach(async () => {
+		while (harnesses.length > 0) await harnesses.pop()?.cleanup();
+	});
+
+	it("retains the complete tool result on resume and fork while preserving extension context transforms", async () => {
+		const original = await createHarness();
+		harnesses.push(original);
+		original.setResponses([
+			fauxAssistantMessage(fauxToolCall("update_plan", { plan }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("created"),
+		]);
+		await original.session.prompt("create plan");
+
+		const leaf = original.sessionManager.getLeafEntry();
+		if (!leaf) throw new Error("Missing session leaf");
+		for (const sessionManager of [original.sessionManager, original.sessionManager.forkBranch(leaf.id)]) {
+			const restored = await createHarness({
+				sessionManager,
+				extensionFactories: [
+					(diffex) =>
+						diffex.on("context", (event) => ({
+							messages: [
+								...event.messages,
+								{
+									role: "custom",
+									customType: "test.extension-context",
+									content: "extension context",
+									display: false,
+									timestamp: Date.now(),
+								},
+							],
+						})),
+				],
+			});
+			harnesses.push(restored);
+			restored.session.agent.state.messages = sessionManager.buildSessionContext().messages;
+			const requests: Message[][] = [];
+			restored.setResponses([
+				(context) => {
+					requests.push(context.messages);
+					return fauxAssistantMessage("resumed");
+				},
+			]);
+			await restored.session.prompt("continue");
+			expect(requests[0]?.map(getMessageText)).toContain("extension context");
+			expect(requests[0]?.map(getMessageText)).toContain(
+				`Plan updated: 1 completed, 1 in progress, 0 pending.\n${JSON.stringify({ plan }, null, 2)}`,
+			);
+			expect(requests[0]?.map(getMessageText).some((text) => text.startsWith("Current task context"))).toBe(false);
 		}
 	});
 
-	it("injects exact active plan context once after opening or resuming an existing session", async () => {
-		const operation = activeOperation();
-		const extensionContextMessage: AgentMessage = {
-			role: "custom",
-			customType: "test.context",
-			content: "extension transformed context",
-			display: false,
-			timestamp: Date.now(),
-		};
-		const opened = await createHarness({
-			sessionManager: createPlanSessionManager(operation),
-			extensionFactories: [
-				(diffex) => {
-					diffex.on("context", (event) => ({ messages: [...event.messages, extensionContextMessage] }));
-				},
-			],
-		});
-		harnesses.push(opened);
-
-		const firstContextTexts = await submitAndCaptureContextTexts(opened, "first submission");
-		expect(findRestoredContextText(firstContextTexts)).toBe(expectedRestoredText(operation));
-		expect(firstContextTexts.indexOf("extension transformed context")).toBeLessThan(
-			firstContextTexts.findIndex((text) => text.includes(RESTORED_CONTEXT_HEADER)),
-		);
-
-		const secondContextTexts = await submitAndCaptureContextTexts(opened, "second submission");
-		expect(findRestoredContextText(secondContextTexts)).toBeUndefined();
-
-		expect(opened.session.messages.some((message) => message.role === "custom")).toBe(false);
-		expect(opened.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
-		expect(
-			opened.events.some(
-				(event) =>
-					(event.type === "message_start" || event.type === "message_end") && event.message.role === "custom",
-			),
-		).toBe(false);
-
-		const resumed = await createHarness({
-			sessionManager: createPlanSessionManager(operation),
-			sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile: "previous.jsonl" },
-		});
-		harnesses.push(resumed);
-
-		const resumedContextTexts = await submitAndCaptureContextTexts(resumed, "resumed submission");
-		expect(findRestoredContextText(resumedContextTexts)).toBe(expectedRestoredText(operation));
-	});
-
-	it("does not arm restoration for new sessions or forks", async () => {
-		for (const reason of ["new", "fork"] as const) {
-			const startEvent: SessionStartEvent = {
-				type: "session_start",
-				reason,
-				previousSessionFile: "previous.jsonl",
-			};
+	it("persists the latest plan in manual and automatic compaction summaries", async () => {
+		for (const mode of ["manual", "auto"] as const) {
 			const harness = await createHarness({
-				sessionManager: createPlanSessionManager(),
-				sessionStartEvent: startEvent,
+				extensionFactories: [
+					(diffex) =>
+						diffex.on("session_before_compact", (event) => ({
+							compaction: {
+								summary: `${mode} summary`,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						})),
+				],
 			});
 			harnesses.push(harness);
+			seedCompactableSession(harness);
+			appendCurrentPlanRecord(harness.sessionManager, { plan });
 
-			const contextTexts = await submitAndCaptureContextTexts(harness, `${reason} submission`);
-			expect(findRestoredContextText(contextTexts)).toBeUndefined();
+			if (mode === "manual") await harness.session.compact();
+			else
+				await (
+					harness.session as unknown as {
+						_runAutoCompaction: (reason: "threshold", willRetry: boolean) => Promise<boolean>;
+					}
+				)._runAutoCompaction("threshold", false);
+
+			const entry = harness.sessionManager.getLeafEntry();
+			expect(entry?.type).toBe("compaction");
+			if (entry?.type !== "compaction") continue;
+			expect(entry.summary).toBe(`${mode} summary\n\n${planSnapshot(plan)}`);
+			const summaryMessage = harness.sessionManager.buildSessionContext().messages[0];
+			expect(summaryMessage?.role).toBe("compactionSummary");
+			if (summaryMessage?.role === "compactionSummary") expect(summaryMessage.summary).toContain(planSnapshot(plan));
+			const fork = harness.sessionManager.forkBranch(entry.id);
+			const forkSummary = fork.buildSessionContext().messages[0];
+			expect(forkSummary?.role).toBe("compactionSummary");
+			if (forkSummary?.role === "compactionSummary") expect(forkSummary.summary).toContain(planSnapshot(plan));
+			for (const sessionManager of [harness.sessionManager, fork]) {
+				const resumed = await createHarness({ sessionManager });
+				harnesses.push(resumed);
+				resumed.session.agent.state.messages = sessionManager.buildSessionContext().messages;
+				const requests: Message[][] = [];
+				resumed.setResponses([
+					(context) => {
+						requests.push(context.messages);
+						return fauxAssistantMessage("continued");
+					},
+				]);
+				await resumed.session.prompt("continue after compaction");
+				expect(requests).toHaveLength(1);
+				expect(requests[0].map(getMessageText).join("\n")).toContain(planSnapshot(plan));
+			}
 		}
 	});
 
-	it("arms through successful manual and auto compaction completion but not cancelled compaction", async () => {
-		const manualOperation = operationWithoutExplanation();
-		const manual = await createHarness({
-			extensionFactories: [
-				(diffex) => {
-					diffex.on("session_before_compact", (event) => ({
-						compaction: {
-							summary: "manual summary",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
-				},
-			],
-		});
-		harnesses.push(manual);
-		seedCompactableSession(manual);
-		appendCurrentPlanRecord(manual.sessionManager, manualOperation);
-
-		await manual.session.compact();
-
-		const manualContextTexts = await submitAndCaptureContextTexts(manual, "after manual compaction");
-		const restoredManual = findRestoredContextText(manualContextTexts);
-		expect(restoredManual).toBe(expectedRestoredText(manualOperation));
-		expect(restoredManual).not.toContain("Explanation:");
-
-		const autoOperation = operationWithoutExplanation();
-		const auto = await createHarness({
-			extensionFactories: [
-				(diffex) => {
-					diffex.on("session_before_compact", (event) => ({
-						compaction: {
-							summary: "auto summary",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
-				},
-			],
-		});
-		harnesses.push(auto);
-		seedCompactableSession(auto);
-		appendCurrentPlanRecord(auto.sessionManager, autoOperation);
-
-		await (auto.session as unknown as SessionWithCompactionInternals)._runAutoCompaction("threshold", false);
-
-		const autoContextTexts = await submitAndCaptureContextTexts(auto, "after auto compaction");
-		expect(findRestoredContextText(autoContextTexts)).toBe(expectedRestoredText(autoOperation));
-
-		const cancelled = await createHarness({
-			extensionFactories: [
-				(diffex) => {
-					diffex.on("session_before_compact", () => ({ cancel: true }));
-				},
-			],
-		});
-		harnesses.push(cancelled);
-		seedCompactableSession(cancelled);
-		appendCurrentPlanRecord(cancelled.sessionManager, operationWithoutExplanation());
-
-		await expect(cancelled.session.compact()).rejects.toThrow("Compaction cancelled");
-
-		const cancelledContextTexts = await submitAndCaptureContextTexts(cancelled, "after cancelled compaction");
-		expect(findRestoredContextText(cancelledContextTexts)).toBeUndefined();
-	});
-
-	it("preserves pending restoration through preflight paths and consumes it on model failure", async () => {
-		let handleInput = true;
-		const handled = await createHarness({
-			sessionManager: createPlanSessionManager(),
-			extensionFactories: [
-				(diffex) => {
-					diffex.on("input", () => (handleInput ? { action: "handled" } : { action: "continue" }));
-				},
-			],
-		});
-		harnesses.push(handled);
-
-		await handled.session.prompt("handled before model");
-		expect(handled.faux.state.callCount).toBe(0);
-		handleInput = false;
-
-		const handledContextTexts = await submitAndCaptureContextTexts(handled, "actual model submission");
-		expect(findRestoredContextText(handledContextTexts)).toBe(expectedRestoredText(activeOperation()));
-
-		const preflight = await createHarness({
-			sessionManager: createPlanSessionManager(),
-			withConfiguredAuth: false,
-		});
-		harnesses.push(preflight);
-
-		await expect(preflight.session.prompt("missing auth")).rejects.toThrow(
-			`No API key found for ${preflight.getModel().provider}.`,
-		);
-		const model = preflight.getModel();
-		preflight.session.modelRuntime.registerProvider(model.provider, {
-			baseUrl: model.baseUrl,
-			apiKey: "faux-key",
-			api: preflight.faux.api,
-			models: preflight.models.map((registeredModel) => ({
-				id: registeredModel.id,
-				name: registeredModel.name,
-				api: registeredModel.api,
-				reasoning: registeredModel.reasoning,
-				input: registeredModel.input,
-				cost: registeredModel.cost,
-				contextWindow: registeredModel.contextWindow,
-				maxTokens: registeredModel.maxTokens,
-				baseUrl: registeredModel.baseUrl,
-			})),
-		});
-
-		const preflightContextTexts = await submitAndCaptureContextTexts(preflight, "after preflight failure");
-		expect(findRestoredContextText(preflightContextTexts)).toBe(expectedRestoredText(activeOperation()));
-
-		const modelFailure = await createHarness({
-			sessionManager: createPlanSessionManager(),
-			settings: { retry: { enabled: false } },
-		});
-		harnesses.push(modelFailure);
-		const failureContexts: Message[][] = [];
-		modelFailure.setResponses([
-			(context) => {
-				failureContexts.push(context.messages);
-				throw new Error("model failed");
-			},
-		]);
-
-		await modelFailure.session.prompt("fails after submission");
-		expect(findRestoredText(failureContexts[0] ?? [])).toBe(expectedRestoredText(activeOperation()));
-		const failedMessage = modelFailure.session.messages.at(-1);
-		expect(failedMessage?.role).toBe("assistant");
-		if (failedMessage?.role === "assistant") {
-			expect(failedMessage.stopReason).toBe("error");
-			expect(failedMessage.errorMessage).toContain("model failed");
+	it("records an empty plan after clearing or when no valid plan exists", async () => {
+		for (const state of ["cleared", "absent", "corrupt"] as const) {
+			const harness = await createHarness({
+				extensionFactories: [
+					(diffex) =>
+						diffex.on("session_before_compact", (event) => ({
+							compaction: {
+								summary: "summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						})),
+				],
+			});
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			if (state === "cleared") {
+				appendCurrentPlanRecord(harness.sessionManager, { plan });
+				appendCurrentPlanRecord(harness.sessionManager, { clear: true });
+			} else if (state === "corrupt") {
+				appendCurrentPlanRecord(harness.sessionManager, { plan });
+				harness.sessionManager.appendCustomEntry(CURRENT_PLAN_CUSTOM_ENTRY_TYPE, { plan: [] });
+			}
+			const result = await harness.session.compact();
+			expect(result.summary).toBe(`summary\n\n${planSnapshot([])}`);
 		}
-
-		const afterFailureTexts = await submitAndCaptureContextTexts(modelFailure, "after model failure");
-		expect(findRestoredContextText(afterFailureTexts)).toBeUndefined();
 	});
 
-	it("consumes without stale injection when newest state becomes inactive, absent, or corrupt", async () => {
-		const inactive = await createHarness({ sessionManager: createPlanSessionManager() });
-		harnesses.push(inactive);
-		appendCurrentPlanRecord(inactive.sessionManager, { clear: true });
-
-		const inactiveTexts = await submitAndCaptureContextTexts(inactive, "after clear");
-		expect(findRestoredContextText(inactiveTexts)).toBeUndefined();
-		expect(resolveCurrentPlanState(inactive.sessionManager).status).toBe("inactive");
-
-		const absent = await createHarness({ sessionManager: createPlanSessionManager() });
-		harnesses.push(absent);
-		absent.sessionManager.resetLeaf();
-
-		const absentTexts = await submitAndCaptureContextTexts(absent, "after branch reset");
-		expect(findRestoredContextText(absentTexts)).toBeUndefined();
-
-		const corrupt = await createHarness({ sessionManager: createPlanSessionManager() });
-		harnesses.push(corrupt);
-		corrupt.sessionManager.appendCustomEntry(CURRENT_PLAN_CUSTOM_ENTRY_TYPE, {
-			plan: [{ step: "Do not revive older valid state", status: "pending" }],
+	it("persists nothing when compaction is cancelled", async () => {
+		const harness = await createHarness({
+			extensionFactories: [(diffex) => diffex.on("session_before_compact", () => ({ cancel: true }))],
 		});
-
-		const corruptTexts = await submitAndCaptureContextTexts(corrupt, "after corrupt newest");
-		expect(findRestoredContextText(corruptTexts)).toBeUndefined();
-		expect(resolveCurrentPlanState(corrupt.sessionManager).status).toBe("corrupt");
-	});
-
-	it("restores independently of active tool selection and same-name custom tools", async () => {
-		const excluded = await createHarness({
-			sessionManager: createPlanSessionManager(),
-			excludedToolNames: ["update_plan"],
-		});
-		harnesses.push(excluded);
-		expect(excluded.session.getActiveToolNames()).not.toContain("update_plan");
-
-		const excludedTexts = await submitAndCaptureContextTexts(excluded, "without update_plan selected");
-		expect(findRestoredContextText(excludedTexts)).toBe(expectedRestoredText(activeOperation()));
-
-		const shadowed = await createHarness({
-			sessionManager: createPlanSessionManager(),
-			extensionFactories: [(diffex) => diffex.registerTool(createUpdatePlanToolDefinition())],
-		});
-		harnesses.push(shadowed);
-
-		const shadowedTexts = await submitAndCaptureContextTexts(shadowed, "with shadowing update_plan");
-		expect(findRestoredContextText(shadowedTexts)).toBe(expectedRestoredText(activeOperation()));
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		appendCurrentPlanRecord(harness.sessionManager, { plan });
+		const entriesBefore = harness.sessionManager.getEntries();
+		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
 });

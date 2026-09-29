@@ -27,4 +27,4 @@ runs:
 
     - name: Build
       shell: bash
-      run: npm run build
+      run: npm run build:offline

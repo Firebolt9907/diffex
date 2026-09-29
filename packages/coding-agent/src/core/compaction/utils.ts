@@ -4,6 +4,7 @@
 
 import type { AgentMessage } from "@diffexai/diffex-agent-core";
 import { contentText, type Message } from "@diffexai/diffex-ai";
+import { stripCurrentPlanSnapshot } from "../plan-snapshot.ts";
 
 // ============================================================================
 // File Operation Tracking
@@ -85,6 +86,21 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 // Message Serialization
 // ============================================================================
 
+/** Exclude plan data from a context projection without changing persisted messages. */
+export function excludePlanItems(messages: AgentMessage[]): AgentMessage[] {
+	return messages.flatMap((message): AgentMessage[] => {
+		if (message.role === "toolResult" && message.toolName === "update_plan") return [];
+		if (message.role === "assistant") {
+			const content = message.content.filter((block) => block.type !== "toolCall" || block.name !== "update_plan");
+			return content.length > 0 ? [{ ...message, content }] : [];
+		}
+		if (message.role === "compactionSummary" || message.role === "branchSummary") {
+			return [{ ...message, summary: stripCurrentPlanSnapshot(message.summary) }];
+		}
+		return [message];
+	});
+}
+
 /** Maximum characters for a tool result in serialized summaries. */
 const TOOL_RESULT_MAX_CHARS = 2000;
 
@@ -105,6 +121,7 @@ function truncateForSummary(text: string, maxChars: number): string {
  *
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
+ * Plan calls and results are omitted because the latest plan is attached separately.
  */
 export function serializeConversation(messages: Message[]): string {
 	const parts: string[] = [];
@@ -121,6 +138,7 @@ export function serializeConversation(messages: Message[]): string {
 				if (block.type === "thinking") {
 					thinkingParts.push(block.thinking);
 				} else if (block.type === "toolCall") {
+					if (block.name === "update_plan") continue;
 					const args = block.arguments as Record<string, unknown>;
 					const argsStr = Object.entries(args)
 						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
@@ -139,6 +157,7 @@ export function serializeConversation(messages: Message[]): string {
 				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
 			}
 		} else if (msg.role === "toolResult") {
+			if (msg.toolName === "update_plan") continue;
 			const content = contentText(msg.content, "");
 			if (content) {
 				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);

@@ -1,8 +1,69 @@
-import type { Message } from "@diffexai/diffex-ai";
+import type { AgentMessage } from "@diffexai/diffex-agent-core";
+import { fauxAssistantMessage, fauxToolCall, type Message } from "@diffexai/diffex-ai";
 import { describe, expect, it } from "vitest";
-import { serializeConversation } from "../src/core/compaction/utils.ts";
+import { excludePlanItems, serializeConversation } from "../src/core/compaction/utils.ts";
+
+describe("excludePlanItems", () => {
+	it("strips snapshots from summary messages and preserves user content without mutation", () => {
+		const snapshot = 'Current task context (latest plan):\n{"plan":[]}';
+		const user: AgentMessage = { role: "user", content: snapshot, timestamp: 1 };
+		const messages: AgentMessage[] = [
+			{ role: "compactionSummary", summary: `Compaction evidence\n\n${snapshot}`, tokensBefore: 100, timestamp: 1 },
+			{ role: "branchSummary", summary: `Branch evidence\n\n${snapshot}`, fromId: "branch", timestamp: 1 },
+			user,
+			fauxAssistantMessage(fauxToolCall("update_plan", { clear: true })),
+		];
+
+		const result = excludePlanItems(messages);
+
+		expect(result).toEqual([
+			{ ...messages[0], summary: "Compaction evidence" },
+			{ ...messages[1], summary: "Branch evidence" },
+			user,
+		]);
+		expect(messages[0]).toHaveProperty("summary", `Compaction evidence\n\n${snapshot}`);
+		expect(messages[1]).toHaveProperty("summary", `Branch evidence\n\n${snapshot}`);
+	});
+});
 
 describe("serializeConversation", () => {
+	it("omits plan calls and results while preserving other content in the same message", () => {
+		const messages: Message[] = [
+			fauxAssistantMessage([
+				{ type: "text", text: "Implementation findings" },
+				{ type: "thinking", thinking: "Reasoning about the implementation" },
+				fauxToolCall("update_plan", { clear: true, explanation: "Plan-only explanation" }),
+				fauxToolCall("read", { path: "src/example.ts" }),
+			]),
+			{
+				role: "toolResult",
+				toolCallId: "plan-result",
+				toolName: "update_plan",
+				content: [{ type: "text", text: "Plan cleared." }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "read-result",
+				toolName: "read",
+				content: [{ type: "text", text: "File contents" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = serializeConversation(messages);
+
+		expect(result).toContain("Implementation findings");
+		expect(result).toContain("Reasoning about the implementation");
+		expect(result).toContain('read(path="src/example.ts")');
+		expect(result).toContain("[Tool result]: File contents");
+		expect(result).not.toContain("update_plan");
+		expect(result).not.toContain("Plan-only explanation");
+		expect(result).not.toContain("Plan cleared.");
+	});
+
 	it("should truncate long tool results", () => {
 		const longContent = "x".repeat(5000);
 		const messages: Message[] = [

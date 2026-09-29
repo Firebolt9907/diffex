@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### New Features
+
+- Added persistent plan context with stable step IDs and optional success criteria, attached to every model request and restored across session resume, compaction, and tree navigation.
+  See [Plan Mode](docs/usage.md#plan-mode) ([#249](https://github.com/diffexai/diffex/pull/249)).
+- Added parallel tool execution phases that overlap independent calls around sequential tool barriers.
+  See [Extensions](docs/extensions.md) ([#250](https://github.com/diffexai/diffex/pull/250)).
+- Added a cache hit rate to the interactive footer alongside context usage ([#249](https://github.com/diffexai/diffex/pull/249)).
+
+### Added
+
+- Added persistent plan step identity with stable IDs and optional success criteria, attached as hidden current-task context to every model request and restored across session resume, compaction, and tree navigation.
+  See [Plan Mode](docs/usage.md#plan-mode) and [SDK tools](docs/sdk.md#tools) ([#249](https://github.com/diffexai/diffex/pull/249)).
+- Added a cache hit rate to the interactive footer alongside context usage ([#249](https://github.com/diffexai/diffex/pull/249)).
+- Added parallel tool execution phases that overlap consecutive parallel-capable calls around individual sequential barriers, such as `update_plan`.
+  See [Extensions](docs/extensions.md#tool_execution_start--tool_execution_update--tool_execution_end) ([#250](https://github.com/diffexai/diffex/pull/250)).
+
+### Changed
+
+- Excluded plan tool history and saved plan snapshots from compaction and branch summaries; the latest attached snapshot supersedes retained plan context ([#251](https://github.com/diffexai/diffex/pull/251)).
+
+### Fixed
+
+- Fixed plan cache-prefix preservation so ordinary requests reuse the existing prompt prefix ([#249](https://github.com/diffexai/diffex/pull/249)).
+- Fixed plan restoration on tree navigation to use the destination branch's authoritative plan snapshot ([#249](https://github.com/diffexai/diffex/pull/249)).
+- Fixed settled tool output being remeasured on every keystroke, keeping typing responsive as session history grows ([#249](https://github.com/diffexai/diffex/pull/249)).
+
 ## [0.3.1] - 2026-09-20
 
 ### New Features

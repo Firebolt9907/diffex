@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added ordered tool execution phases that run consecutive parallel-capable calls concurrently around individual sequential tool barriers ([#250](https://github.com/diffexai/diffex/pull/250)).
+
 ## [0.3.1] - 2026-09-20
 
 ## [0.3.0] - 2026-09-20

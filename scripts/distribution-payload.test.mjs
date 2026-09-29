@@ -16,6 +16,7 @@ const version = getPublicWorkspacePackages()[0].version;
 
 function fixture(extra, omit) {
 	const directory = mkdtempSync(join(tmpdir(), "diffex-payload-test-"));
+	const omittedFiles = new Set(Array.isArray(omit) ? omit : omit ? [omit] : []);
 	const files = {
 		...Object.fromEntries(distributionDocs.map((path) => [path, "Reviewed user guide"])),
 		"README.md": "Diffex installation and usage",
@@ -41,13 +42,11 @@ function fixture(extra, omit) {
 		sourceCommit: "a".repeat(40),
 		algorithm: "sha256",
 		files: Object.entries(files)
-			.filter(
-				([name]) => name !== omit && (name.startsWith("dist/") || (name.startsWith("native/") && name.endsWith(".node"))),
-			)
+			.filter(([name]) => !omittedFiles.has(name) && (name.startsWith("dist/") || (name.startsWith("native/") && name.endsWith(".node"))))
 			.map(([name, data]) => ({ path: name, sha256: createHash("sha256").update(data).digest("hex") })),
 	});
 	for (const [name, data] of Object.entries(files)) {
-		if (name === omit) continue;
+		if (omittedFiles.has(name)) continue;
 		const file = join(directory, "package", name);
 		mkdirSync(dirname(file), { recursive: true });
 		writeFileSync(file, data);
@@ -134,7 +133,7 @@ for (const [name, content, reason] of [
 }
 
 test("inspects a nested archive even when renamed to a binary resource", () => {
-	const nested = fixture({ "dist/private.ts": "export const hidden = 1" }, "README.md");
+	const nested = fixture({ "dist/private.ts": "export const hidden = 1" }, ["README.md", "dist/AGENTS.md"]);
 	try {
 		const result = inspect({ "dist/resource.bin": readFileSync(nested.archive) });
 		assert.notEqual(result.status, 0);

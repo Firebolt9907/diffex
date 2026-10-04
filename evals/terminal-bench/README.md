@@ -8,7 +8,7 @@ The [staged benchmark release gate](RELEASE_GATE.md) pins dataset inputs and ver
 Use the [offline job exporter](RELEASE_GATE.md#export-retained-trials-for-harbor-hub) to package existing stage results for Harbor Hub without rerunning evaluations.
 This integration is not yet ready for leaderboard runs.
 The adapter now requires a release with `--background-process-lifetime` and `--background-process-ownership-dir` support.
-The checked-in Diffex 0.3.1 pin supports these flags; installation verifies their availability alongside the release integrity.
+The checked-in Diffex 0.3.2 pin supports these flags; installation verifies their availability alongside the release integrity.
 Source-only lifecycle tests do not qualify the installed release or a live benchmark trial.
 
 ## Host setup
@@ -68,12 +68,12 @@ The task container must provide Debian/Ubuntu Linux with glibc, root access, Bas
 Linux x86_64 and aarch64 have separate pinned Node archive checksums.
 The installer fails explicitly on unsupported platforms and refuses to reuse an existing installation.
 
-[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.3.1`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
+[pins.toml](src/diffex_terminal_bench/pins.toml) records Node `22.23.2`, Diffex `0.3.2`, the public npm registry, archive checksums, npm integrity, and a 600-second installation deadline.
 The deadline includes apt prerequisites, Node download, npm installation, and all three CLI checks.
 GNU `timeout` terminates the installer process group at the deadline and kills it after a ten-second grace period.
 Harbor's command transport allows another five seconds to collect the result.
 
-Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.3.1` with a private prefix.
+Setup installs Node under `/opt/diffex-terminal-bench/node` and uses `npm install --ignore-scripts --save-exact --registry=https://registry.npmjs.org/ @diffexai/diffex@0.3.2` with a private prefix.
 An isolated home and npm cache prevent host or task npm settings from changing installation.
 Node archive SHA-256, registry metadata, installed package version, and npm lockfile integrity must match the checked-in pins.
 The `/usr/local/bin/diffex` wrapper always invokes the pinned Node binary.
@@ -170,7 +170,7 @@ These local source checks leave pinned-release smokes and a fresh live benchmark
 ### Recorded validation
 
 The following historical smoke records used Diffex 0.2.2.
-They do not qualify the updated Diffex 0.3.1 / Terminal-Bench 2.1 configuration.
+They do not qualify the updated Diffex 0.3.2 / Terminal-Bench 2.1 configuration.
 
 On 2026-09-14, both pinned Ubuntu images passed through Harbor 0.23.0 on Docker Desktop with an arm64 host.
 
@@ -231,7 +231,7 @@ These checks used a loopback provider; live Daytona qualification must start a n
 
 On 2026-09-18, the published Diffex 0.2.6 tarball matched its npm integrity, and the adapter's release instructions were synchronized with the packaged `dist/AGENTS.md`.
 Clean installation checks passed on both pinned Linux images (arm64 native and amd64 emulated), including version, help, model listing, and container cleanup.
-The packaged OpenAI catalog supports `gpt-5.6-luna` with `max` thinking, now selected in `benchmark.toml`.
+The packaged OpenAI catalog supported `gpt-5.6-luna` with `max` thinking, which was selected in `benchmark.toml` at the time.
 All 120 adapter tests and `npm run check` passed.
 These checks did not call a live model; Daytona qualification requires a fresh sequence for the updated identity.
 
@@ -308,7 +308,7 @@ The effective system prompt must match the checked-in prompt's SHA-256, and exec
 This uses supported flags in the pinned Diffex release and requires no product code or release changes.
 
 All eval configurations require disabled subagents and omit `spawn_agent`, `agent_action`, and `agent_status` from the tool allowlist.
-The pinned Diffex 0.3.1 CLI does not propagate `--system-prompt` or `--no-context-files` to child agents, so enabled subagents cannot satisfy this prompt policy.
+The pinned Diffex 0.3.2 CLI does not propagate `--system-prompt` or `--no-context-files` to child agents, so enabled subagents cannot satisfy this prompt policy.
 The adapter rejects attempts to enable them before setup or execution.
 The staged runner's `-n/--concurrency` still controls simultaneous independent trials and sandboxes.
 Native sessions remain beneath `run-<uuid>/sessions/`; trajectory conversion continues to support retained child sessions from earlier evaluations.
@@ -362,7 +362,7 @@ Tool errors alone do not fail execution: the assistant can inspect and recover f
 `DiffexExecutionError` subclasses Harbor's `NonZeroAgentExitCodeError`, so infrastructure failures retain exception information rather than becoming ordinary zero-reward results.
 The adapter never sets or infers verifier reward.
 A completed assistant that produces an incorrect solution returns normally and can earn zero from the verifier.
-The pinned `0.3.1` release returns nonzero for terminal assistant errors and aborts in JSON mode as well as text mode.
+The pinned `0.3.2` release returns nonzero for terminal assistant errors and aborts in JSON mode as well as text mode.
 The adapter also parses native events to classify provider failures and reject incomplete output independently of process exit status.
 
 The launcher writes stdout and stderr directly to files and retains native sessions during execution.

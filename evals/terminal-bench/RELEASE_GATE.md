@@ -3,7 +3,7 @@
 This gate qualifies a specific Diffex adapter, dataset, model, and harness configuration for a larger benchmark run.
 It does not publish a product release or submit a leaderboard entry.
 The implementation supports all qualification stages; live Diffex qualification requires provider credentials and a published release with environment-owned process support.
-The checked-in Diffex 0.3.1 pin includes that support; installation validates the required capabilities and release integrity.
+The checked-in Diffex 0.3.2 pin includes that support; installation validates the required capabilities and release integrity.
 
 ## Configuration and prerequisites
 
@@ -27,8 +27,8 @@ Each invocation extracts a fresh copy of the verified archive; it does not reuse
 The preparation command writes `results/release-gate/dataset.json` without creating sandboxes or calling a model.
 
 Harbor 0.23.0 and Daytona SDK 0.210.0 are locked in the benchmark's private Python environment.
-Node 22.23.2, Diffex 0.3.1, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
-The default is `openai/gpt-5.6-luna`, `max` thinking, tools `read,bash,edit,write,update_plan`, disabled subagents, disabled evolution, and `context-only` project resources.
+Node 22.23.2, Diffex 0.3.2, npm integrity, registry, and Node archive checksums come from [pins.toml](src/diffex_terminal_bench/pins.toml).
+The default is `openai/gpt-6-luna`, `xhigh` thinking, tools `read,bash,edit,write,update_plan`, disabled subagents, disabled evolution, and `context-only` project resources.
 Enabled subagents are rejected because the pinned CLI does not propagate eval prompt and context-file flags to children.
 Every new eval uses the checked-in system prompt without automatic project context and appends the anti-cheating instruction to the user message.
 Change and commit the configuration before starting a new qualification sequence.

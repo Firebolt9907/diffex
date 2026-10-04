@@ -32,6 +32,7 @@ class ExecutionOptions(InstalledAgentOptions):
     subagents: Literal["disabled"] = "disabled"
     project_resources: Literal["context-only"] = "context-only"
     background_process_lifetime: Literal["environment"] = "environment"
+    task_environment: Literal["isolated", "preserve"] = "isolated"
     # Arbitrary native config and prompt templates could defeat trial isolation
     # or alter the benchmark instruction. Reject them in Harbor preflight too.
     config: None = None

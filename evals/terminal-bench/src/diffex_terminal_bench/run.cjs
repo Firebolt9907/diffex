@@ -1,4 +1,4 @@
-// Launch the installed CLI with only the explicitly selected environment.
+// Launch the installed CLI with the explicitly selected environment policy.
 const { spawn } = require("node:child_process");
 const { mkdirSync, mkdtempSync, readFileSync, writeFileSync, openSync, closeSync, existsSync } = require("node:fs");
 const { join } = require("node:path");
@@ -18,8 +18,12 @@ mkdirSync(join(state, "home"), { mode: 0o700 });
 mkdirSync(join(runDir, "sessions"), { mode: 0o700 });
 writeFileSync(join(state, "settings.json"), JSON.stringify({ evolution: { enabled: false } }), { mode: 0o600 });
 const env = {
+	...(config.task_environment === "preserve" ? Object.fromEntries(
+		Object.entries(process.env).filter(([name]) => !name.startsWith("DIFFEX_") &&
+			!config.provider_env_names.includes(name)),
+	) : {}),
 	PATH: process.env.PATH,
-	HOME: join(state, "home"),
+	HOME: config.task_environment === "preserve" ? process.env.HOME : join(state, "home"),
 	LANG: "C.UTF-8",
 	DIFFEX_CODING_AGENT_DIR: state,
 	DIFFEX_SESSION_DIR: join(runDir, "sessions"),

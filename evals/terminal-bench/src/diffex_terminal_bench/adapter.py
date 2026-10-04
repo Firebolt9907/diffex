@@ -109,6 +109,8 @@ class DiffexAgent(BaseInstalledAgent):
             "background_process_lifetime": options.background_process_lifetime,
             "evolution": {"enabled": False}, "state_policy": "fresh-per-run",
             "credential_env_names": sorted(credentials),
+            "provider_env_names": sorted({name for names in PROVIDER_ENV.values() for name in names}),
+            "task_environment": options.task_environment,
             "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
             "user_message_suffix": USER_MESSAGE_SUFFIX,
             "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
@@ -125,8 +127,8 @@ class DiffexAgent(BaseInstalledAgent):
         # Uploads may be root-owned even when the task selects a non-root user.
         if environment.default_user is not None:
             await self.exec_as_root(environment, command=f"chown -R {shlex.quote(str(environment.default_user))} {shlex.quote(str(run_dir))}")
-        # Credentials travel only through Harbor's env parameter. The launcher
-        # discards all unselected inherited variables before starting Diffex.
+        # Credentials travel only through Harbor's env parameter. Task runtime
+        # variables can be preserved independently of Diffex state and credentials.
         execution = {"interruption": None, "launcher_exit_code": None}
         try:
             result = await self.exec_as_agent(

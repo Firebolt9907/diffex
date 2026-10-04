@@ -124,6 +124,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(configs[0]["tools"], ["read", "bash", "edit", "write", "update_plan"])
         self.assertTrue(any("chown -R 1000" in call.kwargs["command"] for call in environment.exec.call_args_list))
 
+    async def test_deepswe_configs_select_and_record_task_environment(self):
+        for name in ("smoke", "sample", "full"):
+            config = JobConfig.model_validate(yaml.safe_load((PACKAGE.parent / "deepswe" / f"{name}.yaml").read_text()))
+            settings = config.agents[0]
+            environment = self.make_environment()
+            requested = []
+
+            async def upload(source, target):
+                if target.endswith("requested.json"):
+                    requested.append(json.loads(Path(source).read_text()))
+
+            environment.upload_file.side_effect = upload
+            agent = DiffexAgent(logs_dir=self.logs_dir, model_name=settings.model_name, **settings.kwargs,
+                               extra_env={"OPENAI_API_KEY": "fixture"})
+            await agent.run("Task", environment, AgentContext())
+            self.assertEqual(requested[0]["task_environment"], "preserve")
+            self.assertIn("ANTHROPIC_API_KEY", requested[0]["provider_env_names"])
+            self.assertEqual(requested[0]["credential_env_names"], ["OPENAI_API_KEY"])
+
     async def test_checked_in_eval_policies_match_launch_tools(self):
         benchmark = load_config(PACKAGE / "benchmark.toml")
         staged = trial_config(benchmark, Path("/task"), Path("/runs/one"), "unique", oracle=False).agent

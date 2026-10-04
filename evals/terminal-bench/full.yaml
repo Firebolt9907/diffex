@@ -10,9 +10,9 @@ environment:
   override_storage_mb: 10240
 agents:
   - name: diffex_terminal_bench.adapter:DiffexAgent
-    model_name: openai/gpt-5.6-luna
+    model_name: openai/gpt-6-luna
     kwargs:
-      thinking: max
+      thinking: xhigh
       tools: read,bash,edit,write,update_plan
       # Child agents in the pinned CLI do not inherit eval prompt flags.
       subagents: disabled

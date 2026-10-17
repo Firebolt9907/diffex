@@ -5,6 +5,12 @@
 </p>
 
 <p align="center">
+  <img src="docs/assets/e2b-startups.png" alt="E2B for Startups" width="151">
+  &nbsp;&nbsp;
+  <img src="docs/assets/daytona-startup-grid.png" alt="Daytona Startup Grid" width="240">
+</p>
+
+<p align="center">
   <a href="https://diffex.ai/"><img alt="Website" src="https://img.shields.io/badge/site-diffex.ai-black.svg" /></a>
   <a href="package.json"><img alt="Node.js 22.19 or newer" src="https://img.shields.io/badge/node-%3E%3D22.19.0-339933.svg?logo=node.js&logoColor=white" /></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" /></a>

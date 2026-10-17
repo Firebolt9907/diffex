@@ -5,9 +5,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/e2b-startups.png" alt="E2B for Startups" width="151">
-  &nbsp;&nbsp;
   <img src="docs/assets/daytona-startup-grid.png" alt="Daytona Startup Grid" width="240">
+</p>
+
+<p align="center">
+  <img src="docs/assets/e2b-startups.png" alt="E2B for Startups" width="151">
 </p>
 
 <p align="center">

@@ -342,7 +342,7 @@ export interface AgentSessionConfig {
 	harnessVersionBundle?: HarnessVersionBundle;
 	/** Stable identity used to scope evolved harness skills. */
 	workspaceIdentity?: HarnessWorkspaceIdentity;
-	/** Keep the supplied harness revision fixed instead of following the global selected pointer. */
+	/** Keep the supplied harness revision fixed instead of refreshing it after compaction. */
 	pinHarnessVersion?: boolean;
 	/** Parent context for passive runtime telemetry. */
 	telemetryContext?: TelemetryContext;
@@ -1475,7 +1475,7 @@ export class AgentSession {
 		await this._notifyHarnessActivated(activatedBundle.manifest.version);
 	}
 
-	private async _refreshSelectedHarnessAtPromptBoundary(): Promise<void> {
+	private async _reconcileSelectedHarness(): Promise<void> {
 		if (!this._harnessStateStore || this._pinHarnessVersion || hasFixedHarnessSubagentSession(this.sessionManager)) {
 			return;
 		}
@@ -1484,6 +1484,24 @@ export class AgentSession {
 		if (selected.manifest.version === this.activeHarnessVersion) return;
 
 		await this._activateHarnessBundle(selected);
+	}
+
+	private async _refreshHarnessAfterCompaction(): Promise<string | undefined> {
+		try {
+			const systemPromptOverride = this._systemPromptOverride;
+			await this._reconcileSelectedHarness();
+			// A before_agent_start override still owns this logical run's effective prompt.
+			if (systemPromptOverride !== undefined) {
+				this._systemPromptOverride = systemPromptOverride;
+				this._installCollaborationModeState(this._deriveCollaborationModeState(this._collaborationMode));
+			}
+			if (this._activeRunCollaborationState) {
+				this._activeRunCollaborationState = this._capturePlanAdmissionState();
+			}
+			return undefined;
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
 	}
 
 	/**
@@ -2311,10 +2329,20 @@ export class AgentSession {
 		let consumedNextTurnMessages: CustomMessage[] | undefined;
 		let preflightAccepted = false;
 		let pendingCompaction: CompactionAppendTransaction | undefined;
-		const commitPendingCompaction = (): void => {
+		const commitPendingCompaction = async (): Promise<void> => {
 			if (!pendingCompaction) return;
 			pendingCompaction.commit();
 			pendingCompaction = undefined;
+			// Do not refresh a harness for compaction that cancellable preflight can still roll back.
+			const refreshError = await this._refreshHarnessAfterCompaction();
+			if (refreshError) {
+				this._extensionRunner.emitError({
+					extensionPath: "<runtime>",
+					event: "harness_refresh",
+					error: refreshError,
+				});
+			}
+			if (collaborationState) collaborationState = this._capturePlanAdmissionState();
 		};
 		const rollbackPendingCompaction = (): void => {
 			if (!pendingCompaction) return;
@@ -2344,7 +2372,6 @@ export class AgentSession {
 				);
 			}
 
-			if (!this.isStreaming) await this._refreshSelectedHarnessAtPromptBoundary();
 			signal?.throwIfAborted();
 
 			// Emit input event for extension interception (before skill/template expansion)
@@ -2529,7 +2556,7 @@ export class AgentSession {
 			if (signal?.aborted) {
 				rollbackPendingCompaction();
 			} else {
-				commitPendingCompaction();
+				await commitPendingCompaction();
 			}
 			if (signal?.aborted && consumedNextTurnMessages) {
 				this._pendingNextTurnMessages = [...consumedNextTurnMessages, ...this._pendingNextTurnMessages];
@@ -2550,7 +2577,7 @@ export class AgentSession {
 				this._pendingNextTurnMessages = [...(consumedNextTurnMessages ?? []), ...this._pendingNextTurnMessages];
 				throw signal.reason;
 			}
-			commitPendingCompaction();
+			await commitPendingCompaction();
 			throw error;
 		}
 		if (signal?.aborted) {
@@ -2559,7 +2586,11 @@ export class AgentSession {
 			consumedNextTurnMessages = undefined;
 			throw signal.reason;
 		}
-		commitPendingCompaction();
+		await commitPendingCompaction();
+		if (signal?.aborted) {
+			this._pendingNextTurnMessages = [...(consumedNextTurnMessages ?? []), ...this._pendingNextTurnMessages];
+			throw signal.reason;
+		}
 		consumedNextTurnMessages = undefined;
 		releaseUnsignaledPreflight();
 		this._releaseIdleSubagentEscalationsForSelectedBranch();
@@ -3381,6 +3412,7 @@ export class AgentSession {
 				usage,
 				willRetry: false,
 			});
+			const refreshError = await this._refreshHarnessAfterCompaction();
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
 			this._compactionAbortController = undefined;
 			this._emit({
@@ -3389,6 +3421,7 @@ export class AgentSession {
 				result: compactionResult,
 				aborted: false,
 				willRetry: false,
+				errorMessage: refreshError,
 			});
 			return compactionResult;
 		} catch (error) {
@@ -3745,7 +3778,8 @@ export class AgentSession {
 				signal,
 				deferCommit,
 			});
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			const refreshError = deferCommit ? undefined : await this._refreshHarnessAfterCompaction();
+			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry, errorMessage: refreshError });
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -4175,6 +4209,18 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		if (
+			this._promptAdmissionInProgress ||
+			this._harnessSwitchInProgress ||
+			this.isStreaming ||
+			this.agent.hasQueuedMessages() ||
+			this.isRetrying ||
+			this._manualCompactionOperations > 0 ||
+			this.isCompacting ||
+			this.isBashRunning
+		) {
+			throw new Error("Cannot reload while the session is busy.");
+		}
 		await this._subagentController?.reset();
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();

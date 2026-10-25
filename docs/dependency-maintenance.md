@@ -41,7 +41,7 @@ Runtime pins use keyring **2.1.2**, Chalk **6.0.1**, diff **9.0.0**, highlight.j
 
 Keyring's missing-password result is now `null`. The storage adapter still reports a missing session as `undefined`. Socket adapters normalize the new declaration's string-or-buffer input, and syntax highlighting uses highlight.js's public entry point. The extension dependency example pins Chalk 6.0.1.
 
-The standalone sandbox example lock now resolves shell-quote **1.12.0**, addressing both reported shell-quote advisories. Sandbox runtime itself remains at 0.0.26 while the latest 0.0.81's unpatched node-forge signature-verification advisory is reviewed; forcing a Zod major or accepting a new vulnerable dependency is not automatic.
+The standalone sandbox example lock now resolves shell-quote **1.12.0**, addressing both reported shell-quote advisories. Sandbox runtime itself is intentionally retained at **0.0.26**: version 0.0.81 introduces node-forge 1.4.0 with the unpatched [GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv) signature-verification advisory. Revisit this exception when a patched upstream dependency is available; do not force an incompatible Zod major override to suppress the remaining audit findings.
 
 ## Networking review
 
@@ -54,6 +54,12 @@ The provider SDKs use Anthropic **1.3.0**, Google GenAI **2.31.0**, Mistral **3.
 Google automatic continuation is explicitly disabled for Gemini and Vertex requests. A continuation limit is reported as `length` rather than allowing the SDK to send additional requests automatically. Google authentication remains independent of GitHub credentials.
 
 Anthropic adopts the SDK's API version **2026-10-21** and no longer sends the removed sampling parameters. A model-context-window limit is reported as `length`. The Google GenAI install-script allowlist was reviewed and updated: its published `preinstall` is still a no-op, and installs continue to skip scripts.
+
+## Python evaluation dependencies
+
+The shared Terminal-Bench/DeepSWE project pins Harbor **0.24.0**, Daytona **0.226.1**, E2B **2.59.0**, Pydantic **2.14.1**, PyYAML **6.0.3**, and build backend Hatchling **1.32.4**. Runtime guards and live setup guides match the checked-in lock; DeepSWE no longer resolves separate `uv run --with` overlays.
+
+The refreshed Python lock patches the reported certifi, aiohttp, OpenTelemetry API, PyJWT, multidict, and urllib3 advisories. Stable direct dependencies still require beta-only OpenTelemetry instrumentation transitives; `prerelease = "if-necessary"` records that resolver policy. Dependency validation uses published wheels without build hooks and mocked tests, not paid sandbox/model benchmark runs. Linux Docker qualification and live service qualification remain separate release checks.
 
 ## Security review
 

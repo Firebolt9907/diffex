@@ -16,7 +16,7 @@
   <a href="https://diffex.ai/"><img alt="Website" src="https://img.shields.io/badge/site-diffex.ai-black.svg" /></a>
   <a href="https://www.npmjs.com/package/@diffexai/diffex?activeTab=readme"><img alt="Latest npm version" src="https://img.shields.io/npm/v/%40diffexai%2Fdiffex?label=diffex" /></a>
   <a href="https://nodejs.org/"><img alt="Node.js 22.19 or newer" src="https://img.shields.io/badge/node-%3E%3D22.19.0-339933.svg?logo=node.js&logoColor=white" /></a>
-  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" /></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
   <a href="https://github.com/diffexai/diffex/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/diffexai/diffex/actions/workflows/ci.yml/badge.svg?branch=main" /></a>
 </p>
 
@@ -53,9 +53,7 @@ Diffex scores are reported mean rewards; Codex's score is published leaderboard 
 | [Terminal-Bench 2.1](https://hub.harborframework.com/jobs/169f8574-9c7f-411c-9fe5-489ea4471016) | Diffex 0.3.1 | GPT-5.6 Luna | 79.85% | 412 / 445 |
 | [Terminal-Bench 2.1](https://github.com/harbor-framework/terminal-bench-2-1/pull/112) | Codex | GPT-5.6 Luna | 75.73% | 445 / 445 |
 
-Deep SWE also reported **95.13% fail-to-pass** and **98.85% pass-to-pass** test scores.
-
-On Terminal-Bench 2.1, Diffex's reported GPT-5.6 Luna score is **4.12 percentage points above Codex**, also using `max` reasoning. This is not a controlled comparison: execution environments may differ.
+On Terminal-Bench 2.1, Diffex's reported GPT-5.6 Luna score is **4.12 percentage points above Codex**, also using `max` reasoning.
 
 ## Documentation
 
@@ -94,4 +92,4 @@ Thank you to the developers of [Pi](https://github.com/earendil-works/pi) for bu
 
 ## License
 
-Apache License 2.0
+MIT

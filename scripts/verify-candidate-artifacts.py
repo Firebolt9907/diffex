@@ -127,9 +127,25 @@ for runtime, exe in executables.items():
                 ):
                     assert not re.search(r"\bRadius\b", text), text
                     mark = len(raw)
+                    os.write(fd, b"radius")
+                    stage = "account-search"
+                elif stage == "account-search" and b"No matching providers" in raw[mark:]:
+                    mark = len(raw)
                     os.write(fd, b"\x03")
                     stage = "back"
                 elif stage == "back" and b"Select authentication method:" in raw[mark:]:
+                    mark = len(raw)
+                    os.write(fd, b"\x1b[B\r")
+                    stage = "api-keys"
+                elif stage == "api-keys" and b"Select provider to configure:" in raw[mark:]:
+                    mark = len(raw)
+                    os.write(fd, b"radius")
+                    stage = "api-key-search"
+                elif stage == "api-key-search" and b"No matching providers" in raw[mark:]:
+                    mark = len(raw)
+                    os.write(fd, b"\x03")
+                    stage = "api-key-back"
+                elif stage == "api-key-back" and b"Select authentication method:" in raw[mark:]:
                     mark = len(raw)
                     os.write(fd, b"\x03")
                     stage = "editor"
@@ -159,7 +175,7 @@ for runtime, exe in executables.items():
             results.append(
                 {
                     "runtime": runtime,
-                    "command": "interactive prompt, login selector, exit",
+                    "command": "interactive prompt, subscription and API-key Radius exclusion, exit",
                     "exitCode": 0,
                     "events": events,
                     "accounts": ["ChatGPT", "OpenRouter", "xAI"],

@@ -3,8 +3,9 @@
  * Provider auth orchestration belongs to ModelRuntime and Diffex AI Models.
  */
 
+import { randomUUID } from "node:crypto";
 import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore } from "@diffexai/diffex-ai";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
@@ -34,7 +35,10 @@ type AuthFileReadState = {
 	reload?: AuthFileReload;
 };
 
-let sharedAuthFileReadState: { authPath: string; readState: AuthFileReadState } | undefined;
+const sharedAuthFileReadStates = new Map<string, WeakRef<AuthFileReadState>>();
+const authFileReadStateCleanup = new FinalizationRegistry<string>((authPath) => {
+	if (!sharedAuthFileReadStates.get(authPath)?.deref()) sharedAuthFileReadStates.delete(authPath);
+});
 
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
@@ -62,6 +66,18 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		if (!existsSync(this.authPath)) {
 			writeFileSync(this.authPath, "{}", AUTH_FILE_WRITE_OPTIONS);
 			chmodSync(this.authPath, 0o600);
+		}
+	}
+
+	private writeAtomically(content: string): void {
+		// Resolve existing symlinks so a configured credential-store link stays intact.
+		const target = realpathSync(this.authPath);
+		const temporary = join(dirname(target), `.auth-${randomUUID()}.tmp`);
+		try {
+			writeFileSync(temporary, content, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+			renameSync(temporary, target);
+		} finally {
+			rmSync(temporary, { force: true });
 		}
 	}
 
@@ -102,8 +118,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
-				chmodSync(this.authPath, 0o600);
+				this.writeAtomically(next);
 			}
 			return result;
 		} finally {
@@ -184,8 +199,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
-				chmodSync(this.authPath, 0o600);
+				this.writeAtomically(next);
 			}
 			throwIfCompromised();
 			return result;
@@ -333,10 +347,11 @@ export class AuthStorage implements CredentialStore {
 	private constructor(storage: AuthStorageBackend, authPath?: string) {
 		this.storage = storage;
 		this.authPath = authPath;
-		this.readState =
-			authPath && sharedAuthFileReadState?.authPath === authPath ? sharedAuthFileReadState.readState : { data: {} };
-		if (authPath && !sharedAuthFileReadState) {
-			sharedAuthFileReadState = { authPath, readState: this.readState };
+		const sharedReadState = authPath ? sharedAuthFileReadStates.get(authPath)?.deref() : undefined;
+		this.readState = sharedReadState ?? { data: {} };
+		if (authPath && !sharedReadState) {
+			sharedAuthFileReadStates.set(authPath, new WeakRef(this.readState));
+			authFileReadStateCleanup.register(this.readState, authPath);
 		}
 		if (authPath) {
 			const revision = getFileRevision(authPath);

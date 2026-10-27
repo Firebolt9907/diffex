@@ -497,7 +497,11 @@ export class ModelRuntime implements Models {
 			this.recomposeProvider(providerId);
 			const compositionError = this.compositionErrors.get(providerId);
 			if (compositionError) throw new Error(compositionError);
-			const result = await this.models.refresh({ allowNetwork: false, providers: [providerId], signal });
+			const result = await this.models.refresh({
+				allowNetwork: operation === "login" && providerId === "openai-codex" && this.modelNetworkEnabled,
+				providers: [providerId],
+				signal,
+			});
 			if (result.aborted) signal.throwIfAborted();
 			const refreshError = result.errors.get(providerId);
 			if (refreshError) throw refreshError;
@@ -669,8 +673,11 @@ export class ModelRuntime implements Models {
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
-			await this.models.logout(providerId, { signal });
-			await this.synchronizeCredentialState(providerId, "logout", undefined, signal);
+			try {
+				await this.models.logout(providerId, { signal });
+			} finally {
+				await this.synchronizeCredentialState(providerId, "logout", undefined, operationSignal());
+			}
 		});
 	}
 

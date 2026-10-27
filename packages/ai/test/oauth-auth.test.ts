@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
+import { getOAuthDisplayUrl } from "../src/auth/helpers.ts";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
 import { kimiCodingOAuth } from "../src/auth/oauth/kimi-coding.ts";
@@ -18,6 +19,14 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe.sequential("OAuthAuth adapters", () => {
+	it("redacts retained ID tokens from displayed authorization URLs", () => {
+		const display = getOAuthDisplayUrl(
+			"https://auth.openai.com/api/accounts/authorize?client_id=oaiapp_diffex&id_token_hint=private-token&state=state",
+		);
+		expect(display).not.toContain("private-token");
+		expect(display).not.toContain("id_token_hint");
+		expect(new URL(display).searchParams.get("client_id")).toBe("oaiapp_diffex");
+	});
 	it("keeps the extension OAuth barrel free of built-in flow implementations", () => {
 		expect(extensionOAuthCompatibility).not.toHaveProperty("loginAnthropic");
 		expect(extensionOAuthCompatibility).not.toHaveProperty("anthropicOAuth");
@@ -40,8 +49,17 @@ describe.sequential("OAuthAuth adapters", () => {
 	});
 
 	it("openai-codex toAuth derives the api key from the access token", async () => {
-		const auth = await openaiCodexOAuth.toAuth({ type: "oauth", access: "token", refresh: "r", expires: 0 });
-		expect(auth).toEqual({ apiKey: "token" });
+		const auth = await openaiCodexOAuth.toAuth({
+			type: "oauth",
+			access: "token",
+			refresh: "r",
+			expires: 0,
+			clientId: "oaiapp_diffex",
+			extAgentHostId: "urn:uuid:host",
+			subject: "subject",
+			scopes: ["chatgpt.tokens.use.direct", "resource.invoke"],
+		});
+		expect(auth).toEqual({ apiKey: "token", baseUrl: "https://api.openai.com/v1" });
 	});
 
 	it("openrouter derives the api key and keeps the permanent credential on refresh", async () => {

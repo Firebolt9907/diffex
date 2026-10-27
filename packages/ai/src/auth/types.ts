@@ -31,6 +31,8 @@ export interface OAuthCredentials {
 /** Stored canonical OAuth credential. */
 export interface OAuthCredential extends OAuthCredentials {
 	type: "oauth";
+	/** Terminal session failure: tokens cleared, registration retained for a new sign-in. */
+	reauthorizationRequired?: boolean;
 }
 
 /** One type-tagged credential per provider — the shape of today's auth.json. */
@@ -220,6 +222,9 @@ export interface OAuthAuth {
 	 * (invalid_grant etc.). `Models` runs this under the store lock.
 	 */
 	refresh(credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential>;
+
+	/** End the renewable session before the app clears its local credential. */
+	logout?(credential: OAuthCredential, signal: AbortSignal): Promise<void>;
 
 	/**
 	 * Side-effect-free derivation of request auth from a valid credential.

@@ -125,7 +125,7 @@ async function startCallbackServer(expectedState: string): Promise<CallbackServe
 
 				if (error) {
 					res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-					res.end(oauthErrorHtml("Anthropic authentication did not complete.", `Error: ${error}`));
+					res.end(oauthErrorHtml("Anthropic authorization did not complete."));
 					return;
 				}
 
@@ -142,11 +142,11 @@ async function startCallbackServer(expectedState: string): Promise<CallbackServe
 				}
 
 				res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-				res.end(oauthSuccessHtml("Anthropic authentication completed. You can close this window."));
+				res.end(oauthSuccessHtml());
 				settleWait?.({ code, state });
 			} catch {
-				res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-				res.end("Internal error");
+				res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(oauthErrorHtml("Internal error while processing OAuth callback."));
 			}
 		});
 

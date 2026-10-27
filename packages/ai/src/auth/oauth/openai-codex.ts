@@ -291,7 +291,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 }
 
 async function createAuthorizationFlow(
-	originator: string = "pi",
+	originator: string = "diffex",
 ): Promise<{ verifier: string; state: string; url: string }> {
 	const { verifier, challenge } = await generatePKCE();
 	const state = createState();
@@ -356,7 +356,7 @@ function startLocalOAuthServer(state: string): Promise<OAuthServerInfo> {
 			}
 			res.statusCode = 200;
 			res.setHeader("Content-Type", "text/html; charset=utf-8");
-			res.end(oauthSuccessHtml("OpenAI authentication completed. You can close this window."));
+			res.end(oauthSuccessHtml());
 			settleWait?.({ code });
 		} catch {
 			res.statusCode = 500;

@@ -123,8 +123,9 @@ for runtime, exe in executables.items():
                     os.write(fd, b"\r")
                     stage = "accounts"
                 elif stage == "accounts" and all(
-                    name in text for name in ["OpenAI Codex", "Radius", "xAI"]
+                    name in text for name in ["OpenAI Codex", "OpenRouter", "xAI"]
                 ):
+                    assert not re.search(r"\bRadius\b", text), text
                     mark = len(raw)
                     os.write(fd, b"\x03")
                     stage = "back"
@@ -161,7 +162,7 @@ for runtime, exe in executables.items():
                     "command": "interactive prompt, login selector, exit",
                     "exitCode": 0,
                     "events": events,
-                    "accounts": ["OpenAI Codex", "Radius", "xAI"],
+                    "accounts": ["OpenAI Codex", "OpenRouter", "xAI"],
                     "cleanup": "process exited and isolated directories removed",
                 }
             )
